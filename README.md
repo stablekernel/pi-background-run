@@ -35,8 +35,8 @@ Restart pi after install so the extension loads.
 | `bgtail` | Print the last N lines of a job's log (default 40), stripping the exit marker. |
 | `bgclean` | Remove old job logs (default 7 days). Skips running jobs while pi is alive. |
 
-`bgwait` and `bgkill` aren't registered as tools — rare in agent flows. Use `bash`
-if you ever need them.
+`bgwait` and `bgkill` are not provided — the pi port has no shell runner. Use
+`bash` with `kill` if you ever need to stop a running job.
 
 ## How it works
 
@@ -50,7 +50,8 @@ agent calls bgrun(command: "make test-short")
 
 child 'exit' event fires:
   → extension records exit code, appends a done entry
-  → pi.sendUserMessage(wakeMessage, { triggerTurn: true })  — wakes the agent
+  → pi.sendUserMessage(wake) when idle (triggers a turn)
+     or pi.sendUserMessage(wake, { deliverAs: 'followUp' }) when busy
   → ctx.ui.notify(...)  — toast for the human
   → ctx.ui.setWidget("bgrun", ...)  — updates/clears the live status widget
 ```

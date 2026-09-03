@@ -38,14 +38,17 @@ no polling.
 2. **On wake:** check the exit status in the wake message first.
    - `exit: 0` → success. `bgtail` to confirm.
    - `exit: <non-zero>` → failure. Analyze the log (see below).
-3. **If you need to check before the wake (non-blocking):** `bgstatus "$JOB"`
+3. **If you need to check before the wake (non-blocking):** call `bgstatus` with the job id.
    - `running` → keep doing other work. Do NOT spin a wait loop.
    - `done exit=0` → success.
-   - `done exit=<non-zero>` or `crashed` → failure; analyze the log.
+   - `done exit=<non-zero>` → failure; analyze the log.
+   - `running` but the job should have finished long ago → likely crashed (the
+     process died without writing the exit marker). Analyze the log with
+     `ctx_execute_file`.
 
 ### Reading results without flooding context
 
-- **Quick peek (≤40 lines):** `bgtail "$JOB" 40` — strips the `__BGRUN_EXIT__` marker.
+- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker.
 - **Whole-log failure analysis:** `ctx_execute_file` on the log path:
   ```
   ctx_execute_file(
@@ -75,4 +78,7 @@ no polling.
 - Call the tools; never hand-roll `nohup … &` inline.
 - One job = one id. Multiple concurrent jobs are fine — each has its own log.
 - Logs live in `~/.pi-bgrun/jobs` (override with `PI_BGRUN_DIR`).
-- Run `bgclean` periodically; the extension also auto-sweeps old logs on startup.
+- Run `bgclean` periodically; the extension also auto-sweeps old logs on startup
+  (14-day threshold).
+- To stop a running job, use `bash` with `kill <pid>` (the pid is in the `bgstatus`
+  output). There is no `bgkill` tool.

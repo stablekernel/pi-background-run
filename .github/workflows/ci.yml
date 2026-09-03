@@ -27,6 +27,11 @@ jobs:
           node-version: "24"
           cache: npm
 
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: npm ci
         run: npm ci
 
@@ -38,10 +43,7 @@ jobs:
 
       - name: Run tests
         id: tests
-        run: |
-          output=$(npm test 2>&1)
-          echo "$output"
-          echo "$output" | grep -qE "(passing|passed|# tests [0-9]+)" || true
+        run: npm test
 
       - name: npm pack --dry-run (files allowlist sanity)
         id: pack
