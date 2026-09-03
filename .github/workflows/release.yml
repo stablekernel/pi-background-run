@@ -45,13 +45,17 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
-          cache: npm
           registry-url: "https://registry.npmjs.org"
           # Node 24 ships with npm 11.5.1+ which is required for OIDC trusted
           # publishing.
 
-      - name: npm ci
-        run: npm ci
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: bun install
+        run: bun install
 
       # ── Version-consistency guard ─────────────────────────────────────────
       - name: Verify version consistency
