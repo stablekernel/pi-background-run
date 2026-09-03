@@ -23,26 +23,49 @@ interface CapturedWake {
   options?: Record<string, unknown>;
 }
 
-function makeFakePi(opts: { idle?: boolean } = {}): {
+function makeFakePi(opts: { idle?: boolean; priorEntries?: any[] } = {}): {
   pi: any;
   wakes: CapturedWake[];
+  entries: any[];
   tools: Map<string, { execute: (...args: any[]) => Promise<any> }>;
   ctx: any;
+  handlers: Map<string, ((...args: any[]) => Promise<any>)[]>;
+  fireSessionStart: () => Promise<void>;
 } {
   const wakes: CapturedWake[] = [];
+  const entries: any[] = opts.priorEntries ? [...opts.priorEntries] : [];
   const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  const handlers = new Map<string, ((...args: any[]) => Promise<any>)[]>();
   const idle = opts.idle ?? true;
-  const ctx = { isIdle: () => idle };
+  const ctx = {
+    isIdle: () => idle,
+    hasUI: false,
+    ui: { notify() {}, setWidget() {}, setStatus() {} },
+    sessionManager: { getEntries: () => entries },
+  };
   const pi = {
     sendUserMessage(text: string, options?: Record<string, unknown>) {
       wakes.push({ text, options });
     },
+    appendEntry(customType: string, data?: unknown) {
+      entries.push({ type: "custom", customType, data });
+    },
+    registerEntryRenderer() {},
     registerTool(def: any) {
       tools.set(def.name, def);
     },
-    on() {},
+    on(event: string, handler: (...args: any[]) => Promise<any>) {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+    },
   };
-  return { pi, wakes, tools, ctx };
+  const fireSessionStart = async () => {
+    for (const h of handlers.get("session_start") ?? []) {
+      await h({ reason: "startup" }, ctx);
+    }
+  };
+  return { pi, wakes, entries, tools, ctx, handlers, fireSessionStart };
 }
 
 async function loadExtension(fakePi: any): Promise<Map<string, { execute: (...args: any[]) => Promise<any> }>> {
@@ -228,4 +251,141 @@ test("bgrun: rejects empty command", async () => {
     () => bgrun.execute("call-6", { command: "" }, undefined, undefined, ctx),
     /command is required/,
   );
+});
+
+// ── Phase 1 tests ────────────────────────────────────────────────────────────
+
+test("bgrun: appends bgrun-job entries (running then done)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, entries, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute("call-e1", { command: "echo entry-test" }, undefined, undefined, ctx);
+    // One running entry appended at start.
+    const runningEntries = entries.filter((e) => e.data?.state === "running");
+    assert.equal(runningEntries.length, 1, "running entry appended at start");
+    assert.equal(runningEntries[0].data.cmd, "echo entry-test");
+
+    await waitForWakes(wakes, 1);
+    // One done entry appended on exit.
+    const doneEntries = entries.filter((e) => e.data?.state === "done");
+    assert.equal(doneEntries.length, 1, "done entry appended on exit");
+    assert.equal(doneEntries[0].data.exitCode, 0);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session_start: reconstructs in-memory Map from bgrun-job entries", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // First instance: run a job, capture its entries.
+    const { pi: pi1, wakes, entries, tools: tools1, ctx: ctx1 } = makeFakePi();
+    await loadExtension(pi1);
+    const bgrun1 = tools1.get("bgrun")!;
+    const res = await bgrun1.execute("call-r1", { command: "echo reconstruct-me" }, undefined, undefined, ctx1);
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    // Second instance: simulate a restart. Load fresh, passing the prior entries,
+    // then fire session_start to trigger reconstruction.
+    const { pi: pi2, tools: tools2, ctx: ctx2, fireSessionStart } = makeFakePi({ priorEntries: entries });
+    await loadExtension(pi2);
+    await fireSessionStart();
+
+    // Now bgstatus should find the job in the in-memory Map (not just dir scan).
+    const bgstatus2 = tools2.get("bgstatus")!;
+    const status = await bgstatus2.execute("call-r2", { id }, undefined, undefined, ctx2);
+    const text = status.content[0].text as string;
+    assert.match(text, /done.*exit=0/);
+    // Verify it came from the in-memory Map (not "from log" marker).
+    assert.ok(!text.includes("from log"), "reconstructed from entries, not dir scan");
+    assert.ok(!text.includes("recovered from log"), "reconstructed from entries, not log recovery");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgclean: removes old logs, keeps recent ones", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgclean = tools.get("bgclean")!;
+
+    // Run a real job (recent log — should be kept).
+    await bgrun.execute("call-c1", { command: "echo recent" }, undefined, undefined, ctx);
+    await new Promise((r) => setTimeout(r, 200)); // let it finish
+
+    // Write an old log file (backdated mtime).
+    const oldPath = join(dir, "old-job-1000000000-99999.log");
+    const fs = await import("node:fs");
+    fs.writeFileSync(oldPath, "old output\n__BGRUN_EXIT__=0\n");
+    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // 30 days ago
+    fs.utimesSync(oldPath, oldTime, oldTime);
+
+    const result = await bgclean.execute("call-c2", { days: 7 }, undefined, undefined, ctx);
+    const text = result.content[0].text as string;
+    assert.match(text, /removed 1/);
+    assert.ok(!fs.existsSync(oldPath), "old log removed");
+    // The recent log should still exist.
+    const remaining = fs.readdirSync(dir).filter((f: string) => f.endsWith(".log"));
+    assert.equal(remaining.length, 1, "recent log kept");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgclean: rejects negative days", async () => {
+  const { pi, tools, ctx } = makeFakePi();
+  await loadExtension(pi);
+  const bgclean = tools.get("bgclean")!;
+  await assert.rejects(
+    () => bgclean.execute("call-c3", { days: -1 }, undefined, undefined, ctx),
+    /non-negative/,
+  );
+});
+
+test("bgclean: does not remove a running job's log", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgclean = tools.get("bgclean")!;
+
+    // Start a long-running job (10s) so it's still running when we clean.
+    const res = await bgrun.execute("call-c4", { command: "sleep 10" }, undefined, undefined, ctx);
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    const logPath = join(dir, `${id}.log`);
+
+    // Backdate the log's mtime to make it look old — but the job is still running
+    // (pid is in the in-memory Map), so bgclean should skip it.
+    const fs = await import("node:fs");
+    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    // Wait a moment for the log file to exist, then backdate.
+    await new Promise((r) => setTimeout(r, 100));
+    fs.utimesSync(logPath, oldTime, oldTime);
+
+    const result = await bgclean.execute("call-c5", { days: 7 }, undefined, undefined, ctx);
+    const text = result.content[0].text as string;
+    assert.match(text, /skipped 1 running/);
+    assert.ok(fs.existsSync(logPath), "running job's log not removed");
+
+    // Kill the orphaned sleep so it doesn't linger.
+    try { process.kill((res.details as any).pid); } catch {}
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
