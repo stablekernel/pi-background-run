@@ -1,0 +1,52 @@
+{
+  "name": "pi-bgrun",
+  "version": "0.1.0",
+  "description": "Run long shell commands detached in the background for pi; get woken on completion. Output lands in a file; context stays clean.",
+  "type": "module",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": "./extension/index.ts"
+  },
+  "pi": {
+    "extensions": ["./extension/index.ts"],
+    "skills": ["./skill/run-bg"]
+  },
+  "scripts": {
+    "test": "node --test extension/index.test.ts",
+    "lint": "tsc --noEmit"
+  },
+  "files": [
+    "extension/",
+    "skill/",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stablekernel/pi-bgrun.git"
+  },
+  "homepage": "https://github.com/stablekernel/pi-bgrun#readme",
+  "bugs": {
+    "url": "https://github.com/stablekernel/pi-bgrun/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "background",
+    "bgrun",
+    "ai",
+    "agent",
+    "extension"
+  ],
+  "author": "stablekernel",
+  "dependencies": {
+    "typebox": "^0.34.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typescript": "^5.7.0"
+  }
+}

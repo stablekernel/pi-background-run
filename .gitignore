@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+
+# Build artifacts
+dist/
+
+# Transient agent working files — never committed.
+.pi/wip/

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege: read-only repo contents; no other scopes needed for lint+test.
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: tsc --noEmit
+        id: tsc
+        run: |
+          npx tsc --noEmit
+          echo "result=passed" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        id: tests
+        run: |
+          output=$(npm test 2>&1)
+          echo "$output"
+          echo "$output" | grep -qE "(passing|passed|# tests [0-9]+)" || true
+
+      - name: npm pack --dry-run (files allowlist sanity)
+        id: pack
+        run: |
+          pack_output=$(npm pack --dry-run 2>&1)
+          echo "$pack_output"
+          file_count=$(echo "$pack_output" | grep -oP 'total files:\s*\K[0-9]+' || echo "?")
+          echo "file_count=${file_count}" >> "$GITHUB_OUTPUT"
+
+      - name: Write run summary
+        if: always()
+        env:
+          TSC_RESULT: ${{ steps.tsc.outcome }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          PACK_OUTCOME: ${{ steps.pack.outcome }}
+          PACK_FILES: ${{ steps.pack.outputs.file_count }}
+        run: |
+          {
+            echo "## CI — ${{ github.workflow }} — ${{ job.status }}"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| tsc --noEmit | \`${TSC_RESULT}\` |"
+            echo "| tests | \`${TESTS_OUTCOME}\` |"
+            echo "| npm pack --dry-run | \`${PACK_OUTCOME}\` — ${PACK_FILES} files in tarball |"
+            echo ""
+            echo "Ref: \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
