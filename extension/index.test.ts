@@ -13,7 +13,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -306,6 +306,274 @@ test("session_start: reconstructs in-memory Map from bgrun-job entries", async (
     // Verify it came from the in-memory Map (not "from log" marker).
     assert.ok(!text.includes("from log"), "reconstructed from entries, not dir scan");
     assert.ok(!text.includes("recovered from log"), "reconstructed from entries, not log recovery");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── name (human-readable label) tests ───────────────────────────────────────
+
+test("bgrun: name flows into job id, response, entry, wake, and status", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, entries, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    const res = await bgrun.execute("call-n1", { command: "echo named job", name: "unit-tests" }, undefined, undefined, ctx);
+    const text = res.content[0].text as string;
+    const id = (text.match(/^started: ([^\n]+)/) || [])[1];
+    // Slug derives from the name, not the command.
+    assert.ok(id.startsWith("unit-tests-"), `id should start with 'unit-tests-': ${id}`);
+    // Response includes the name.
+    assert.match(text, /name: unit-tests/);
+    // Details include the name.
+    assert.equal((res.details as any).name, "unit-tests");
+
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    // Wake includes the name.
+    assert.match(wake, /"unit-tests"/);
+
+    // Persisted entries carry the name.
+    const withName = entries.filter((e) => e.data?.name === "unit-tests");
+    assert.equal(withName.length, 2, "running + done entries carry name");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: name is optional — behavior unchanged without it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    const res = await bgrun.execute("call-n2", { command: "echo unnamed job" }, undefined, undefined, ctx);
+    const text = res.content[0].text as string;
+    // No 'name:' line in the response.
+    assert.ok(!/^  name:/m.test(text), "no name line when name omitted");
+    const id = (text.match(/^started: ([^\n]+)/) || [])[1];
+    assert.ok(id.startsWith("echo-unnamed-job-"), `slug falls back to command: ${id}`);
+
+    await waitForWakes(wakes, 1);
+    assert.ok(!wakes[0].text.includes('"'), "wake has no name quote when unnamed");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: blank name is ignored, over-long name is truncated", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    // Blank name treated as absent.
+    const res1 = await bgrun.execute("call-n3", { command: "echo blank", name: "   " }, undefined, undefined, ctx);
+    assert.ok(!/^  name:/m.test(res1.content[0].text as string), "blank name ignored");
+
+    // Over-long name truncated to 80 chars.
+    const longName = "x".repeat(200);
+    const res2 = await bgrun.execute("call-n4", { command: "echo long", name: longName }, undefined, undefined, ctx);
+    const text2 = res2.content[0].text as string;
+    const nameLine = (text2.match(/^  name: (.+)$/m) || [])[1];
+    assert.equal(nameLine.length, 80, "name truncated to 80 chars");
+
+    await waitForWakes(wakes, 2);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: name survives session_start reconstruction", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // First instance: run a named job, capture entries.
+    const { pi: pi1, wakes, entries, tools: tools1, ctx: ctx1 } = makeFakePi();
+    await loadExtension(pi1);
+    const bgrun1 = tools1.get("bgrun")!;
+    const res = await bgrun1.execute("call-n5", { command: "echo named-restart", name: "rebuild" }, undefined, undefined, ctx1);
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    // Second instance: reconstruct from entries, name should be restored.
+    const { pi: pi2, tools: tools2, ctx: ctx2, fireSessionStart } = makeFakePi({ priorEntries: entries });
+    await loadExtension(pi2);
+    await fireSessionStart();
+
+    const bgstatus2 = tools2.get("bgstatus")!;
+    const status = await bgstatus2.execute("call-n6", { id }, undefined, undefined, ctx2);
+    const text = status.content[0].text as string;
+    assert.match(text, /name: rebuild/);
+    assert.ok(!text.includes("recovered from log"), "reconstructed from entries, not log");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgstatus: list shows name after job id", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgstatus = tools.get("bgstatus")!;
+
+    await bgrun.execute("call-n7", { command: "sleep 0.1; echo listed", name: "nightly" }, undefined, undefined, ctx);
+    await waitForWakes(wakes, 1);
+
+    const list = await bgstatus.execute("call-n8", {}, undefined, undefined, ctx);
+    assert.match(list.content[0].text as string, /— nightly: done exit=0/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session_start: adopts running jobs from the jobs dir (other session's job) into the widget", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // A log with no exit marker whose pid is alive (this test process's own pid).
+    const adoptedId = `kafka-bootstrap-${Date.now()}-${process.pid}`;
+    writeFileSync(join(dir, `${adoptedId}.log`), "job still going\n");
+
+    const { pi, tools, ctx, fireSessionStart } = makeFakePi();
+    ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) => widgetCalls.push(lines);
+
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    // Widget should now show the adopted job.
+    const shown = widgetCalls.find((l) => Array.isArray(l)) ?? [];
+    const flat = (shown as string[]).join("\n");
+    assert.match(flat, /bgrun: 1 running/);
+    assert.match(flat, new RegExp(adoptedId.slice(0, 20)));
+    assert.match(flat, /\(adopted\)/);
+    assert.match(flat, /since \d{2}:\d{2}:\d{2}/);
+
+    // bgstatus single-id should also see it as running (in-memory now).
+    const bgstatus = tools.get("bgstatus")!;
+    const res = await bgstatus.execute("call-a1", { id: adoptedId }, undefined, undefined, ctx);
+    assert.match(res.content[0].text as string, /: running/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session_start: does NOT adopt finished or dead-pid jobs", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // Finished (exit marker present).
+    writeFileSync(join(dir, `done-job-${Date.now()}-${process.pid}.log`), "out\n__BGRUN_EXIT__=0\n");
+    // No marker but pid is certainly dead (pid 1 is launchd — alive, so use a likely-dead high pid).
+    // Use pid 1-style trick instead: a dead pid we spawn and reap.
+    const { spawnSync } = await import("node:child_process");
+    const dead = spawnSync("sh", ["-c", "exit 0"]);
+    assert.equal(dead.status, 0);
+    // Write log with a pid that no longer exists: use the reaped child's pid if captured, else 999999.
+    const deadPid = dead.pid ?? 999999;
+    writeFileSync(join(dir, `dead-job-${Date.now()}-${deadPid}.log`), "partial\n");
+
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    ctx.hasUI = true;
+    let widgetShown = false;
+    ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) => {
+      if (lines) widgetShown = true;
+    };
+
+    await loadExtension(pi);
+    await fireSessionStart();
+    assert.equal(widgetShown, false, "no widget for finished/dead jobs");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: job id encodes the CHILD's pid, not pi's own pid", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    const res = await bgrun.execute("call-pid", { command: "echo pidcheck" }, undefined, undefined, ctx);
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    const idPid = Number(id.split("-").pop());
+    assert.ok(idPid > 0, `id ends with child pid: ${id}`);
+    assert.notEqual(idPid, process.pid, "id must NOT carry pi's own pid");
+    // Log file named after the id, no .tmp- leftovers.
+    assert.ok(existsSync(join(dir, `${id}.log`)), "log at final id-named path");
+    assert.equal(readdirSync(dir).filter((f) => f.startsWith(".tmp-")).length, 0, "no temp log leftovers");
+
+    await waitForWakes(wakes, 1);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgclean: removes a FINISHED job's old log even when its id-pid is alive", async () => {
+  // Regression: exit marker must win over pid liveness. Old code checked
+  // pid first, so any log whose id-pid happened to be a live process (e.g.
+  // pi's own pid from the old id bug, or pid reuse) was kept forever.
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // Old finished log whose id-pid is THIS process (alive!) — must still be removed.
+    const oldPath = join(dir, `stale-job-1000000000-${process.pid}.log`);
+    writeFileSync(oldPath, "stale\n__BGRUN_EXIT__=2\n");
+    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const fs = await import("node:fs");
+    fs.utimesSync(oldPath, oldTime, oldTime);
+
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgclean = tools.get("bgclean")!;
+
+    const result = await bgclean.execute("call-stale", { days: 7 }, undefined, undefined, ctx);
+    assert.match(result.content[0].text as string, /removed 1/);
+    assert.ok(!existsSync(oldPath), "finished job's log removed despite live id-pid");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session_start adoption: skips finished jobs even with a live id-pid", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // Finished job (exit marker) whose id-pid is this process (alive).
+    writeFileSync(join(dir, `done-job-${Date.now()}-${process.pid}.log`), "out\n__BGRUN_EXIT__=0\n");
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    ctx.hasUI = true;
+    let widgetShown = false;
+    ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) => {
+      if (lines) widgetShown = true;
+    };
+    await loadExtension(pi);
+    await fireSessionStart();
+    assert.equal(widgetShown, false, "finished job not adopted even though id-pid is alive");
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });

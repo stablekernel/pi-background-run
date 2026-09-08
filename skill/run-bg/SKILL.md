@@ -26,14 +26,15 @@ no polling.
 
 | Action | Tool |
 |---|---|
-| Start  | `bgrun(command: "make test-short")` → `started: <job-id>` |
+| Start  | `bgrun(command: "make test-short", name: "unit-tests")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the status widget, and wake messages) |
 | Status | `bgstatus(<job-id>)` or `bgstatus()` for all |
 | Tail   | `bgtail(<job-id>, 40)` |
 | Clean  | `bgclean(7)` |
 
 ## Workflow
 
-1. **Start:** call `bgrun` with the command. Note the returned job-id. Continue other
+1. **Start:** call `bgrun` with the command (and a short `name`, e.g. `name: "unit-tests"`).
+   Note the returned job-id. Continue other
    work; you will be woken automatically when the job finishes.
 2. **On wake:** check the exit status in the wake message first.
    - `exit: 0` → success. `bgtail` to confirm.

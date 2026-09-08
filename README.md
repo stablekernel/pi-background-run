@@ -30,7 +30,7 @@ Restart pi after install so the extension loads.
 
 | Tool | Purpose |
 |------|---------|
-| `bgrun` | Launch a command detached in the background. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
+| `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
 | `bgstatus` | List jobs (running + done) with exit codes. Reads the in-memory table while pi is alive; scans the jobs dir after restart. |
 | `bgtail` | Print the last N lines of a job's log (default 40), stripping the exit marker. |
 | `bgclean` | Remove old job logs (default 7 days). Skips running jobs while pi is alive. |
@@ -41,7 +41,7 @@ Restart pi after install so the extension loads.
 ## How it works
 
 ```
-agent calls bgrun(command: "make test-short")
+agent calls bgrun(command: "make test-short", name: "unit-tests")
   → extension resolves log path: ~/.pi-bgrun/jobs/<slug>-<ts>-<pid>.log
   → spawn('sh', ['-c', '<cmd>; ec=$?; printf "\\n__BGRUN_EXIT__=%d\\n" "$ec"; exit $ec'],
           { stdio: ['ignore', logFd, logFd], detached: true }).unref()

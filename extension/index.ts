@@ -32,6 +32,7 @@ import {
   readFileSync,
   mkdirSync,
   readdirSync,
+  renameSync,
   unlinkSync,
   statSync,
 } from "node:fs";
@@ -50,12 +51,14 @@ interface JobRecord {
   id: string;
   pid: number;
   cmd: string;
+  name?: string; // optional human-readable label
   started: number;
   logPath: string;
   exitedAt?: number;
   exitCode?: number;
-  child?: ReturnType<typeof spawn>;
+  child?: ReturnType<typeof spawn>; // absent for adopted (fs-discovered) jobs
   ctx: ExtensionContext; // captured at tool-call time for isIdle() in the exit handler
+  adopted?: boolean; // true when discovered from the jobs dir (another session's job)
 }
 
 // Shape persisted via pi.appendEntry — survives same-session restart, renders
@@ -64,6 +67,7 @@ interface BgrunJobEntryData {
   id: string;
   pid: number;
   cmd: string;
+  name?: string;
   started: number;
   logPath: string;
   state: "running" | "done";
@@ -76,6 +80,7 @@ interface BgStatusDetails {
   state?: string;
   exitCode?: number;
   cmd?: string;
+  name?: string;
   count?: number;
   recovered?: boolean;
 }
@@ -99,6 +104,13 @@ export default function (pi: ExtensionAPI) {
     const raw = command.toLowerCase().replace(/[/\\.-]+/g, " ").trim();
     const slug = raw.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
     return slug || "job";
+  }
+
+  // Normalize an optional human-readable name: trim, drop blank, cap length.
+  function sanitizeName(name: string | undefined): string | undefined {
+    const trimmed = (name ?? "").trim();
+    if (!trimmed) return undefined;
+    return trimmed.slice(0, 80);
   }
 
   function readLastLogLine(logPath: string, maxLen = 200): string | null {
@@ -147,9 +159,11 @@ export default function (pi: ExtensionAPI) {
     }
     const lines = [`📊 bgrun: ${running.length} running`];
     for (const rec of running) {
-      const elapsed = Math.floor((Date.now() - rec.started) / 1000);
+      const startedAt = new Date(rec.started).toLocaleTimeString([], { hour12: false });
       const cmd = rec.cmd.length > 40 ? rec.cmd.slice(0, 37) + "…" : rec.cmd;
-      lines.push(`  ${rec.id.slice(0, 20)}  ${cmd.padEnd(40)}  (${elapsed}s)`);
+      const label = rec.name ? `${rec.name} · ${cmd}` : cmd.padEnd(40);
+      const tag = rec.adopted ? " (adopted)" : "";
+      lines.push(`  ${rec.id.slice(0, 20)}  ${label}  (since ${startedAt})${tag}`);
     }
     ctx.ui.setWidget("bgrun", lines);
   }
@@ -185,16 +199,22 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
       const id = name.slice(0, -".log".length);
-      // Never clean a running job. Check in-memory Map first, then pid from filename.
-      const rec = jobs.get(id);
-      if (rec && rec.exitCode === undefined) {
-        result.skippedRunning++;
-        continue;
-      }
-      const pid = pidFromId(id);
-      if (pid !== null && pid > 0 && isRunningPid(pid)) {
-        result.skippedRunning++;
-        continue;
+      // Exit marker is the authoritative finished signal — check it BEFORE pid
+      // liveness, so completed jobs are never mistaken for running (pid reuse
+      // and shared pids made the old order keep stale jobs forever).
+      const finished = parseExitFromLog(logPath) !== null;
+      if (!finished) {
+        // No marker yet — running only if the pid is alive.
+        const rec = jobs.get(id);
+        if (rec && rec.exitCode === undefined) {
+          result.skippedRunning++;
+          continue;
+        }
+        const pid = pidFromId(id);
+        if (pid !== null && pid > 0 && isRunningPid(pid)) {
+          result.skippedRunning++;
+          continue;
+        }
       }
       try {
         unlinkSync(logPath);
@@ -216,7 +236,8 @@ export default function (pi: ExtensionAPI) {
     const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
     const icon = d.state === "done" ? (d.exitCode === 0 ? "✅" : "❌") : "🔄";
     const exitStr = d.state === "done" ? ` exit=${d.exitCode ?? "?"}` : "";
-    box.addChild(new Text(`${icon} ${theme.fg("accent", "bgrun")} ${d.id}${exitStr}`, 0, 0));
+    const namePrefix = d.name ? `"${d.name}" ` : "";
+    box.addChild(new Text(`${icon} ${theme.fg("accent", "bgrun")} ${namePrefix}${d.id}${exitStr}`, 0, 0));
     const cmdPreview = d.cmd.length > 60 ? d.cmd.slice(0, 57) + "…" : d.cmd;
     box.addChild(new Text(theme.fg("dim", `  $ ${cmdPreview}`), 0, 0));
     if (expanded) {
@@ -253,6 +274,7 @@ export default function (pi: ExtensionAPI) {
           id: d.id,
           pid: d.pid,
           cmd: d.cmd,
+          name: d.name,
           started: d.started,
           logPath: d.logPath,
           exitedAt: d.exitedAt,
@@ -263,6 +285,42 @@ export default function (pi: ExtensionAPI) {
     } catch (err) {
       console.error("[pi-bgrun] session_start reconstruction failed:", (err as Error).message);
     }
+
+    // Adopt running jobs discovered from the jobs dir (started by other sessions).
+    // These render in the widget and bgstatus, but have no ChildProcess handle —
+    // no exit event, so no wake-on-exit for adopted jobs.
+    try {
+      for (const name of readdirSync(jobsDir)) {
+        if (!name.endsWith(".log")) continue;
+        const id = name.slice(0, -".log".length);
+        if (jobs.has(id)) continue;
+        const logPath = join(jobsDir, name);
+        const exit = parseExitFromLog(logPath);
+        if (exit !== null) continue; // finished — nothing to show in the widget
+        const pid = pidFromId(id);
+        if (pid === null || pid <= 0 || !isRunningPid(pid)) continue; // dead pid, marker just not written yet
+        let started = Date.now();
+        try {
+          started = statSync(logPath).birthtimeMs;
+        } catch {
+          // keep fallback
+        }
+        jobs.set(id, {
+          id,
+          pid,
+          cmd: "(started by another session)",
+          started,
+          logPath,
+          ctx,
+          adopted: true,
+        });
+      }
+    } catch {
+      // jobs dir doesn't exist — nothing to adopt.
+    }
+
+    // Show the widget if anything is now running (covers adopted + reconstructed jobs).
+    updateWidget(ctx);
     // Auto-cleanup of old logs (14-day default, fire-and-forget).
     cleanOldJobs(AUTO_CLEANUP_DAYS, ctx);
   });
@@ -281,10 +339,12 @@ export default function (pi: ExtensionAPI) {
     description:
       "Run a long shell command detached in the background. Returns 'started: <job-id>' immediately. " +
       "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
-      "expected to run >30s or emit >100 lines (tests, builds, linters).",
+      "expected to run >30s or emit >100 lines (tests, builds, linters). Optionally pass `name` for a " +
+      "short human-readable label used in the job id, status output, and wake messages.",
     promptSnippet: "Run a long command detached in the background; get woken on completion",
     promptGuidelines: [
       "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
+      "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
       "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
       "Never cat or Read a full bgrun log — use bgtail for a peek or ctx_execute_file for failure analysis.",
     ],
@@ -292,22 +352,34 @@ export default function (pi: ExtensionAPI) {
       command: Type.String({
         description: "Shell command to run in the background. Run as `sh -c`, so pipes and && work.",
       }),
+      name: Type.Optional(
+        Type.String({
+          description:
+            "Optional short human-readable label for the job (e.g. 'unit-tests', 'frontend-build'). " +
+            "Used in the job id, status output, the status widget, and wake messages.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { command } = params;
+      const { command, name: rawName } = params;
       if (!command || !command.trim()) {
         throw new Error("bgrun: command is required");
       }
+      const name = sanitizeName(rawName);
 
       mkdirSync(jobsDir, { recursive: true });
 
-      const slug = makeSlug(command);
+      const slug = makeSlug(name ?? command);
       const ts = Math.floor(Date.now() / 1000);
-      const id = `${slug}-${ts}-${process.pid}`;
-      const logPath = join(jobsDir, `${id}.log`);
-
-      const logFd = openSync(logPath, "w");
-
+      // The id must carry the CHILD's pid (liveness checks depend on it), but the
+      // log fd must exist before spawn. Create at a temp path, rename after spawn.
+      const tmpPath = join(jobsDir, `.tmp-${slug}-${ts}-${Math.random().toString(36).slice(2, 8)}.log`);
+      let logFd: number;
+      try {
+        logFd = openSync(tmpPath, "w");
+      } catch (err) {
+        throw new Error(`bgrun: cannot create log file: ${(err as Error).message}`);
+      }
       const wrapped = `${command}; ec=$?; printf '\\n${EXIT_MARKER}%d\\n' "$ec"; exit $ec`;
 
       const child = spawn("sh", ["-c", wrapped], {
@@ -316,10 +388,20 @@ export default function (pi: ExtensionAPI) {
       });
       child.unref();
 
+      const childPid = child.pid ?? -1;
+      const id = `${slug}-${ts}-${childPid}`;
+      const logPath = join(jobsDir, `${id}.log`);
+      try {
+        renameSync(tmpPath, logPath);
+      } catch (err) {
+        console.error(`[pi-bgrun] rename to final log path failed:`, (err as Error).message);
+      }
+
       const record: JobRecord = {
         id,
-        pid: child.pid ?? -1,
+        pid: childPid,
         cmd: command,
+        name,
         started: Date.now(),
         logPath,
         child,
@@ -330,8 +412,9 @@ export default function (pi: ExtensionAPI) {
       // Persist a bgrun-job entry (running state) — transcript card + restart recovery.
       pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
         id,
-        pid: child.pid ?? -1,
+        pid: childPid,
         cmd: command,
+        name,
         started: Date.now(),
         logPath,
         state: "running",
@@ -359,6 +442,7 @@ export default function (pi: ExtensionAPI) {
           id,
           pid: rec.pid,
           cmd: rec.cmd,
+          name: rec.name,
           started: rec.started,
           logPath,
           state: "done",
@@ -367,7 +451,8 @@ export default function (pi: ExtensionAPI) {
         });
 
         // Wake the agent.
-        let wake = `${exitEmoji} Background job \`${id}\` finished (exit ${exitStr}).\n`;
+        const namePrefix = rec.name ? `"${rec.name}" ` : "";
+        let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
         wake += `Command: ${command}\n`;
         if (lastLine) wake += `Last output: ${lastLine}\n`;
         wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
@@ -387,7 +472,8 @@ export default function (pi: ExtensionAPI) {
 
         // Toast for the human.
         if (rec.ctx.hasUI) {
-          rec.ctx.ui.notify(`${exitEmoji} ${command.slice(0, 50)} → exit ${exitStr}`, exitCode === 0 ? "info" : "error");
+          const toastLabel = (rec.name ?? command).slice(0, 50);
+          rec.ctx.ui.notify(`${exitEmoji} ${toastLabel} → exit ${exitStr}`, exitCode === 0 ? "info" : "error");
         }
 
         // Update/clear the widget.
@@ -400,14 +486,12 @@ export default function (pi: ExtensionAPI) {
         updateWidget(ctx);
       });
 
+      const startedLines = [`started: ${id}`];
+      if (name) startedLines.push(`  name: ${name}`);
+      startedLines.push(`  log: ${logPath}`, `  You'll be woken automatically when it finishes.`);
       return {
-        content: [
-          {
-            type: "text",
-            text: `started: ${id}\n  log: ${logPath}\n  You'll be woken automatically when it finishes.`,
-          },
-        ],
-        details: { id, logPath, pid: child.pid },
+        content: [{ type: "text", text: startedLines.join("\n") }],
+        details: { id, name, logPath, pid: childPid },
       };
     },
   });
@@ -468,9 +552,12 @@ export default function (pi: ExtensionAPI) {
         if (rec) {
           const state = rec.exitCode !== undefined ? "done" : "running";
           const exit = rec.exitCode !== undefined ? ` exit=${rec.exitCode}` : "";
+          const lines = [`${id}: ${state}${exit}`];
+          if (rec.name) lines.push(`  name: ${rec.name}`);
+          lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
           return {
-            content: [{ type: "text", text: `${id}: ${state}${exit}\n  cmd: ${rec.cmd}\n  log: ${rec.logPath}` }],
-            details: { id, state, exitCode: rec.exitCode ?? undefined, cmd: rec.cmd, recovered: false },
+            content: [{ type: "text", text: lines.join("\n") }],
+            details: { id, state, exitCode: rec.exitCode ?? undefined, cmd: rec.cmd, name: rec.name, recovered: false },
           };
         }
         const logPath = join(jobsDir, `${id}.log`);
@@ -498,7 +585,8 @@ export default function (pi: ExtensionAPI) {
         seen.add(jid);
         const state = rec.exitCode !== undefined ? "done" : "running";
         const exit = rec.exitCode !== undefined ? ` exit=${rec.exitCode}` : "";
-        lines.push(`  ${jid}: ${state}${exit}`);
+        const label = rec.name ? `${jid} — ${rec.name}` : jid;
+        lines.push(`  ${label}: ${state}${exit}`);
       }
       try {
         for (const name of readdirSync(jobsDir)) {
