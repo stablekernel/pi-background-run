@@ -1,6 +1,6 @@
 {
   "name": "pi-background-run",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Run long shell commands detached in the background for pi; get woken on completion. Output lands in a file; context stays clean.",
   "type": "module",
   "license": "MIT",
