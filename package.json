@@ -26,11 +26,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/stablekernel/pi-bgrun.git"
+    "url": "https://github.com/stablekernel/pi-background-run.git"
   },
-  "homepage": "https://github.com/stablekernel/pi-bgrun#readme",
+  "homepage": "https://github.com/stablekernel/pi-background-run#readme",
   "bugs": {
-    "url": "https://github.com/stablekernel/pi-bgrun/issues"
+    "url": "https://github.com/stablekernel/pi-background-run/issues"
   },
   "keywords": [
     "pi",

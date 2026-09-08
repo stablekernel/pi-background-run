@@ -1,9 +1,9 @@
-# pi-bgrun
+# pi-background-run
 
 Run long shell commands (test suites, builds, linters) as detached background jobs
 so your pi agent session stays unblocked and its context stays clean. Output lands
 in a file under `~/.pi-bgrun/jobs/`; the command returns immediately. When the job
-finishes, pi-bgrun **wakes the live agent session** so it proactively reads the
+finishes, pi-background-run **wakes the live agent session** so it proactively reads the
 results and continues — no polling, no human intervention.
 
 Built as a [pi](https://github.com/earendil-works/pi-coding-agent) extension. No
@@ -19,8 +19,7 @@ pi install npm:pi-background-run
 ```
 
 > The npm package is `pi-background-run` — npm blocked the name `pi-bgrun`
-> (too similar to the existing `pi-bg-run`), and the GitHub repo keeps the
-> original name.
+> (too similar to the existing `pi-bg-run`).
 
 Or the scoped alias (same code, permanent namespace claim):
 
