@@ -13,11 +13,13 @@ never blocks. The extension wakes this session automatically when the job finish
 no polling.
 
 ## When to use
+
 - Any command expected to run > ~30s OR emit > ~100 lines.
 - Typical: `make test`, `go test ./...`, `make lint`, `make build`.
 - Integration / infra suites (long-running, always background).
 
 ## When NOT to use
+
 - Commands that complete in < ~5s — the overhead isn't worth it.
 - Short, quiet commands whose full output you actually need (`git status`).
 - Interactive commands (prompts, REPL, SSH) — bgrun detaches from the terminal.
@@ -27,9 +29,9 @@ no polling.
 | Action | Tool |
 |---|---|
 | Start  | `bgrun(command: "make test-short", name: "unit-tests")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the status widget, and wake messages) |
-| Status | `bgstatus(<job-id>)` or `bgstatus()` for all |
+| Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
 | Tail   | `bgtail(<job-id>, 40)` |
-| Clean  | `bgclean(7)` |
+| Clean  | `bgclean()` (default 7-day retention) |
 
 ## Workflow
 
@@ -51,6 +53,7 @@ no polling.
 
 - **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker.
 - **Whole-log failure analysis:** `ctx_execute_file` on the log path:
+
   ```
   ctx_execute_file(
     path: "~/.pi-bgrun/jobs/<JOB>.log",
@@ -61,6 +64,7 @@ no polling.
            console.log(fails.slice(0,40).join('\\n'));"
   )
   ```
+
   A 10 000-line `make test` log collapses to a ~30-line summary in context.
 
 **Never `cat`, `Read`, or `bash cat` a full bgrun log.** Always `bgtail` or
@@ -70,16 +74,20 @@ no polling.
 
 - The live wake does not survive a pi restart or a `/resume` to a different session
   (the extension loses the child process handle). The log still completes on disk.
-- After a restart/switch, `bgstatus` scans `~/.pi-bgrun/jobs/` and recovers exit codes
-  from the log's `__BGRUN_EXIT__=N` marker. If you were waiting on a job, run
-  `bgstatus` to find it.
+- After a restart/switch, run `bgstatus(<job-id>)` — the id still resolves via the
+  log's `__BGRUN_EXIT__=N` marker. To browse everything on disk, use
+  `bgstatus(includeDone: true)`.
+- Each session only tracks its own jobs by default. Jobs from other sessions
+  appear only when `adoptForeignJobs` is enabled in `~/.pi/agent/pi-bgrun.json`
+  (or `PI_BGRUN_FOREIGN_JOBS=1`).
 
 ## Rules
 
 - Call the tools; never hand-roll `nohup … &` inline.
 - One job = one id. Multiple concurrent jobs are fine — each has its own log.
 - Logs live in `~/.pi-bgrun/jobs` (override with `PI_BGRUN_DIR`).
-- Run `bgclean` periodically; the extension also auto-sweeps old logs on startup
-  (14-day threshold).
+- Cleanup: `bgclean` manually; auto-sweeps run at session start/shutdown, at
+  most once per `cleanupDays` (default 7, configurable in
+  `~/.pi/agent/pi-bgrun.json` or `PI_BGRUN_CLEANUP_DAYS`).
 - To stop a running job, use `bash` with `kill <pid>` (the pid is in the `bgstatus`
   output). There is no `bgkill` tool.

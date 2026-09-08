@@ -34,9 +34,9 @@ Restart pi after install so the extension loads.
 | Tool | Purpose |
 | ------ | --------- |
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
-| `bgstatus` | List jobs (running + done) with exit codes. Reads the in-memory table while pi is alive; scans the jobs dir after restart. |
+| `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Jobs from other sessions are only listed when `adoptForeignJobs` is enabled. |
 | `bgtail` | Print the last N lines of a job's log (default 40), stripping the exit marker. |
-| `bgclean` | Remove old job logs (default 7 days). Skips running jobs while pi is alive. |
+| `bgclean` | Remove old job logs. Default retention: `cleanupDays` config (7 days). Always runs — not throttled. |
 
 `bgwait` and `bgkill` are not provided — the pi port has no shell runner. Use
 `bash` with `kill` if you ever need to stop a running job.
@@ -72,9 +72,44 @@ exit code even after a restart.
 
 ## Configuration
 
+The jobs dir (`~/.pi-bgrun/jobs`) is shared by **every pi session on the
+machine**. By default each session only *tracks its own jobs*: the widget and
+`bgstatus` listings show this session's running jobs, and finished jobs are
+hidden (ask for them explicitly with `bgstatus includeDone: true`). Jobs
+started by other sessions can still be inspected by id, but they don't clutter
+your widget.
+
+Configuration is layered (later wins): **defaults ← user config file ← project
+config file (trusted projects only) ← environment variables**.
+
+- User: `~/.pi/agent/pi-bgrun.json`
+- Project: `<project>/.pi/pi-bgrun.json`
+
+```json
+{
+  "adoptForeignJobs": false,
+  "showCompletedJobs": false,
+  "cleanupDays": 7,
+  "jobsDir": "/some/other/dir"
+}
+```
+
+Environment variables (same knobs, handy for one-off overrides):
+
 | Variable | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `PI_BGRUN_DIR` | `~/.pi-bgrun/jobs` | Override where job logs are stored. |
+| `PI_BGRUN_FOREIGN_JOBS` | `false` | Adopt other sessions' running jobs into this session's widget and job list. Adopted jobs are polled so they leave the widget when they finish. |
+| `PI_BGRUN_SHOW_COMPLETED` | `false` | Include finished jobs in `bgstatus` listings by default. |
+| `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for auto-clean sweeps and the `bgclean` default. |
+
+### Log cleanup
+
+- **Auto-sweep** runs at `session_start` and `session_shutdown`, but at most
+  **once per `cleanupDays`** (tracked by a `.last-clean` marker in the jobs dir)
+  — restart-heavy workflows don't re-sweep on every launch.
+- **Manual** `bgclean` always runs immediately and refreshes the marker.
+- Running jobs are never swept while their pid is alive.
 
 ## Status
 
