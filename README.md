@@ -15,13 +15,17 @@ the agent. The log file is self-describing (full output + a trailing
 ## Install
 
 ```bash
-pi install npm:pi-bgrun
+pi install npm:pi-background-run
 ```
+
+> The npm package is `pi-background-run` — npm blocked the name `pi-bgrun`
+> (too similar to the existing `pi-bg-run`), and the GitHub repo keeps the
+> original name.
 
 Or the scoped alias (same code, permanent namespace claim):
 
 ```bash
-pi install npm:@stablekernel/pi-bgrun
+pi install npm:@stablekernel/pi-background-run
 ```
 
 Restart pi after install so the extension loads.
@@ -29,7 +33,7 @@ Restart pi after install so the extension loads.
 ## Tools registered
 
 | Tool | Purpose |
-|------|---------|
+| ------ | --------- |
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
 | `bgstatus` | List jobs (running + done) with exit codes. Reads the in-memory table while pi is alive; scans the jobs dir after restart. |
 | `bgtail` | Print the last N lines of a job's log (default 40), stripping the exit marker. |

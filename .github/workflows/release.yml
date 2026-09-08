@@ -1,6 +1,6 @@
 name: Release
 
-# STATE-MUTATING WORKFLOW — publishes to npm (dual publish: pi-bgrun + @stablekernel/pi-bgrun).
+# STATE-MUTATING WORKFLOW — publishes to npm (dual publish: pi-background-run + @stablekernel/pi-background-run).
 # dry-run safety, concurrency serialization, annotations, and summary are all MANDATORY.
 on:
   release:
@@ -33,7 +33,8 @@ jobs:
     permissions:
       contents: read
       # id-token: write is required for npm OIDC trusted publishing (provenance).
-      # PREREQUISITE: BOTH npm packages (`pi-bgrun` and `@stablekernel/pi-bgrun`)
+      # PREREQUISITE: BOTH npm packages (`pi-background-run` and
+      # `@stablekernel/pi-background-run`)
       # must have trusted-publisher configurations pointing at this repo + workflow.
       id-token: write
 
@@ -78,41 +79,41 @@ jobs:
             echo "::notice::DRY-RUN — package.json version that would be published: ${pkg_version}"
           fi
 
-      # ── Publish primary (unscoped: pi-bgrun) ──────────────────────────────
-      # package.json ships with "name": "pi-bgrun" so the default publish hits the
-      # primary. All-or-nothing: a failure here fails the job before the alias step.
-      - name: Publish primary (pi-bgrun)
+      # ── Publish primary (unscoped: pi-background-run) ──────────────────────────────
+      # package.json ships with "name": "pi-background-run" so the default publish
+      # hits the primary. All-or-nothing: a failure here fails the job before the alias step.
+      - name: Publish primary (pi-background-run)
         id: publish_primary
         if: ${{ github.event_name == 'release' || !inputs.dry-run }}
         env:
           PKG_VERSION: ${{ steps.version_check.outputs.pkg_version }}
         run: |
           npm publish --provenance --access public
-          echo "::notice::Published pi-bgrun@${PKG_VERSION} to npm"
+          echo "::notice::Published pi-background-run@${PKG_VERSION} to npm"
 
       - name: Publish primary dry-run
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
         run: npm publish --dry-run --access public
 
-      # ── Publish alias (scoped: @stablekernel/pi-bgrun) ─────────────────────
+      # ── Publish alias (scoped: @stablekernel/pi-background-run) ──────────────────
       # Same tarball, different name. Rewrite package.json's name field, repack.
       # All-or-nothing: if the primary publish succeeded but this fails, the job
       # fails — leaving the primary published without the alias. Acceptable: the
       # primary is the canonical name; the alias is a permanent-namespace nice-to-have.
-      - name: Publish alias (@stablekernel/pi-bgrun)
+      - name: Publish alias (@stablekernel/pi-background-run)
         id: publish_alias
         if: ${{ github.event_name == 'release' || !inputs.dry-run }}
         env:
           PKG_VERSION: ${{ steps.version_check.outputs.pkg_version }}
         run: |
-          node -e "const p=require('./package.json'); p.name='@stablekernel/pi-bgrun'; require('fs').writeFileSync('./package.json', JSON.stringify(p,null,2)+'\n')"
+          node -e "const p=require('./package.json'); p.name='@stablekernel/pi-background-run'; require('fs').writeFileSync('./package.json', JSON.stringify(p,null,2)+'\n')"
           npm publish --provenance --access public
-          echo "::notice::Published @stablekernel/pi-bgrun@${PKG_VERSION} to npm"
+          echo "::notice::Published @stablekernel/pi-background-run@${PKG_VERSION} to npm"
 
       - name: Publish alias dry-run
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
         run: |
-          node -e "const p=require('./package.json'); p.name='@stablekernel/pi-bgrun'; require('fs').writeFileSync('./package.json', JSON.stringify(p,null,2)+'\n')"
+          node -e "const p=require('./package.json'); p.name='@stablekernel/pi-background-run'; require('fs').writeFileSync('./package.json', JSON.stringify(p,null,2)+'\n')"
           npm publish --dry-run --access public
 
       # ── Deprecate the alias in favor of the primary ────────────────────────
@@ -124,7 +125,7 @@ jobs:
           PKG_VERSION: ${{ steps.version_check.outputs.pkg_version }}
         continue-on-error: true
         run: |
-          npm deprecate "@stablekernel/pi-bgrun@${PKG_VERSION}" "Use pi-bgrun (the unscoped primary) instead: pi install npm:pi-bgrun"
+          npm deprecate "@stablekernel/pi-background-run@${PKG_VERSION}" "Use pi-background-run (the unscoped primary) instead: pi install npm:pi-background-run"
 
       - name: Write publish summary
         if: always()
@@ -144,7 +145,7 @@ jobs:
             echo "| Version | \`${PKG_VERSION}\` |"
             echo "| Event | \`${EVENT_NAME}\` |"
             echo "| Dry-run | \`${IS_DRY_RUN}\` |"
-            echo "| Primary publish (pi-bgrun) | \`${PRIMARY_OUTCOME}\` |"
-            echo "| Alias publish (@stablekernel/pi-bgrun) | \`${ALIAS_OUTCOME}\` |"
+            echo "| Primary publish (pi-background-run) | \`${PRIMARY_OUTCOME}\` |"
+            echo "| Alias publish (@stablekernel/pi-background-run) | \`${ALIAS_OUTCOME}\` |"
             echo "| Release tag | \`${RELEASE_TAG:-N/A}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

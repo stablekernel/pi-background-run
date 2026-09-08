@@ -1,5 +1,5 @@
 {
-  "name": "pi-bgrun",
+  "name": "pi-background-run",
   "version": "0.1.0",
   "description": "Run long shell commands detached in the background for pi; get woken on completion. Output lands in a file; context stays clean.",
   "type": "module",
