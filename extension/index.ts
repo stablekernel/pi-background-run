@@ -594,7 +594,7 @@ export default function (pi: ExtensionAPI) {
       "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
       "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
       "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
-      "Never cat or Read a full bgrun log — use bgtail for a peek or ctx_execute_file for failure analysis.",
+      "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use ctx_execute_file on the log path only when the condensed tail is insufficient.",
     ],
     parameters: Type.Object({
       command: Type.String({
@@ -764,14 +764,67 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── bgtail: read last N lines of a job's log, stripping the exit marker ────
+  // ── Log condenser: ANSI strip, per-line cap, collapse runs, total budget ────
+  // Keeps bgtail output small enough that a "quick peek" never floods context:
+  // colored test output often carries 2-3x its text size in ANSI escapes, and
+  // one unbounded line (minified bundle, base64 blob) can blow the whole budget.
+  const ANSI_RE = /[\u001B\u009B][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><]/g;
+  const LINE_CAP = 2000; // chars per line after stripping
+  const TOTAL_CAP = 8000; // chars for the whole bgtail result
+
+  function condenseLogLines(
+    lines: string[],
+    opts: { raw?: boolean } = {},
+  ): { text: string; truncated: string[] } {
+    const notes: string[] = [];
+    if (opts.raw) return { text: lines.join("\n"), truncated: notes };
+    let stripped = 0;
+    let cappedLines = 0;
+    const clean = lines.map((l) => {
+      if (ANSI_RE.test(l)) { stripped++; l = l.replace(ANSI_RE, ""); }
+      return l;
+    });
+    ANSI_RE.lastIndex = 0;
+    // collapse runs of 3+ identical lines (spinner frames, retry spam)
+    const collapsed: { text: string; count: number }[] = [];
+    let runs = 0;
+    for (const l of clean) {
+      const prev = collapsed[collapsed.length - 1];
+      if (prev && prev.text === l) {
+        prev.count++;
+        if (prev.count === 3) runs++;
+      } else {
+        collapsed.push({ text: l, count: 1 });
+      }
+    }
+    const out: string[] = [];
+    let total = 0;
+    for (const c of collapsed) {
+      let line = c.count >= 3 ? `${c.text}  [x${c.count}]` : c.text;
+      if (line.length > LINE_CAP) {
+        line = line.slice(0, LINE_CAP) + ` …[+${line.length - LINE_CAP} chars]`;
+        cappedLines++;
+      }
+      total += line.length + 1;
+      if (total > TOTAL_CAP) {
+        notes.push(`output capped at ${TOTAL_CAP} chars — ${lines.length} raw lines total; raise \`lines\`, use \`raw: true\`, or run ctx_execute_file on the log for whole-log analysis`);
+        break;
+      }
+      out.push(line);
+    }
+    if (stripped > 0) notes.push(`${stripped} ANSI escape sequence${stripped === 1 ? "" : "s"} stripped`);
+    if (runs > 0) notes.push(`${runs} repeated-line run${runs === 1 ? "" : "s"} collapsed`);
+    if (cappedLines > 0) notes.push(`${cappedLines} long line${cappedLines === 1 ? "" : "s"} truncated to ${LINE_CAP} chars`);
+    return { text: out.join("\n"), truncated: notes };
+  }
+
+  // ── bgtail: read last N lines of a job's log, condensed for context ────────
 
   pi.registerTool({
     name: "bgtail",
     label: "Tail Background Log",
     description:
-      "Print the last N lines of a background job's log (default 40). Strips the exit-marker line. " +
-      "Use this for a quick peek at results; use ctx_execute_file on the log path for whole-log failure analysis.",
+      "Print the last N lines of a background job's log (default 40), condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. Pass raw: true for unprocessed output; use ctx_execute_file on the log path for whole-log failure analysis.",
     promptSnippet: "Read the last N lines of a bgrun job's log",
     parameters: Type.Object({
       id: Type.String({
@@ -780,9 +833,14 @@ export default function (pi: ExtensionAPI) {
       lines: Type.Optional(
         Type.Number({ description: "Number of lines to show (default 40)" }),
       ),
+      raw: Type.Optional(
+        Type.Boolean({
+          description: "Skip condensing (ANSI strip, collapse, caps) and return raw text",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { id, lines = 40 } = params;
+      const { id, lines = 40, raw = false } = params;
       if (!id) throw new Error("bgtail: id is required");
       const logPath = join(resolveConfig(ctx).jobsDir, `${id}.log`);
       try {
@@ -791,9 +849,18 @@ export default function (pi: ExtensionAPI) {
           .split("\n")
           .filter((l) => !l.startsWith(EXIT_MARKER) && l.trim().length > 0);
         const tail = all.slice(-lines);
+        const { text, truncated } = condenseLogLines(tail, { raw });
+        const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
         return {
-          content: [{ type: "text", text: tail.join("\n") || "(empty log)" }],
-          details: { id, linesShown: tail.length, logPath, notFound: false },
+          content: [{ type: "text", text: (text + notes) || "(empty log)" }],
+          details: {
+            id,
+            linesShown: tail.length,
+            logPath,
+            notFound: false,
+            condensed: !raw,
+            ...(truncated.length > 0 ? { condenserNotes: truncated } : {}),
+          },
         };
       } catch {
         return {

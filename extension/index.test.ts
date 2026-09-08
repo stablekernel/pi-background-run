@@ -234,6 +234,132 @@ test("bgtail: returns last N lines, strips the exit marker", async () => {
   }
 });
 
+test("bgtail: condenses output — strips ANSI, collapses repeats, caps long lines", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+
+    // 1 ANSI-colored line, 5 identical spinner lines, 1 huge line
+    const esc = "\u001b"; // literal ESC byte, safe to pass through a shell arg
+    const payload =
+      `printf "${esc}[32mOK green${esc}[0m\nwait\nwait\nwait\nwait\nwait\nline3\n"; ` +
+      "echo \"$(printf 'x%.0s' $(seq 1 5000))\"";
+    const res = await bgrun.execute(
+      "call-c1",
+      { command: payload },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    const tail = await bgtail.execute(
+      "call-c1",
+      { id, lines: 40 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text = tail.content[0].text as string;
+    assert.ok(!text.includes("\u001b"), "ANSI escapes stripped");
+    assert.ok(text.includes("OK green"), "text after stripping survives");
+    assert.match(text, /wait  \[x5\]/, "5 identical lines collapsed to one with count");
+    assert.ok(!text.includes("x".repeat(4000)), "5000-char line capped");
+    assert.match(text, /\u2026\[\+3\d{3} chars\]/, "truncation marker present");
+    assert.match(text, /\(\d+ ANSI escape/, "notes mention ANSI stripping");
+    assert.match(text, /1 repeated-line run collapsed/, "notes mention run collapse");
+    assert.ok((tail.details as any).condensed === true);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgtail: raw=true skips condensing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+
+    const esc = "\u001b";
+    const res = await bgrun.execute(
+      "call-c2",
+      { command: `printf "${esc}[31mraw-red${esc}[0m\nwait\nwait\nwait\n"` },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    const tail = await bgtail.execute(
+      "call-c2",
+      { id, raw: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text = tail.content[0].text as string;
+    assert.ok(text.includes("\u001b[31m"), "raw keeps ANSI escapes");
+    assert.ok(text.includes("wait\nwait\nwait"), "raw keeps repeated lines uncollapsed");
+    assert.ok((tail.details as any).condensed === false);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgtail: total cap kicks in on large output with guidance note", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+
+    // ~200 distinct lines x ~500 chars = ~100KB, well past the 8KB total cap
+    const cmd =
+      "for i in $(seq 1 200); do echo \"line-$i $(printf 'y%.0s' $(seq 1 500))\"; done";
+    const res = await bgrun.execute(
+      "call-c3",
+      { command: cmd },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    const tail = await bgtail.execute(
+      "call-c3",
+      { id, lines: 200 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text = tail.content[0].text as string;
+    assert.ok(text.length < 10_000, "result capped well below raw size");
+    assert.match(
+      text,
+      /output capped at 8000 chars — 200 raw lines total/,
+      "cap note names the raw line count and suggests escalation paths",
+    );
+    assert.ok((tail.details as any).condenserNotes, "notes in details too");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("bgstatus: shows running then done with exit code", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;
