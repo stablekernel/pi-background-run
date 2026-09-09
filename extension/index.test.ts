@@ -19,10 +19,11 @@ import {
   readFileSync,
   writeFileSync,
   existsSync,
+  mkdirSync,
   readdirSync,
 } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 
 interface CapturedWake {
@@ -30,7 +31,13 @@ interface CapturedWake {
   options?: Record<string, unknown>;
 }
 
-function makeFakePi(opts: { idle?: boolean; priorEntries?: any[] } = {}): {
+function makeFakePi(
+  opts: {
+    idle?: boolean;
+    priorEntries?: any[];
+    ctxFields?: Record<string, unknown>;
+  } = {},
+): {
   pi: any;
   wakes: CapturedWake[];
   entries: any[];
@@ -60,6 +67,7 @@ function makeFakePi(opts: { idle?: boolean; priorEntries?: any[] } = {}): {
     hasUI: false,
     ui: { notify() {}, setWidget() {}, setStatus() {} },
     sessionManager: { getEntries: () => entries },
+    ...(opts.ctxFields as Record<string, unknown> | undefined),
   };
   const pi = {
     sendUserMessage(text: string, options?: Record<string, unknown>) {
@@ -1769,4 +1777,177 @@ test("formatSince: same-day shows time only; older days include the date", async
   assert.match(prevYearStr, /2025/);
   assert.match(prevYearStr, /Dec 30/);
   assert.match(prevYearStr, /08:00:00/);
+});
+
+// ── Project-local jobs dir ──────────────────────────────────────────────────
+
+test("resolveJobsDirPath: relative resolves against a project root; absolute and no-root fall back", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  const scratch = mkdtempSync(join(tmpdir(), "pi-bgrun-scratch-"));
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+
+    // absolute → used as-is, never flagged project-local (older configs keep
+    // working unchanged — the migration guarantee)
+    const absPath = join(proj, "abs-jobs");
+    const abs = mod.resolveJobsDirPath(absPath, { cwd: proj });
+    assert.equal(abs.dir, absPath);
+    assert.equal(abs.projectLocal, false);
+
+    // relative + project root → resolved against the root, flagged project-local
+    const rel = mod.resolveJobsDirPath(".pi-bgrun/jobs", { cwd: proj });
+    assert.equal(rel.dir, join(proj, ".pi-bgrun", "jobs"));
+    assert.equal(rel.projectLocal, true);
+
+    // unset → global default
+    const none = mod.resolveJobsDirPath(undefined, { cwd: proj });
+    assert.equal(none.dir, join(homedir(), ".pi-bgrun", "jobs"));
+    assert.equal(none.projectLocal, false);
+
+    // relative + cwd that is not a project → global fallback, never cwd-relative
+    const fb = mod.resolveJobsDirPath(".pi-bgrun/jobs", { cwd: scratch });
+    assert.equal(fb.dir, join(homedir(), ".pi-bgrun", "jobs"));
+    assert.equal(fb.projectLocal, false);
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("ensureGitExcluded: appends the jobs dir pattern to .git/info/exclude once per dir", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const repo = mkdtempSync(join(tmpdir(), "pi-bgrun-repo-"));
+  try {
+    mkdirSync(join(repo, ".git", "info"), { recursive: true });
+    mod.ensureGitExcluded(join(repo, ".pi-bgrun", "jobs"));
+    mod.ensureGitExcluded(join(repo, ".pi-bgrun", "jobs"));
+    // a second, different jobs dir under the same repo adds its own pattern
+    mod.ensureGitExcluded(join(repo, ".pi-bgrun", "other"));
+    const exclude = readFileSync(join(repo, ".git", "info", "exclude"), "utf8");
+    assert.match(exclude, /# pi-bgrun job logs/);
+    assert.equal(
+      exclude.split("\n").filter((l) => l.trim() === ".pi-bgrun/jobs/").length,
+      1,
+      "pattern appears exactly once",
+    );
+    assert.ok(exclude.split("\n").includes(".pi-bgrun/other/"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("ensureGitExcluded: linked worktree (.git file) writes to the pointed git dir", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const wt = mkdtempSync(join(tmpdir(), "pi-bgrun-wt-"));
+  const gd = mkdtempSync(join(tmpdir(), "pi-bgrun-gitdir-"));
+  try {
+    writeFileSync(join(wt, ".git"), `gitdir: ${gd}\n`);
+    mod.ensureGitExcluded(join(wt, ".pi-bgrun", "jobs"));
+    const exclude = readFileSync(join(gd, "info", "exclude"), "utf8");
+    assert.match(exclude, /^\.pi-bgrun\/jobs\/$/m);
+    // nothing was created inside the worktree's own .git (it's a file)
+    assert.ok(!existsSync(join(wt, ".git", "info")));
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+    rmSync(gd, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: relative jobsDir in project config → project-local log + auto git-exclude", async () => {
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  delete process.env.PI_BGRUN_DIR;
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    mkdirSync(join(proj, ".pi"), { recursive: true });
+    writeFileSync(
+      join(proj, ".pi", "pi-bgrun.json"),
+      JSON.stringify({ jobsDir: ".pi-bgrun/jobs" }),
+    );
+    const { pi, wakes, tools, ctx } = makeFakePi({
+      ctxFields: { cwd: proj, isProjectTrusted: () => true },
+    });
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    const res = await bgrun.execute(
+      "call-1",
+      { command: "echo project-local" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(
+      /^started: ([^\n]+)/,
+    ) || [])[1];
+    assert.ok(id, "got a job id");
+
+    await waitForWakes(wakes, 1);
+
+    const logPath = join(proj, ".pi-bgrun", "jobs", `${id}.log`);
+    assert.ok(existsSync(logPath), "log written inside the project");
+    assert.match(readFileSync(logPath, "utf8"), /project-local/);
+
+    const exclude = join(proj, ".git", "info", "exclude");
+    assert.ok(existsSync(exclude), "exclude file created");
+    assert.match(readFileSync(exclude, "utf8"), /^\.pi-bgrun\/jobs\/$/m);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("bgtail: prefers the session record's logPath when the jobsDir config changes", async () => {
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  delete process.env.PI_BGRUN_DIR;
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    mkdirSync(join(proj, ".pi"), { recursive: true });
+    writeFileSync(
+      join(proj, ".pi", "pi-bgrun.json"),
+      JSON.stringify({ jobsDir: ".pi-bgrun/jobs" }),
+    );
+    const { pi, wakes, tools, ctx } = makeFakePi({
+      ctxFields: { cwd: proj, isProjectTrusted: () => true },
+    });
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+
+    const res = await bgrun.execute(
+      "call-1",
+      { command: "echo migrated-log" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(
+      /^started: ([^\n]+)/,
+    ) || [])[1];
+    assert.ok(id, "got a job id");
+    await waitForWakes(wakes, 1);
+
+    // A ctx with no project config/trust now resolves the jobs dir to the
+    // GLOBAL default — only the session record's logPath can still find the
+    // log (the mid-upgrade config-change scenario).
+    const plainCtx = { ...ctx, cwd: undefined, isProjectTrusted: undefined };
+    const tail = await bgtail.execute(
+      "call-2",
+      { id, lines: 10 },
+      undefined,
+      undefined,
+      plainCtx,
+    );
+    assert.equal(tail.details.notFound, false);
+    assert.match(tail.content[0].text as string, /migrated-log/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(proj, { recursive: true, force: true });
+  }
 });

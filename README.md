@@ -118,11 +118,41 @@ config file (trusted projects only) ← environment variables**.
 }
 ```
 
+### Project-local logs
+
+A **relative** `jobsDir` (from any config layer, or `PI_BGRUN_DIR`) opts into
+project-local logs: it resolves against the session's project root, so job logs
+land inside the workspace — e.g. `"jobsDir": ".pi-bgrun/jobs"` in the project
+config writes logs to `<project>/.pi-bgrun/jobs`.
+
+Why you might want this:
+
+- Logs sit inside the project sandbox, so project-confined analysis tools
+  (e.g. context-mode's `ctx_execute_file` / `ctx_index`) can process whole logs
+  without pulling raw bytes into the context window.
+- Each checkout/worktree gets its own logs — no cross-project clutter in the
+  shared dir.
+- The dir is auto-added to the repo's `.git/info/exclude` (local-only — the
+  tracked `.gitignore` is never touched), so logs never pollute `git status`.
+  Works in linked worktrees too (`.git` file → pointed git dir).
+
+Rules and migration notes:
+
+- Absolute `jobsDir` values behave exactly as in older versions — nothing
+  moves, nothing breaks on upgrade.
+- If the session cwd is not a recognizable project root (no `.git`/`.pi`), a
+  relative path falls back to the global dir rather than scattering logs
+  across arbitrary directories.
+- Tools resolve a job's log from the session's job record first, so jobs
+  started before a config change stay readable after it.
+- Existing logs in the old global dir are not migrated (they're ephemeral,
+  `cleanupDays`-retained); `bgclean all` sweeps them once you've switched.
+
 Environment variables (same knobs, handy for one-off overrides):
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `PI_BGRUN_DIR` | `~/.pi-bgrun/jobs` | Override where job logs are stored. |
+| `PI_BGRUN_DIR` | `~/.pi-bgrun/jobs` | Override where job logs are stored. An absolute path is used as-is; a **relative** path resolves against the project root (see [project-local logs](#project-local-logs)), falling back to the default when there is no project root. |
 | `PI_BGRUN_FOREIGN_JOBS` | `false` | Adopt other sessions' running jobs into this session's widget and job list. Adopted jobs are polled so they leave the widget when they finish. |
 | `PI_BGRUN_SHOW_COMPLETED` | `false` | Include finished jobs in `bgstatus` listings by default. |
 | `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |

@@ -34,17 +34,19 @@ import { Type } from "typebox";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { spawn } from "node:child_process";
 import {
-  openSync,
+  appendFileSync,
   closeSync,
-  readFileSync,
+  existsSync,
   mkdirSync,
+  openSync,
+  readFileSync,
   readdirSync,
   renameSync,
-  unlinkSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 
 // Exit marker appended to every log so the file is self-describing: the exit
@@ -54,6 +56,7 @@ const EXIT_MARKER = "__BGRUN_EXIT__=";
 
 const DEFAULT_CLEANUP_DAYS = 7;
 const STALE_POLL_MS = 30_000; // re-check interval for jobs with no live child handle
+const GLOBAL_JOBS_DIR = join(homedir(), ".pi-bgrun", "jobs");
 
 // ── Configuration ───────────────────────────────────────────────────────────
 //
@@ -66,6 +69,10 @@ const STALE_POLL_MS = 30_000; // re-check interval for jobs with no live child h
 
 interface BgrunConfig {
   jobsDir: string;
+  // True when jobsDir came from a RELATIVE path resolved against the project
+  // root (project-local logs). Only then does bgrun auto-ignore the dir in
+  // .git/info/exclude — an absolute dir is the user's explicit choice.
+  jobsDirProjectLocal: boolean;
   // Adopt other sessions' running jobs (found in the shared jobs dir) into
   // this session's widget and job list. Default false — most sessions don't
   // want unrelated jobs from other projects cluttering the widget.
@@ -112,6 +119,95 @@ function readConfigFile(path: string): BgrunConfigFile {
   return {};
 }
 
+// ── Project-local jobs dir ──────────────────────────────────────────────────
+//
+// A RELATIVE `jobsDir` (from any config layer, or PI_BGRUN_DIR) opts into
+// project-local logs: it resolves against the session's project root, so logs
+// land inside the workspace. That keeps them within the project sandbox —
+// analysis tools confined to the project root (e.g. context-mode's
+// ctx_execute_file/ctx_index) can then process whole logs without flooding
+// context. Absolute paths behave exactly as in older versions
+// (migration-safe), and with no recognizable project root a relative path
+// falls back to the global dir instead of scattering logs across whatever
+// directory pi happened to start in.
+
+function isProjectRootLike(dir: string): boolean {
+  // Cheap heuristic: a directory holding .git or pi's config dir is a project.
+  return (
+    existsSync(join(dir, ".git")) || existsSync(join(dir, CONFIG_DIR_NAME))
+  );
+}
+
+export function resolveJobsDirPath(
+  raw: string | undefined,
+  ctx?: { cwd?: string },
+): { dir: string; projectLocal: boolean } {
+  if (!raw) return { dir: GLOBAL_JOBS_DIR, projectLocal: false };
+  if (isAbsolute(raw)) return { dir: raw, projectLocal: false };
+  const root = ctx?.cwd ?? process.cwd();
+  if (!root || !isProjectRootLike(root)) {
+    return { dir: GLOBAL_JOBS_DIR, projectLocal: false };
+  }
+  return { dir: join(root, raw), projectLocal: true };
+}
+
+// Auto-ignore a project-local jobs dir in git so logs never pollute
+// `git status`: appends the dir pattern to the enclosing repo's
+// .git/info/exclude (local-only — the tracked .gitignore is never touched).
+// Memoized per dir; every step is best-effort and must never fail a bgrun.
+const gitExcludedDirs = new Set<string>();
+
+export function ensureGitExcluded(jobsDir: string): void {
+  if (gitExcludedDirs.has(jobsDir)) return;
+  gitExcludedDirs.add(jobsDir); // set first — best-effort, never retry-spam
+  try {
+    // Walk up from jobsDir to the enclosing work tree.
+    let cur = jobsDir;
+    for (;;) {
+      const dot = join(cur, ".git");
+      if (existsSync(dot)) {
+        appendExcludePattern(cur, dot, jobsDir);
+        return;
+      }
+      const parent = dirname(cur);
+      if (parent === cur) return; // filesystem root — not inside a work tree
+      cur = parent;
+    }
+  } catch {
+    // best-effort — ignore hygiene must never break job creation
+  }
+}
+
+function appendExcludePattern(
+  repoRoot: string,
+  dotGit: string,
+  jobsDir: string,
+): void {
+  if (jobsDir === repoRoot) return; // can't exclude the whole repo
+  // `.git` is a directory in a normal checkout, or a file pointing at the
+  // real git dir in linked worktrees (git worktree add) and submodules.
+  let gitDir = dotGit;
+  if (statSync(dotGit).isFile()) {
+    const m = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(\S+)/);
+    if (!m) return;
+    gitDir = m[1];
+  }
+  const pattern = relative(repoRoot, jobsDir).split(sep).join("/") + "/";
+  const excludePath = join(gitDir, "info", "exclude");
+  let existing = "";
+  try {
+    existing = readFileSync(excludePath, "utf8");
+  } catch {
+    // no exclude file yet — we'll create it
+  }
+  if (existing.split("\n").some((l) => l.trim() === pattern)) return;
+  mkdirSync(join(gitDir, "info"), { recursive: true });
+  appendFileSync(
+    excludePath,
+    `\n# pi-bgrun job logs (auto-added)\n${pattern}\n`,
+  );
+}
+
 // Resolved per call (cheap: at most two small file reads) so env/config
 // changes are picked up without module reloads — and tests can isolate.
 function resolveConfig(ctx?: {
@@ -154,11 +250,11 @@ function resolveConfig(ctx?: {
       : undefined;
   const envDays = Number(process.env.PI_BGRUN_CLEANUP_DAYS);
   const daysEnv = Number.isFinite(envDays) && envDays > 0 ? envDays : undefined;
+  const { dir: jobsDir, projectLocal: jobsDirProjectLocal } =
+    resolveJobsDirPath(process.env.PI_BGRUN_DIR || dirFile, ctx);
   return {
-    jobsDir:
-      process.env.PI_BGRUN_DIR ||
-      dirFile ||
-      join(homedir(), ".pi-bgrun", "jobs"),
+    jobsDir,
+    jobsDirProjectLocal,
     adoptForeignJobs:
       parseBoolEnv(process.env.PI_BGRUN_FOREIGN_JOBS) ?? foreignFile ?? false,
     showCompletedJobs:
@@ -733,7 +829,11 @@ export default function (pi: ExtensionAPI) {
       }
       const name = sanitizeName(rawName);
 
-      const jobsDir = resolveConfig(ctx).jobsDir;
+      const cfg = resolveConfig(ctx);
+      // Project-local logs are auto-ignored in .git/info/exclude (best-effort)
+      // so they never pollute `git status`. Absolute dirs are left untouched.
+      if (cfg.jobsDirProjectLocal) ensureGitExcluded(cfg.jobsDir);
+      const jobsDir = cfg.jobsDir;
       mkdirSync(jobsDir, { recursive: true });
 
       const slug = makeSlug(name ?? command);
@@ -962,7 +1062,11 @@ export default function (pi: ExtensionAPI) {
   }> {
     const { id, lines = 40, raw = false } = params;
     if (!id) throw new Error("bgtail: id is required");
-    const logPath = join(resolveConfig(ctx).jobsDir, `${id}.log`);
+    // Prefer this session's record: its logPath stays correct even if the
+    // config (and thus the resolved jobs dir) changes mid-session — e.g. a
+    // user switching to project-local logs right after upgrading.
+    const logPath =
+      jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
     try {
       const content = readFileSync(logPath, "utf8");
       const all = content
