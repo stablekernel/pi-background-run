@@ -1883,9 +1883,8 @@ test("bgrun: relative jobsDir in project config → project-local log + auto git
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     assert.ok(id, "got a job id");
 
     await waitForWakes(wakes, 1);
@@ -1927,9 +1926,8 @@ test("bgtail: prefers the session record's logPath when the jobsDir config chang
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     assert.ok(id, "got a job id");
     await waitForWakes(wakes, 1);
 

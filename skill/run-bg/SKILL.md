@@ -54,7 +54,7 @@ no polling.
 - **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker.
 - **Whole-log failure analysis:** `ctx_execute_file` on the log path:
 
-  ```
+  ```javascript
   ctx_execute_file(
     path: "~/.pi-bgrun/jobs/<JOB>.log",
     language: "javascript",
