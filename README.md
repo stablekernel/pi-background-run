@@ -59,7 +59,7 @@ wake messages) is the agent's workflow.
 
 ## How it works
 
-```
+```text
 agent calls bgrun(command: "make test-short", name: "unit-tests")
   → extension resolves log path: <jobsDir>/<slug>-<ts>-<pid>.log (default ~/.pi-bgrun/jobs/)
   → spawn('sh', ['-c', '<cmd>; ec=$?; printf "\\n__BGRUN_EXIT__=%d\\n" "$ec"; exit $ec'],
