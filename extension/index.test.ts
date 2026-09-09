@@ -35,6 +35,10 @@ function makeFakePi(opts: { idle?: boolean; priorEntries?: any[] } = {}): {
   wakes: CapturedWake[];
   entries: any[];
   tools: Map<string, { execute: (...args: any[]) => Promise<any> }>;
+  commands: Map<
+    string,
+    { description?: string; handler: (...args: any[]) => Promise<void> }
+  >;
   ctx: any;
   handlers: Map<string, ((...args: any[]) => Promise<any>)[]>;
   fireSessionStart: () => Promise<void>;
@@ -44,6 +48,10 @@ function makeFakePi(opts: { idle?: boolean; priorEntries?: any[] } = {}): {
   const tools = new Map<
     string,
     { execute: (...args: any[]) => Promise<any> }
+  >();
+  const commands = new Map<
+    string,
+    { description?: string; handler: (...args: any[]) => Promise<void> }
   >();
   const handlers = new Map<string, ((...args: any[]) => Promise<any>)[]>();
   const idle = opts.idle ?? true;
@@ -64,6 +72,9 @@ function makeFakePi(opts: { idle?: boolean; priorEntries?: any[] } = {}): {
     registerTool(def: any) {
       tools.set(def.name, def);
     },
+    registerCommand(name: string, def: any) {
+      commands.set(name, def);
+    },
     on(event: string, handler: (...args: any[]) => Promise<any>) {
       const list = handlers.get(event) ?? [];
       list.push(handler);
@@ -75,7 +86,16 @@ function makeFakePi(opts: { idle?: boolean; priorEntries?: any[] } = {}): {
       await h({ reason: "startup" }, ctx);
     }
   };
-  return { pi, wakes, entries, tools, ctx, handlers, fireSessionStart };
+  return {
+    pi,
+    wakes,
+    entries,
+    tools,
+    commands,
+    ctx,
+    handlers,
+    fireSessionStart,
+  };
 }
 
 async function loadExtension(
@@ -268,11 +288,19 @@ test("bgtail: condenses output — strips ANSI, collapses repeats, caps long lin
     const text = tail.content[0].text as string;
     assert.ok(!text.includes("\u001b"), "ANSI escapes stripped");
     assert.ok(text.includes("OK green"), "text after stripping survives");
-    assert.match(text, /wait  \[x5\]/, "5 identical lines collapsed to one with count");
+    assert.match(
+      text,
+      /wait {2}\[x5\]/,
+      "5 identical lines collapsed to one with count",
+    );
     assert.ok(!text.includes("x".repeat(4000)), "5000-char line capped");
     assert.match(text, /\u2026\[\+3\d{3} chars\]/, "truncation marker present");
     assert.match(text, /\(\d+ ANSI escape/, "notes mention ANSI stripping");
-    assert.match(text, /1 repeated-line run collapsed/, "notes mention run collapse");
+    assert.match(
+      text,
+      /1 repeated-line run collapsed/,
+      "notes mention run collapse",
+    );
     assert.ok((tail.details as any).condensed === true);
   } finally {
     delete process.env.PI_BGRUN_DIR;
@@ -309,7 +337,10 @@ test("bgtail: raw=true skips condensing", async () => {
     );
     const text = tail.content[0].text as string;
     assert.ok(text.includes("\u001b[31m"), "raw keeps ANSI escapes");
-    assert.ok(text.includes("wait\nwait\nwait"), "raw keeps repeated lines uncollapsed");
+    assert.ok(
+      text.includes("wait\nwait\nwait"),
+      "raw keeps repeated lines uncollapsed",
+    );
     assert.ok((tail.details as any).condensed === false);
   } finally {
     delete process.env.PI_BGRUN_DIR;
@@ -667,7 +698,7 @@ test("bgrun: name is optional — behavior unchanged without it", async () => {
     );
     const text = res.content[0].text as string;
     // No 'name:' line in the response.
-    assert.ok(!/^  name:/m.test(text), "no name line when name omitted");
+    assert.ok(!/^ {2}name:/m.test(text), "no name line when name omitted");
     const id = (text.match(/^started: ([^\n]+)/) || [])[1];
     assert.ok(
       id.startsWith("echo-unnamed-job-"),
@@ -702,7 +733,7 @@ test("bgrun: blank name is ignored, over-long name is truncated", async () => {
       ctx,
     );
     assert.ok(
-      !/^  name:/m.test(res1.content[0].text as string),
+      !/^ {2}name:/m.test(res1.content[0].text as string),
       "blank name ignored",
     );
 
@@ -716,7 +747,7 @@ test("bgrun: blank name is ignored, over-long name is truncated", async () => {
       ctx,
     );
     const text2 = res2.content[0].text as string;
-    const nameLine = (text2.match(/^  name: (.+)$/m) || [])[1];
+    const nameLine = (text2.match(/^ {2}name: (.+)$/m) || [])[1];
     assert.equal(nameLine.length, 80, "name truncated to 80 chars");
 
     await waitForWakes(wakes, 2);
@@ -1068,14 +1099,15 @@ test("bgrun: job id encodes the CHILD's pid, not pi's own pid", async () => {
   }
 });
 
-test("bgclean: removes a FINISHED job's old log even when its id-pid is alive", async () => {
+test("bgclean all: removes a FINISHED job's old log even when its id-pid is alive", async () => {
   // Regression: exit marker must win over pid liveness. Old code checked
   // pid first, so any log whose id-pid happened to be a live process (e.g.
   // pi's own pid from the old id bug, or pid reuse) was kept forever.
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;
   try {
-    // Old finished log whose id-pid is THIS process (alive!) — must still be removed.
+    // Old finished foreign log whose id-pid is THIS process (alive!) — must
+    // still be removed by an explicit global sweep.
     const oldPath = join(dir, `stale-job-1000000000-${process.pid}.log`);
     writeFileSync(oldPath, "stale\n__BGRUN_EXIT__=2\n");
     const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
@@ -1086,14 +1118,31 @@ test("bgclean: removes a FINISHED job's old log even when its id-pid is alive", 
     await loadExtension(pi);
     const bgclean = tools.get("bgclean")!;
 
-    const result = await bgclean.execute(
-      "call-stale",
+    // Default scope: this session only — the foreign log is untouched.
+    const scoped = await bgclean.execute(
+      "call-stale-scoped",
       { days: 7 },
       undefined,
       undefined,
       ctx,
     );
-    assert.match(result.content[0].text as string, /removed 1/);
+    assert.match(scoped.content[0].text as string, /removed 0/);
+    assert.ok(
+      existsSync(oldPath),
+      "foreign log untouched by session-scoped bgclean",
+    );
+
+    const result = await bgclean.execute(
+      "call-stale",
+      { days: 7, all: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      result.content[0].text as string,
+      /removed 1 job log\(s\) \(all sessions\)/,
+    );
     assert.ok(
       !existsSync(oldPath),
       "finished job's log removed despite live id-pid",
@@ -1134,10 +1183,134 @@ test("session_start adoption: skips finished jobs even with a live id-pid", asyn
   }
 });
 
-test("auto-clean: throttled via .last-clean marker; manual bgclean always runs", async () => {
+test("session_start: reconstructed 'running' job that finished while pi was down is cleared, not zombified", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;
   delete process.env.PI_BGRUN_FOREIGN_JOBS;
+  try {
+    // A job from 5 days ago whose transcript entry never got a done entry
+    // (pi wasn't running when it exited), whose log is long gone and whose
+    // pid is definitely dead.
+    const zombieId = `cd-old-project-make-test-${Date.now()}-99999999`;
+    const logPath = join(dir, `${zombieId}.log`); // never created
+    const priorEntries = [
+      {
+        type: "custom",
+        customType: "bgrun-job",
+        data: {
+          id: zombieId,
+          pid: 99999999,
+          cmd: "cd /old/project && make test",
+          name: undefined,
+          started: Date.now() - 5 * 24 * 60 * 60 * 1000,
+          logPath,
+          state: "running",
+        },
+      },
+    ];
+    const { pi, entries, tools, ctx, fireSessionStart } = makeFakePi({
+      priorEntries,
+    });
+    ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    // Revalidation runs before the widget ever renders — the zombie is
+    // cleared immediately instead of showing as "running" forever.
+    assert.ok(
+      !widgetCalls.some((l) => Array.isArray(l)),
+      "reconstructed zombie never shown in the widget",
+    );
+
+    // A done entry is appended so future resumes reconstruct it as done.
+    const doneEntry = entries.find(
+      (e) =>
+        e.customType === "bgrun-job" &&
+        e.data?.id === zombieId &&
+        e.data?.state === "done",
+    );
+    assert.ok(doneEntry, "done entry appended for the recovered job");
+
+    // Single-id lookup reports done, not running.
+    const bgstatus = tools.get("bgstatus")!;
+    const res = await bgstatus.execute(
+      "call-z1",
+      { id: zombieId },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(res.content[0].text as string, /: done/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session_start: done entries with missing exitCode (signal kills) reconstruct as done", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  delete process.env.PI_BGRUN_FOREIGN_JOBS;
+  try {
+    // Jobs killed by a signal persist state:"done" with exitCode: undefined —
+    // reconstruction must honor the state field, not just the exit code.
+    const killedId = `nightly-watch-${Date.now()}-${process.pid}`;
+    const logPath = join(dir, `${killedId}.log`);
+    writeFileSync(logPath, "partial output\n"); // no marker — killed before it
+    const priorEntries = [
+      {
+        type: "custom",
+        customType: "bgrun-job",
+        data: {
+          id: killedId,
+          pid: process.pid, // alive — liveness alone must not resurrect it as running
+          cmd: "npm run watch",
+          name: "nightly-watch",
+          started: Date.now() - 60_000,
+          logPath,
+          state: "done",
+          exitCode: undefined,
+          exitedAt: Date.now() - 30_000,
+        },
+      },
+    ];
+    const { pi, tools, ctx, fireSessionStart } = makeFakePi({ priorEntries });
+    ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.ok(
+      !widgetCalls.some((l) => Array.isArray(l)),
+      "signal-killed job with a done entry is not resurrected as running",
+    );
+    const bgstatus = tools.get("bgstatus")!;
+    const res = await bgstatus.execute(
+      "call-z2",
+      { id: killedId },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(res.content[0].text as string, /: done/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("auto-clean: session boundaries sweep this session's old logs AND week-old foreign orphans by default", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  delete process.env.PI_BGRUN_FOREIGN_JOBS;
+  delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
   try {
     const fs = await import("node:fs");
     const backdate = (path: string) => {
@@ -1145,92 +1318,283 @@ test("auto-clean: throttled via .last-clean marker; manual bgclean always runs",
       fs.utimesSync(path, oldTime, oldTime);
     };
 
-    // Old log A + first session_start (no marker yet) → sweep runs, A removed.
-    const logA = join(dir, "old-a-1000000000-99999.log");
-    fs.writeFileSync(logA, "old a\n__BGRUN_EXIT__=0\n");
-    backdate(logA);
-    {
-      const { pi, ctx, fireSessionStart } = makeFakePi();
-      await loadExtension(pi);
-      await fireSessionStart();
-    }
-    assert.ok(!fs.existsSync(logA), "first sweep removed old log A");
+    // This session's old done job (from the transcript) with a backdated log.
+    const mineId = `my-old-job-${Date.now()}-99999999`;
+    const myLog = join(dir, `${mineId}.log`);
+    fs.writeFileSync(myLog, "mine\n__BGRUN_EXIT__=0\n");
+    backdate(myLog);
+
+    // A foreign session's week-old FINISHED log — an orphan; swept by default.
+    const orphanLog = join(dir, "foreign-old-job-1000000000-99998.log");
+    fs.writeFileSync(orphanLog, "foreign\n__BGRUN_EXIT__=0\n");
+    backdate(orphanLog);
+
+    // A foreign session's RECENT finished log — within retention, kept.
+    const recentForeignLog = join(
+      dir,
+      `foreign-recent-${Math.floor(Date.now() / 1000)}-99997.log`,
+    );
+    fs.writeFileSync(recentForeignLog, "recent foreign\n__BGRUN_EXIT__=0\n");
+
+    // A foreign session's week-old RUNNING log (no marker, live pid) — running
+    // jobs are pid-protected even when old.
+    const runningForeignLog = join(
+      dir,
+      `foreign-running-${Math.floor(Date.now() / 1000)}-${process.pid}.log`,
+    );
+    fs.writeFileSync(runningForeignLog, "still going\n");
+    backdate(runningForeignLog);
+
+    const priorEntries = [
+      {
+        type: "custom",
+        customType: "bgrun-job",
+        data: {
+          id: mineId,
+          pid: 99999999,
+          cmd: "echo mine",
+          name: undefined,
+          started: Date.now() - 30 * 24 * 60 * 60 * 1000,
+          logPath: myLog,
+          state: "done",
+          exitCode: 0,
+          exitedAt: Date.now() - 30 * 24 * 60 * 60 * 1000,
+        },
+      },
+    ];
+    const { pi, fireSessionStart } = makeFakePi({ priorEntries });
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.ok(!fs.existsSync(myLog), "this session's old log swept");
     assert.ok(
-      fs.existsSync(join(dir, ".last-clean")),
-      "throttle marker written",
+      !fs.existsSync(orphanLog),
+      "week-old finished foreign orphan swept by default",
     );
-
-    // Old log B + second session_start while marker is fresh → throttled, B kept.
-    const logB = join(dir, "old-b-1000000000-99998.log");
-    fs.writeFileSync(logB, "old b\n__BGRUN_EXIT__=0\n");
-    backdate(logB);
-    {
-      const { pi, ctx, fireSessionStart } = makeFakePi();
-      await loadExtension(pi);
-      await fireSessionStart();
-    }
-    assert.ok(fs.existsSync(logB), "second sweep throttled — old log B kept");
-
-    // Manual bgclean ignores the throttle and removes B.
-    const { pi: pi3, tools: tools3, ctx: ctx3 } = makeFakePi();
-    await loadExtension(pi3);
-    const bgclean = tools3.get("bgclean")!;
-    const result = await bgclean.execute(
-      "call-t1",
-      {},
-      undefined,
-      undefined,
-      ctx3,
+    assert.ok(
+      fs.existsSync(recentForeignLog),
+      "recent foreign log kept (within retention)",
     );
-    assert.match(result.content[0].text as string, /removed 1/);
-    assert.ok(!fs.existsSync(logB), "manual bgclean removed log B");
+    assert.ok(
+      fs.existsSync(runningForeignLog),
+      "old but RUNNING foreign log kept (pid-protected)",
+    );
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("bgclean: removes old logs, keeps recent ones", async () => {
+test("auto-clean: globalAutoClean=false opts out — foreign orphans untouched, own old logs still swept", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;
+  delete process.env.PI_BGRUN_FOREIGN_JOBS;
+  process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN = "0";
   try {
-    const { pi, tools, ctx } = makeFakePi();
+    const fs = await import("node:fs");
+    const backdate = (path: string) => {
+      const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      fs.utimesSync(path, oldTime, oldTime);
+    };
+
+    const mineId = `my-old-job-${Date.now()}-99999999`;
+    const myLog = join(dir, `${mineId}.log`);
+    fs.writeFileSync(myLog, "mine\n__BGRUN_EXIT__=0\n");
+    backdate(myLog);
+
+    const orphanLog = join(dir, "foreign-old-job-1000000000-99998.log");
+    fs.writeFileSync(orphanLog, "foreign\n__BGRUN_EXIT__=0\n");
+    backdate(orphanLog);
+
+    const priorEntries = [
+      {
+        type: "custom",
+        customType: "bgrun-job",
+        data: {
+          id: mineId,
+          pid: 99999999,
+          cmd: "echo mine",
+          name: undefined,
+          started: Date.now() - 30 * 24 * 60 * 60 * 1000,
+          logPath: myLog,
+          state: "done",
+          exitCode: 0,
+          exitedAt: Date.now() - 30 * 24 * 60 * 60 * 1000,
+        },
+      },
+    ];
+    const { pi, fireSessionStart } = makeFakePi({ priorEntries });
     await loadExtension(pi);
-    const bgrun = tools.get("bgrun")!;
+    await fireSessionStart();
+
+    assert.ok(!fs.existsSync(myLog), "this session's old log still swept");
+    assert.ok(
+      fs.existsSync(orphanLog),
+      "foreign orphan untouched when globalAutoClean is off",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("auto-clean: global orphan sweep is throttled via .last-clean; manual bgclean all always runs", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  delete process.env.PI_BGRUN_FOREIGN_JOBS;
+  delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN; // default: on
+  try {
+    const fs = await import("node:fs");
+    const backdate = (path: string) => {
+      const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      fs.utimesSync(path, oldTime, oldTime);
+    };
+
+    // Old foreign log A + first session_start (no marker yet) → global sweep
+    // runs, A removed.
+    const logA = join(dir, "old-a-1000000000-99999.log");
+    fs.writeFileSync(logA, "old a\n__BGRUN_EXIT__=0\n");
+    backdate(logA);
+    {
+      const { pi, fireSessionStart } = makeFakePi();
+      await loadExtension(pi);
+      await fireSessionStart();
+    }
+    assert.ok(!fs.existsSync(logA), "first global sweep removed old log A");
+    assert.ok(
+      fs.existsSync(join(dir, ".last-clean")),
+      "throttle marker written",
+    );
+
+    // Old foreign log B + second session_start while marker is fresh →
+    // throttled, B kept.
+    const logB = join(dir, "old-b-1000000000-99998.log");
+    fs.writeFileSync(logB, "old b\n__BGRUN_EXIT__=0\n");
+    backdate(logB);
+    {
+      const { pi, fireSessionStart } = makeFakePi();
+      await loadExtension(pi);
+      await fireSessionStart();
+    }
+    assert.ok(
+      fs.existsSync(logB),
+      "second global sweep throttled — old log B kept",
+    );
+
+    // Manual `bgclean all` ignores the throttle and removes B.
+    const { pi: pi3, tools: tools3, ctx: ctx3 } = makeFakePi();
+    await loadExtension(pi3);
+    const bgclean = tools3.get("bgclean")!;
+    const result = await bgclean.execute(
+      "call-t1",
+      { all: true },
+      undefined,
+      undefined,
+      ctx3,
+    );
+    assert.match(
+      result.content[0].text as string,
+      /removed 1 job log\(s\) \(all sessions\)/,
+    );
+    assert.ok(!fs.existsSync(logB), "manual bgclean all removed log B");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgclean: default scope is this session's logs; all: true sweeps everything", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  // Isolate bgclean's scoping from the global orphan auto-sweep (default on)
+  // so the foreign log survives session_start for bgclean to (not) act on.
+  process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN = "0";
+  try {
+    const fs = await import("node:fs");
+    const backdate = (path: string) => {
+      const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      fs.utimesSync(path, oldTime, oldTime);
+    };
+
+    const mkEntry = (
+      id: string,
+      logPath: string,
+      extra: Record<string, unknown> = {},
+    ) => ({
+      type: "custom",
+      customType: "bgrun-job",
+      data: {
+        id,
+        pid: 99999999,
+        cmd: `echo ${id}`,
+        name: undefined,
+        started: Date.now() - 60_000,
+        logPath,
+        state: "done",
+        exitCode: 0,
+        exitedAt: Date.now() - 30_000,
+        ...extra,
+      },
+    });
+
+    // This session's recent done job (fresh log — kept).
+    const recentId = `recent-job-${Date.now()}-99999998`;
+    const recentLog = join(dir, `${recentId}.log`);
+    fs.writeFileSync(recentLog, "recent\n__BGRUN_EXIT__=0\n");
+
+    // This session's old done job (backdated log — removed by default scope).
+    const oldId = `old-session-job-${Date.now()}-99999997`;
+    const oldLog = join(dir, `${oldId}.log`);
+    fs.writeFileSync(oldLog, "old session job\n__BGRUN_EXIT__=0\n");
+    backdate(oldLog);
+
+    // A foreign session's old log — untouched by default, removed with all.
+    const foreignLog = join(dir, "foreign-old-job-1000000000-99996.log");
+    fs.writeFileSync(foreignLog, "foreign\n__BGRUN_EXIT__=0\n");
+    backdate(foreignLog);
+
+    const priorEntries = [
+      mkEntry(recentId, recentLog),
+      mkEntry(oldId, oldLog, {
+        started: Date.now() - 30 * 24 * 60 * 60 * 1000,
+        exitedAt: Date.now() - 30 * 24 * 60 * 60 * 1000,
+      }),
+    ];
+    const { pi, tools, ctx, fireSessionStart } = makeFakePi({ priorEntries });
+    await loadExtension(pi);
+    await fireSessionStart(); // reconstruct + session-scoped auto-sweep runs here too
+
     const bgclean = tools.get("bgclean")!;
 
-    // Run a real job (recent log — should be kept).
-    await bgrun.execute(
-      "call-c1",
-      { command: "echo recent" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    await new Promise((r) => setTimeout(r, 200)); // let it finish
-
-    // Write an old log file (backdated mtime).
-    const oldPath = join(dir, "old-job-1000000000-99999.log");
-    const fs = await import("node:fs");
-    fs.writeFileSync(oldPath, "old output\n__BGRUN_EXIT__=0\n");
-    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // 30 days ago
-    fs.utimesSync(oldPath, oldTime, oldTime);
-
-    const result = await bgclean.execute(
+    // Default: this session only.
+    const scoped = await bgclean.execute(
       "call-c2",
       { days: 7 },
       undefined,
       undefined,
       ctx,
     );
-    const text = result.content[0].text as string;
-    assert.match(text, /removed 1/);
-    assert.ok(!fs.existsSync(oldPath), "old log removed");
-    // The recent log should still exist.
-    const remaining = fs
-      .readdirSync(dir)
-      .filter((f: string) => f.endsWith(".log"));
-    assert.equal(remaining.length, 1, "recent log kept");
+    assert.match(scoped.content[0].text as string, /\(this session\)/);
+    assert.ok(!fs.existsSync(oldLog), "this session's old log removed");
+    assert.ok(fs.existsSync(recentLog), "this session's recent log kept");
+    assert.ok(
+      fs.existsSync(foreignLog),
+      "foreign log untouched by session-scoped bgclean",
+    );
+
+    // all: true sweeps the shared dir.
+    const global = await bgclean.execute(
+      "call-c3",
+      { days: 7, all: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(global.content[0].text as string, /\(all sessions\)/);
+    assert.ok(!fs.existsSync(foreignLog), "foreign log removed by bgclean all");
+    assert.ok(fs.existsSync(recentLog), "recent log still kept");
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
@@ -1294,6 +1658,115 @@ test("bgclean: does not remove a running job's log", async () => {
     }
   } finally {
     delete process.env.PI_BGRUN_DIR;
+    delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("slash commands: /bgstatus, /bgtail, /bgclean registered and share the tool logic", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  delete process.env.PI_BGRUN_FOREIGN_JOBS;
+  delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+  try {
+    const { pi, wakes, tools, commands, ctx } = makeFakePi();
+    ctx.hasUI = true;
+    const notes: { text: string; kind: string }[] = [];
+    ctx.ui.notify = (text: string, kind: string) => notes.push({ text, kind });
+
+    await loadExtension(pi);
+
+    // All three human-facing commands are registered (/bgrun is agent-only).
+    assert.ok(commands.has("bgstatus"), "/bgstatus registered");
+    assert.ok(commands.has("bgtail"), "/bgtail registered");
+    assert.ok(commands.has("bgclean"), "/bgclean registered");
+    assert.ok(!commands.has("bgrun"), "/bgrun deliberately not a command");
+
+    // Run a real job to completion so there's something to inspect.
+    const bgrun = tools.get("bgrun")!;
+    const res = await bgrun.execute(
+      "call-cmd1",
+      { command: "echo cmd-mirror", name: "mirror-job" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    // /bgstatus <id> → single-job status via notify.
+    await commands.get("bgstatus")!.handler(id, ctx);
+    assert.ok(
+      notes.some((n) => n.text.includes(id) && /: done/.test(n.text)),
+      "/bgstatus <id> notifies job status",
+    );
+
+    // /bgstatus done → listing includes the finished job.
+    await commands.get("bgstatus")!.handler("done", ctx);
+    assert.ok(
+      notes.some((n) => /mirror-job: done exit=0/.test(n.text)),
+      "/bgstatus done lists finished jobs",
+    );
+
+    // /bgtail <id> <lines> → condensed tail via notify.
+    await commands.get("bgtail")!.handler(`${id} 5`, ctx);
+    assert.ok(
+      notes.some((n) => n.text.includes("cmd-mirror")),
+      "/bgtail notifies the log tail",
+    );
+
+    // /bgtail with no args → usage error.
+    await commands.get("bgtail")!.handler("", ctx);
+    assert.ok(
+      notes.some((n) => n.kind === "error" && /Usage: \/bgtail/.test(n.text)),
+      "/bgtail without id shows usage",
+    );
+
+    // /bgclean (no args) → session-scoped summary via notify.
+    await commands.get("bgclean")!.handler("", ctx);
+    assert.ok(
+      notes.some((n) => /removed 0 job log\(s\) \(this session\)/.test(n.text)),
+      "/bgclean notifies the session-scoped summary",
+    );
+
+    // /bgclean 7 all → global scope.
+    await commands.get("bgclean")!.handler("7 all", ctx);
+    assert.ok(
+      notes.some((n) => /\(all sessions\)/.test(n.text)),
+      "/bgclean all notifies the global summary",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("formatSince: same-day shows time only; older days include the date", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  assert.equal(typeof mod.formatSince, "function");
+
+  const now = new Date("2026-09-09T10:00:00").getTime();
+  const sameDay = new Date("2026-09-09T06:30:12").getTime();
+  const prevDay = new Date("2026-09-04T15:05:40").getTime();
+  const prevMonth = new Date("2026-08-12T23:59:59").getTime();
+  const prevYear = new Date("2025-12-30T08:00:00").getTime();
+
+  // Same calendar day → time only (unchanged display).
+  assert.equal(mod.formatSince(sameDay, now), "06:30:12");
+
+  // Different day, same year → date + time.
+  const prevDayStr = mod.formatSince(prevDay, now);
+  assert.match(prevDayStr, /Sep 4/);
+  assert.match(prevDayStr, /15:05:40/);
+
+  const prevMonthStr = mod.formatSince(prevMonth, now);
+  assert.match(prevMonthStr, /Aug 12/);
+  assert.match(prevMonthStr, /23:59:59/);
+
+  // Different year → date includes the year.
+  const prevYearStr = mod.formatSince(prevYear, now);
+  assert.match(prevYearStr, /2025/);
+  assert.match(prevYearStr, /Dec 30/);
+  assert.match(prevYearStr, /08:00:00/);
 });

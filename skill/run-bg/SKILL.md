@@ -31,7 +31,7 @@ no polling.
 | Start  | `bgrun(command: "make test-short", name: "unit-tests")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the status widget, and wake messages) |
 | Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
 | Tail   | `bgtail(<job-id>, 40)` |
-| Clean  | `bgclean()` (default 7-day retention) |
+| Clean  | `bgclean()` for this session's old logs; `bgclean all` to sweep every session's (default 7-day retention) |
 
 ## Workflow
 
@@ -86,8 +86,11 @@ no polling.
 - Call the tools; never hand-roll `nohup … &` inline.
 - One job = one id. Multiple concurrent jobs are fine — each has its own log.
 - Logs live in `~/.pi-bgrun/jobs` (override with `PI_BGRUN_DIR`).
-- Cleanup: `bgclean` manually; auto-sweeps run at session start/shutdown, at
-  most once per `cleanupDays` (default 7, configurable in
-  `~/.pi/agent/pi-bgrun.json` or `PI_BGRUN_CLEANUP_DAYS`).
+- Cleanup: `bgclean` removes only THIS session's old logs; `bgclean all`
+  sweeps every session's. Auto-sweeps at session start/shutdown are
+  session-scoped plus a global orphan pass (default on — removes finished
+  week-old logs from crashed/abandoned sessions; disable with
+  `globalAutoClean: false` / `PI_BGRUN_GLOBAL_AUTO_CLEAN=0`). Retention is
+  `cleanupDays` (default 7, configurable).
 - To stop a running job, use `bash` with `kill <pid>` (the pid is in the `bgstatus`
   output). There is no `bgkill` tool.

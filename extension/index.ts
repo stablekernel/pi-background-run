@@ -53,7 +53,7 @@ import { homedir } from "node:os";
 const EXIT_MARKER = "__BGRUN_EXIT__=";
 
 const DEFAULT_CLEANUP_DAYS = 7;
-const ADOPTED_POLL_MS = 30_000; // re-check interval for adopted (foreign) jobs
+const STALE_POLL_MS = 30_000; // re-check interval for jobs with no live child handle
 
 // ── Configuration ───────────────────────────────────────────────────────────
 //
@@ -73,9 +73,16 @@ interface BgrunConfig {
   // Include finished jobs in bgstatus listings by default. Default false —
   // completed jobs are noise; ask for them explicitly (bgstatus includeDone).
   showCompletedJobs: boolean;
-  // Log retention for auto-clean sweeps and the bgclean default. Also the
-  // throttle interval for auto-clean (at most one sweep per cleanupDays).
+  // Log retention for cleanup (auto-sweeps and the bgclean default).
   cleanupDays: number;
+  // Auto-sweep the WHOLE shared jobs dir at session boundaries for orphans —
+  // finished (exit marker or dead pid) logs older than cleanupDays from
+  // sessions that crashed or are never resumed again. Running jobs are always
+  // pid-protected. Throttled to once per cleanupDays via a .last-clean marker.
+  // Default true — without it, orphaned logs accumulate forever. Set false to
+  // keep every sweep session-scoped (then only `bgclean all` touches foreign
+  // logs).
+  globalAutoClean: boolean;
 }
 
 interface BgrunConfigFile {
@@ -83,6 +90,7 @@ interface BgrunConfigFile {
   adoptForeignJobs?: unknown;
   showCompletedJobs?: unknown;
   cleanupDays?: unknown;
+  globalAutoClean?: unknown;
 }
 
 function parseBoolEnv(v: string | undefined): boolean | undefined {
@@ -130,6 +138,10 @@ function resolveConfig(ctx?: {
     typeof merged.showCompletedJobs === "boolean"
       ? merged.showCompletedJobs
       : undefined;
+  const globalCleanFile =
+    typeof merged.globalAutoClean === "boolean"
+      ? merged.globalAutoClean
+      : undefined;
   const dirFile =
     typeof merged.jobsDir === "string" && merged.jobsDir
       ? merged.jobsDir
@@ -154,7 +166,36 @@ function resolveConfig(ctx?: {
       completedFile ??
       false,
     cleanupDays: daysEnv ?? daysFile ?? DEFAULT_CLEANUP_DAYS,
+    globalAutoClean:
+      parseBoolEnv(process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN) ??
+      globalCleanFile ??
+      true,
   };
+}
+
+// Widget "since" formatting: time-only when the job started today; otherwise
+// include the date (and the year too when it differs) — a job that has been
+// running since a previous day shouldn't render as if it started today at
+// that time. `now` is injectable for deterministic tests.
+export function formatSince(started: number, now: number = Date.now()): string {
+  const d = new Date(started);
+  const n = new Date(now);
+  const time = d.toLocaleTimeString([], { hour12: false });
+  const sameDay =
+    d.getFullYear() === n.getFullYear() &&
+    d.getMonth() === n.getMonth() &&
+    d.getDate() === n.getDate();
+  if (sameDay) return time;
+  if (d.getFullYear() === n.getFullYear()) {
+    const md = d.toLocaleDateString([], { month: "short", day: "numeric" });
+    return `${md} ${time}`;
+  }
+  const ymd = d.toLocaleDateString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+  return `${ymd} ${time}`;
 }
 
 interface JobRecord {
@@ -206,9 +247,11 @@ function isRunningPid(pid: number): boolean {
 
 export default function (pi: ExtensionAPI) {
   const jobs = new Map<string, JobRecord>();
-  // Poller for adopted (foreign) jobs — they have no ChildProcess handle, so
-  // no exit event; their logs/pids are re-checked on an interval instead.
-  let adoptedPoller: ReturnType<typeof setInterval> | undefined;
+  // Poller for stale job records — anything running with no live ChildProcess
+  // handle (adopted foreign jobs + jobs reconstructed from transcript entries
+  // after a restart). No exit event exists for those, so their logs/pids are
+  // re-checked on an interval instead.
+  let stalePoller: ReturnType<typeof setInterval> | undefined;
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -269,7 +312,7 @@ export default function (pi: ExtensionAPI) {
 
   function updateWidget(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
-    revalidateAdoptedJobs();
+    revalidateStaleJobs();
     const running: JobRecord[] = [];
     for (const rec of jobs.values()) {
       if (rec.exitCode === undefined) running.push(rec);
@@ -280,9 +323,7 @@ export default function (pi: ExtensionAPI) {
     }
     const lines = [`📊 bgrun: ${running.length} running`];
     for (const rec of running) {
-      const startedAt = new Date(rec.started).toLocaleTimeString([], {
-        hour12: false,
-      });
+      const startedAt = formatSince(rec.started);
       const cmd = rec.cmd.length > 40 ? rec.cmd.slice(0, 37) + "…" : rec.cmd;
       const label = rec.name ? `${rec.name} · ${cmd}` : cmd.padEnd(40);
       const tag = rec.adopted ? " (adopted)" : "";
@@ -353,14 +394,61 @@ export default function (pi: ExtensionAPI) {
     return result;
   }
 
-  // Throttled auto-clean: runs at session_start/session_shutdown at most once
-  // per cleanupDays (tracked via a .last-clean marker in the jobs dir). Manual
-  // bgclean always runs and refreshes the marker. This is the "7-day timer" —
-  // any session boundary after the interval fires the sweep, so long-lived
-  // sessions and restart-heavy workflows both stay covered without cleaning on
-  // every bgrun call.
+  // Session-scoped sweep: remove THIS session's finished job logs older than
+  // `days`. Only looks at the in-memory Map (which, after reconstruction, is
+  // exactly this session's lineage) — other sessions' logs are never touched.
+  // Running jobs are always skipped. Cheap (a handful of stats), so it runs
+  // unthrottled at session boundaries.
+  function cleanSessionJobs(
+    days: number,
+    ctx?: ExtensionContext,
+  ): { removed: number; kept: number; skippedRunning: number } {
+    const result = { removed: 0, kept: 0, skippedRunning: 0 };
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    for (const rec of jobs.values()) {
+      if (rec.exitCode === undefined) {
+        result.skippedRunning++;
+        continue;
+      }
+      let st;
+      try {
+        st = statSync(rec.logPath);
+      } catch {
+        continue; // already gone
+      }
+      if (st.mtimeMs > cutoff) {
+        result.kept++;
+        continue;
+      }
+      try {
+        unlinkSync(rec.logPath);
+        result.removed++;
+      } catch {
+        // ignore
+      }
+    }
+    if (result.removed > 0 && ctx?.hasUI) {
+      ctx.ui.notify(`bgrun: cleaned ${result.removed} old job log(s)`, "info");
+    }
+    return result;
+  }
+
+  // Auto-clean at session boundaries. Two parts:
+  //  1. Session-scoped sweep — this session's old logs only; cheap,
+  //     unthrottled.
+  //  2. Global orphan sweep (default on; disable via globalAutoClean: false /
+  //     PI_BGRUN_GLOBAL_AUTO_CLEAN=0) — the whole shared jobs dir, removing
+  //     FINISHED logs (exit marker, or dead pid) older than cleanupDays. This
+  //     is what keeps orphans from crashed / never-resumed sessions from
+  //     accumulating: a week-old finished log is garbage under the same
+  //     retention the owning session would apply itself, and running jobs are
+  //     always pid-protected. Throttled to one sweep per cleanupDays via a
+  //     .last-clean marker so restart-heavy workflows don't re-sweep on every
+  //     launch.
   function autoCleanJobs(ctx: ExtensionContext): void {
     const cfg = resolveConfig(ctx);
+    cleanSessionJobs(cfg.cleanupDays, ctx);
+    if (!cfg.globalAutoClean) return;
     const markerPath = join(cfg.jobsDir, ".last-clean");
     try {
       const last = Number(readFileSync(markerPath, "utf8").trim());
@@ -381,46 +469,67 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Re-check adopted (foreign) jobs: they have no exit event, so the exit
-  // marker in the log (or a dead pid) is the only completion signal. Without
-  // this, adopted jobs render as "running" forever even after they finish.
-  // Finished adopted jobs are dropped from the in-memory registry entirely —
-  // they aren't this session's history; the log stays on disk (id lookup,
-  // disk note, and cleanup all still cover it). Called from the adopted poller
-  // and before rendering the widget / listing jobs.
-  function revalidateAdoptedJobs(): void {
+  // Re-check stale job records — anything running with no live ChildProcess
+  // handle (rec.child unset): adopted foreign jobs, and jobs reconstructed
+  // from transcript entries after a restart. None of these get an exit event,
+  // so the exit marker in the log (or a dead pid) is the only completion
+  // signal. Without this they render as "running" forever — e.g. a job that
+  // finished while pi was down reconstructs as a zombie on every resume.
+  //  - Adopted jobs are dropped from the registry entirely (not this
+  //    session's history; the log on disk still covers id lookup + cleanup).
+  //  - Reconstructed jobs ARE this session's history: mark them done and
+  //    append a done entry so future resumes reconstruct them as done too.
+  function revalidateStaleJobs(): void {
     for (const [id, rec] of jobs) {
-      if (!rec.adopted || rec.exitCode !== undefined) continue;
+      if (rec.child || rec.exitCode !== undefined) continue;
       let exit = parseExitFromLog(rec.logPath);
       if (exit === null && rec.pid > 0 && !isRunningPid(rec.pid)) {
-        // pid gone with no marker — killed/crashed before the wrapper could write it
+        // pid gone with no marker — killed/crashed before the wrapper could write it,
+        // or the log was already cleaned up
         exit = -1;
       }
-      if (exit !== null) jobs.delete(id);
+      if (exit === null) continue; // still genuinely running
+      if (rec.adopted) {
+        jobs.delete(id);
+      } else {
+        rec.exitCode = exit;
+        rec.exitedAt = Date.now();
+        pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
+          id: rec.id,
+          pid: rec.pid,
+          cmd: rec.cmd,
+          name: rec.name,
+          started: rec.started,
+          logPath: rec.logPath,
+          state: "done",
+          exitCode: exit >= 0 ? exit : undefined,
+          exitedAt: rec.exitedAt,
+        });
+      }
     }
   }
 
-  function hasAdoptedRunning(): boolean {
+  function hasUnsupervisedRunning(): boolean {
     for (const rec of jobs.values()) {
-      if (rec.adopted && rec.exitCode === undefined) return true;
+      if (!rec.child && rec.exitCode === undefined) return true;
     }
     return false;
   }
 
-  function ensureAdoptedPoller(ctx: ExtensionContext): void {
-    if (adoptedPoller !== undefined || !hasAdoptedRunning()) return;
-    adoptedPoller = setInterval(() => {
-      revalidateAdoptedJobs();
+  function ensureStalePoller(ctx: ExtensionContext): void {
+    if (stalePoller !== undefined || !hasUnsupervisedRunning()) return;
+    stalePoller = setInterval(() => {
+      revalidateStaleJobs();
       updateWidget(ctx);
-      if (!hasAdoptedRunning()) stopAdoptedPoller();
-    }, ADOPTED_POLL_MS);
-    adoptedPoller.unref();
+      if (!hasUnsupervisedRunning()) stopStalePoller();
+    }, STALE_POLL_MS);
+    stalePoller.unref();
   }
 
-  function stopAdoptedPoller(): void {
-    if (adoptedPoller !== undefined) {
-      clearInterval(adoptedPoller);
-      adoptedPoller = undefined;
+  function stopStalePoller(): void {
+    if (stalePoller !== undefined) {
+      clearInterval(stalePoller);
+      stalePoller = undefined;
     }
   }
 
@@ -500,6 +609,10 @@ export default function (pi: ExtensionAPI) {
       }
       for (const d of latestBydId.values()) {
         if (jobs.has(d.id)) continue;
+        // A done entry is authoritative even when exitCode is missing (jobs
+        // killed by a signal persist exitCode: undefined) — without the state
+        // check those reconstruct as "running" zombies on every resume.
+        const isDone = d.state === "done" || d.exitCode !== undefined;
         jobs.set(d.id, {
           id: d.id,
           pid: d.pid,
@@ -508,7 +621,7 @@ export default function (pi: ExtensionAPI) {
           started: d.started,
           logPath: d.logPath,
           exitedAt: d.exitedAt,
-          exitCode: d.exitCode,
+          exitCode: isDone ? (d.exitCode ?? -1) : undefined,
           ctx,
         });
       }
@@ -557,18 +670,22 @@ export default function (pi: ExtensionAPI) {
       } catch {
         // jobs dir doesn't exist — nothing to adopt.
       }
-      ensureAdoptedPoller(ctx);
     }
 
-    // Show the widget if anything is now running (covers adopted + reconstructed jobs).
+    // Show the widget if anything is now running. revalidateStaleJobs()
+    // inside clears zombies — reconstructed jobs that finished while pi was
+    // down — before they ever render. Then start the stale poller for
+    // anything still genuinely running without a child handle (also gives
+    // resumed sessions live tracking of their still-running jobs).
     updateWidget(ctx);
+    ensureStalePoller(ctx);
     // Auto-cleanup of old logs, throttled to one sweep per cleanupDays via a
     // marker in the jobs dir (see autoCleanJobs). Also runs on session_shutdown.
     autoCleanJobs(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    stopAdoptedPoller();
+    stopStalePoller();
     // Sweep old logs on the way out. Throttled via the .last-clean marker so
     // restart-heavy workflows don't sweep more than once per cleanupDays.
     try {
@@ -768,7 +885,8 @@ export default function (pi: ExtensionAPI) {
   // Keeps bgtail output small enough that a "quick peek" never floods context:
   // colored test output often carries 2-3x its text size in ANSI escapes, and
   // one unbounded line (minified bundle, base64 blob) can blow the whole budget.
-  const ANSI_RE = /[\u001B\u009B][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><]/g;
+  const ANSI_RE =
+    /[\u001B\u009B][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><]/g;
   const LINE_CAP = 2000; // chars per line after stripping
   const TOTAL_CAP = 8000; // chars for the whole bgtail result
 
@@ -781,7 +899,10 @@ export default function (pi: ExtensionAPI) {
     let stripped = 0;
     let cappedLines = 0;
     const clean = lines.map((l) => {
-      if (ANSI_RE.test(l)) { stripped++; l = l.replace(ANSI_RE, ""); }
+      if (ANSI_RE.test(l)) {
+        stripped++;
+        l = l.replace(ANSI_RE, "");
+      }
       return l;
     });
     ANSI_RE.lastIndex = 0;
@@ -807,18 +928,70 @@ export default function (pi: ExtensionAPI) {
       }
       total += line.length + 1;
       if (total > TOTAL_CAP) {
-        notes.push(`output capped at ${TOTAL_CAP} chars — ${lines.length} raw lines total; raise \`lines\`, use \`raw: true\`, or run ctx_execute_file on the log for whole-log analysis`);
+        notes.push(
+          `output capped at ${TOTAL_CAP} chars — ${lines.length} raw lines total; raise \`lines\`, use \`raw: true\`, or run ctx_execute_file on the log for whole-log analysis`,
+        );
         break;
       }
       out.push(line);
     }
-    if (stripped > 0) notes.push(`${stripped} ANSI escape sequence${stripped === 1 ? "" : "s"} stripped`);
-    if (runs > 0) notes.push(`${runs} repeated-line run${runs === 1 ? "" : "s"} collapsed`);
-    if (cappedLines > 0) notes.push(`${cappedLines} long line${cappedLines === 1 ? "" : "s"} truncated to ${LINE_CAP} chars`);
+    if (stripped > 0)
+      notes.push(
+        `${stripped} ANSI escape sequence${stripped === 1 ? "" : "s"} stripped`,
+      );
+    if (runs > 0)
+      notes.push(`${runs} repeated-line run${runs === 1 ? "" : "s"} collapsed`);
+    if (cappedLines > 0)
+      notes.push(
+        `${cappedLines} long line${cappedLines === 1 ? "" : "s"} truncated to ${LINE_CAP} chars`,
+      );
     return { text: out.join("\n"), truncated: notes };
   }
 
   // ── bgtail: read last N lines of a job's log, condensed for context ────────
+
+  // Shared by the bgtail tool (agent-facing) and the /bgtail slash command
+  // (human-facing).
+  async function bgtailCore(
+    params: { id: string; lines?: number; raw?: boolean },
+    ctx?: ExtensionContext,
+  ): Promise<{
+    content: { type: "text"; text: string }[];
+    details: Record<string, unknown>;
+    isError?: boolean;
+  }> {
+    const { id, lines = 40, raw = false } = params;
+    if (!id) throw new Error("bgtail: id is required");
+    const logPath = join(resolveConfig(ctx).jobsDir, `${id}.log`);
+    try {
+      const content = readFileSync(logPath, "utf8");
+      const all = content
+        .split("\n")
+        .filter((l) => !l.startsWith(EXIT_MARKER) && l.trim().length > 0);
+      const tail = all.slice(-lines);
+      const { text, truncated } = condenseLogLines(tail, { raw });
+      const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
+      return {
+        content: [{ type: "text", text: text + notes || "(empty log)" }],
+        details: {
+          id,
+          linesShown: tail.length,
+          logPath,
+          notFound: false,
+          condensed: !raw,
+          ...(truncated.length > 0 ? { condenserNotes: truncated } : {}),
+        },
+      };
+    } catch {
+      return {
+        content: [
+          { type: "text", text: `No log found for job ${id} at ${logPath}` },
+        ],
+        details: { id, linesShown: 0, logPath, notFound: true },
+        isError: true,
+      };
+    }
+  }
 
   pi.registerTool({
     name: "bgtail",
@@ -835,46 +1008,137 @@ export default function (pi: ExtensionAPI) {
       ),
       raw: Type.Optional(
         Type.Boolean({
-          description: "Skip condensing (ANSI strip, collapse, caps) and return raw text",
+          description:
+            "Skip condensing (ANSI strip, collapse, caps) and return raw text",
         }),
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { id, lines = 40, raw = false } = params;
-      if (!id) throw new Error("bgtail: id is required");
-      const logPath = join(resolveConfig(ctx).jobsDir, `${id}.log`);
-      try {
-        const content = readFileSync(logPath, "utf8");
-        const all = content
-          .split("\n")
-          .filter((l) => !l.startsWith(EXIT_MARKER) && l.trim().length > 0);
-        const tail = all.slice(-lines);
-        const { text, truncated } = condenseLogLines(tail, { raw });
-        const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
-        return {
-          content: [{ type: "text", text: (text + notes) || "(empty log)" }],
-          details: {
-            id,
-            linesShown: tail.length,
-            logPath,
-            notFound: false,
-            condensed: !raw,
-            ...(truncated.length > 0 ? { condenserNotes: truncated } : {}),
-          },
-        };
-      } catch {
-        return {
-          content: [
-            { type: "text", text: `No log found for job ${id} at ${logPath}` },
-          ],
-          details: { id, linesShown: 0, logPath, notFound: true },
-          isError: true,
-        };
-      }
+      return bgtailCore(params, ctx);
     },
   });
 
   // ── bgstatus: list jobs (in-memory while alive; dir scan after restart) ─────
+
+  // Shared by the bgstatus tool (agent-facing) and the /bgstatus slash command
+  // (human-facing).
+  async function bgstatusCore(
+    params: { id?: string; includeDone?: boolean },
+    ctx: ExtensionContext,
+  ): Promise<{
+    content: { type: "text"; text: string }[];
+    details: BgStatusDetails;
+    isError?: boolean;
+  }> {
+    const { id } = params;
+    const cfg = resolveConfig(ctx);
+    const jobsDir = cfg.jobsDir;
+    if (id) {
+      const rec = jobs.get(id);
+      if (rec) {
+        const state = rec.exitCode === undefined ? "running" : "done";
+        const exit = rec.exitCode === undefined ? "" : ` exit=${rec.exitCode}`;
+        const lines = [`${id}: ${state}${exit}`];
+        if (rec.name) lines.push(`  name: ${rec.name}`);
+        lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: {
+            id,
+            state,
+            exitCode: rec.exitCode ?? undefined,
+            cmd: rec.cmd,
+            name: rec.name,
+            recovered: false,
+          },
+        };
+      }
+      const logPath = join(jobsDir, `${id}.log`);
+      try {
+        const exit = parseExitFromLog(logPath);
+        const state = exit === null ? "running" : "done";
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${id}: ${state}${exit === null ? "" : ` exit=${exit}`} (recovered from log)\n  log: ${logPath}`,
+            },
+          ],
+          details: {
+            id,
+            state,
+            exitCode: exit ?? undefined,
+            recovered: true,
+          },
+        };
+      } catch {
+        return {
+          content: [{ type: "text", text: `No job found with id ${id}` }],
+          details: { id, state: "unknown" },
+          isError: true,
+        };
+      }
+    }
+    // List: this session's jobs (running by default; finished only when
+    // includeDone / showCompletedJobs is set), plus — when opted in — other
+    // sessions' jobs from the shared jobs dir. Hidden disk logs get a
+    // one-line count instead of spamming the listing.
+    const showDone = params.includeDone ?? cfg.showCompletedJobs;
+    revalidateStaleJobs();
+    updateWidget(ctx);
+    const lines: string[] = [];
+    const seen = new Set<string>();
+    for (const [jid, rec] of jobs) {
+      seen.add(jid);
+      if (rec.exitCode === undefined || showDone) {
+        const state = rec.exitCode === undefined ? "running" : "done";
+        const exit = rec.exitCode === undefined ? "" : ` exit=${rec.exitCode}`;
+        const label = rec.name ? `${jid} — ${rec.name}` : jid;
+        const from = rec.adopted ? " (adopted)" : "";
+        lines.push(`  ${label}: ${state}${exit}${from}`);
+      }
+    }
+    let hiddenOnDisk = 0;
+    try {
+      for (const name of readdirSync(jobsDir)) {
+        if (!name.endsWith(".log")) continue;
+        const jid = name.slice(0, -".log".length);
+        if (seen.has(jid)) continue;
+        const logPath = join(jobsDir, name);
+        const exit = parseExitFromLog(logPath);
+        if (exit !== null) {
+          // finished log on disk (other or older session)
+          if (showDone) {
+            lines.push(`  ${jid}: done exit=${exit} (from log)`);
+          } else {
+            hiddenOnDisk++;
+          }
+        } else if (cfg.adoptForeignJobs) {
+          // running foreign job — only surfaced when adoption is enabled
+          lines.push(`  ${jid}: running (from log)`);
+        } else {
+          hiddenOnDisk++;
+        }
+      }
+    } catch {
+      // jobs dir doesn't exist — nothing to scan.
+    }
+    if (hiddenOnDisk > 0) {
+      lines.push(
+        `  (${hiddenOnDisk} more job log(s) on disk — pass includeDone to list, bgclean all to prune)`,
+      );
+    }
+    if (lines.length === 0) {
+      return {
+        content: [{ type: "text", text: "(no bgrun jobs)" }],
+        details: { count: 0 },
+      };
+    }
+    return {
+      content: [{ type: "text", text: `bgrun jobs:\n${lines.join("\n")}` }],
+      details: { count: lines.length },
+    };
+  }
 
   pi.registerTool({
     name: "bgstatus",
@@ -895,168 +1159,153 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(
-      _toolCallId,
-      params,
-      _signal,
-      _onUpdate,
-      ctx,
-    ): Promise<{
-      content: { type: "text"; text: string }[];
-      details: BgStatusDetails;
-      isError?: boolean;
-    }> {
-      const { id } = params;
-      const cfg = resolveConfig(ctx);
-      const jobsDir = cfg.jobsDir;
-      if (id) {
-        const rec = jobs.get(id);
-        if (rec) {
-          const state = rec.exitCode === undefined ? "running" : "done";
-          const exit =
-            rec.exitCode === undefined ? "" : ` exit=${rec.exitCode}`;
-          const lines = [`${id}: ${state}${exit}`];
-          if (rec.name) lines.push(`  name: ${rec.name}`);
-          lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
-          return {
-            content: [{ type: "text", text: lines.join("\n") }],
-            details: {
-              id,
-              state,
-              exitCode: rec.exitCode ?? undefined,
-              cmd: rec.cmd,
-              name: rec.name,
-              recovered: false,
-            },
-          };
-        }
-        const logPath = join(jobsDir, `${id}.log`);
-        try {
-          const exit = parseExitFromLog(logPath);
-          const state = exit === null ? "running" : "done";
-          return {
-            content: [
-              {
-                type: "text",
-                text: `${id}: ${state}${exit === null ? "" : ` exit=${exit}`} (recovered from log)\n  log: ${logPath}`,
-              },
-            ],
-            details: {
-              id,
-              state,
-              exitCode: exit ?? undefined,
-              recovered: true,
-            },
-          };
-        } catch {
-          return {
-            content: [{ type: "text", text: `No job found with id ${id}` }],
-            details: { id, state: "unknown" },
-            isError: true,
-          };
-        }
-      }
-      // List: this session's jobs (running by default; finished only when
-      // includeDone / showCompletedJobs is set), plus — when opted in — other
-      // sessions' jobs from the shared jobs dir. Hidden disk logs get a
-      // one-line count instead of spamming the listing.
-      const showDone = params.includeDone ?? cfg.showCompletedJobs;
-      revalidateAdoptedJobs();
-      updateWidget(ctx);
-      const lines: string[] = [];
-      const seen = new Set<string>();
-      for (const [jid, rec] of jobs) {
-        seen.add(jid);
-        if (rec.exitCode === undefined || showDone) {
-          const state = rec.exitCode === undefined ? "running" : "done";
-          const exit =
-            rec.exitCode === undefined ? "" : ` exit=${rec.exitCode}`;
-          const label = rec.name ? `${jid} — ${rec.name}` : jid;
-          const from = rec.adopted ? " (adopted)" : "";
-          lines.push(`  ${label}: ${state}${exit}${from}`);
-        }
-      }
-      let hiddenOnDisk = 0;
-      try {
-        for (const name of readdirSync(jobsDir)) {
-          if (!name.endsWith(".log")) continue;
-          const jid = name.slice(0, -".log".length);
-          if (seen.has(jid)) continue;
-          const logPath = join(jobsDir, name);
-          const exit = parseExitFromLog(logPath);
-          if (exit !== null) {
-            // finished log on disk (other or older session)
-            if (showDone) {
-              lines.push(`  ${jid}: done exit=${exit} (from log)`);
-            } else {
-              hiddenOnDisk++;
-            }
-          } else if (cfg.adoptForeignJobs) {
-            // running foreign job — only surfaced when adoption is enabled
-            lines.push(`  ${jid}: running (from log)`);
-          } else {
-            hiddenOnDisk++;
-          }
-        }
-      } catch {
-        // jobs dir doesn't exist — nothing to scan.
-      }
-      if (hiddenOnDisk > 0) {
-        lines.push(
-          `  (${hiddenOnDisk} more job log(s) on disk — pass includeDone to list, bgclean to prune)`,
-        );
-      }
-      if (lines.length === 0) {
-        return {
-          content: [{ type: "text", text: "(no bgrun jobs)" }],
-          details: { count: 0 },
-        };
-      }
-      return {
-        content: [{ type: "text", text: `bgrun jobs:\n${lines.join("\n")}` }],
-        details: { count: lines.length },
-      };
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return bgstatusCore(params, ctx);
     },
   });
 
   // ── bgclean: remove old job logs ───────────────────────────────────────────
 
-  pi.registerTool({
-    name: "bgclean",
-    label: "Clean Old Background Jobs",
-    description:
-      "Remove old background job logs from disk. Default: 7 days. Never removes a running job's log. " +
-      "Prints a summary of what was removed vs kept.",
-    promptSnippet: "Remove old bgrun job logs",
-    parameters: Type.Object({
-      days: Type.Optional(
-        Type.Number({
-          description: "Remove logs older than this many days (default 7)",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const cfg = resolveConfig(ctx);
-      const { days = cfg.cleanupDays } = params;
-      if (typeof days !== "number" || days < 0 || !Number.isFinite(days)) {
-        throw new Error(
-          `bgclean: days must be a non-negative number, got ${days}`,
-        );
-      }
-      const result = cleanOldJobs(days, cfg.jobsDir, ctx);
-      // Manual clean refreshes the throttle marker so the next auto-sweep
-      // doesn't immediately redo this work.
+  // ── bgclean: remove old job logs ──────────────────────────────────────
+
+  // Shared by the bgclean tool (agent-facing) and the /bgclean slash command
+  // (human-facing).
+  async function bgcleanCore(
+    params: { days?: number; all?: boolean },
+    ctx?: ExtensionContext,
+  ): Promise<{
+    content: { type: "text"; text: string }[];
+    details: { removed: number; kept: number; skippedRunning: number };
+  }> {
+    const cfg = resolveConfig(ctx);
+    const { days = cfg.cleanupDays, all = false } = params;
+    if (typeof days !== "number" || days < 0 || !Number.isFinite(days)) {
+      throw new Error(
+        `bgclean: days must be a non-negative number, got ${days}`,
+      );
+    }
+    let result;
+    if (all) {
+      result = cleanOldJobs(days, cfg.jobsDir, ctx);
+      // A manual global clean refreshes the throttle marker so the next
+      // auto-sweep doesn't immediately redo this work.
       try {
         mkdirSync(cfg.jobsDir, { recursive: true });
         writeFileSync(join(cfg.jobsDir, ".last-clean"), String(Date.now()));
       } catch {
         // best-effort
       }
-      const summary = `removed ${result.removed} job log(s), kept ${result.kept}${result.skippedRunning > 0 ? `, skipped ${result.skippedRunning} running` : ""}`;
-      return {
-        content: [{ type: "text", text: summary }],
-        details: result,
-      };
+    } else {
+      // Session-scoped by default: bg* commands apply to the current
+      // session's jobs only.
+      result = cleanSessionJobs(days, ctx);
+    }
+    const scope = all ? "all sessions" : "this session";
+    const summary = `removed ${result.removed} job log(s) (${scope}), kept ${result.kept}${result.skippedRunning > 0 ? `, skipped ${result.skippedRunning} running` : ""}`;
+    return {
+      content: [{ type: "text", text: summary }],
+      details: result,
+    };
+  }
+
+  pi.registerTool({
+    name: "bgclean",
+    label: "Clean Old Background Jobs",
+    description:
+      "Remove old background job logs from disk. Default scope: THIS session's jobs only (other sessions' logs are " +
+      "untouched). Pass all: true to sweep the whole shared jobs dir. Retention: cleanupDays config (default 7 days). " +
+      "Never removes a running job's log. Prints a summary of what was removed vs kept.",
+    promptSnippet:
+      "Remove old bgrun job logs (this session by default; all: true for every session's)",
+    parameters: Type.Object({
+      days: Type.Optional(
+        Type.Number({
+          description: "Remove logs older than this many days (default 7)",
+        }),
+      ),
+      all: Type.Optional(
+        Type.Boolean({
+          description:
+            "Sweep the whole shared jobs dir (all sessions' logs), not just this session's (default false)",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return bgcleanCore(params, ctx);
+    },
+  });
+
+  // ── Slash commands: human-facing mirrors of the read/clean tools ───────────
+  //
+  // pi.registerTool registers AGENT tools; slash commands need a separate
+  // pi.registerCommand registration. These let the human check jobs or prune
+  // logs directly from the TUI without asking the agent. /bgrun is
+  // deliberately NOT a command — starting jobs (and reacting to their wakes)
+  // is the agent's workflow.
+
+  pi.registerCommand("bgstatus", {
+    description: "Background jobs: status (/bgstatus [id] [done])",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const includeDone = tokens.some((t) =>
+        ["done", "all"].includes(t.toLowerCase()),
+      );
+      const id = tokens.find((t) => !["done", "all"].includes(t.toLowerCase()));
+      const res = await bgstatusCore(
+        { id, includeDone: includeDone || undefined },
+        ctx,
+      );
+      if (ctx.hasUI) {
+        ctx.ui.notify(res.content[0].text, res.isError ? "error" : "info");
+      }
+    },
+  });
+
+  pi.registerCommand("bgtail", {
+    description: "Background jobs: tail a log (/bgtail <id> [lines])",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const id = tokens[0];
+      if (!id) {
+        if (ctx.hasUI) {
+          ctx.ui.notify("Usage: /bgtail <job-id> [lines]", "error");
+        }
+        return;
+      }
+      const n = Number(tokens[1]);
+      const res = await bgtailCore(
+        { id, lines: Number.isFinite(n) && n > 0 ? n : undefined },
+        ctx,
+      );
+      if (ctx.hasUI) {
+        ctx.ui.notify(res.content[0].text, res.isError ? "error" : "info");
+      }
+    },
+  });
+
+  pi.registerCommand("bgclean", {
+    description: "Background jobs: remove old logs (/bgclean [days] [all])",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const tokens = (args ?? "")
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)
+        .filter(Boolean);
+      const daysToken = Number(tokens.find((t) => /^\d+(\.\d+)?$/.test(t)));
+      const all = tokens.includes("all");
+      try {
+        const res = await bgcleanCore(
+          { days: Number.isFinite(daysToken) ? daysToken : undefined, all },
+          ctx,
+        );
+        if (ctx.hasUI) {
+          ctx.ui.notify(res.content[0].text, "info");
+        }
+      } catch (err) {
+        if (ctx.hasUI) {
+          ctx.ui.notify(String(err), "error");
+        }
+      }
     },
   });
 }

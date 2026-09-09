@@ -34,7 +34,23 @@ Restart pi after install so the extension loads.
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Jobs from other sessions are only listed when `adoptForeignJobs` is enabled. |
 | `bgtail` | Print the last N lines of a job's log (default 40), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. Pass `raw: true` to skip condensing. |
-| `bgclean` | Remove old job logs. Default retention: `cleanupDays` config (7 days). Always runs — not throttled. |
+| `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Pass `all: true` to sweep the whole shared jobs dir. Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
+
+## Slash commands
+
+Human-facing mirrors of the read/clean tools, usable directly in the TUI
+without asking the agent (registered via `pi.registerCommand` — a separate
+registration from the agent tools above, which is why tools alone never show
+up as `/` commands):
+
+| Command | Purpose |
+| --- | --- |
+| `/bgstatus [id] [done]` | One job's status by id, or the session listing (`done`/`all` includes finished jobs). |
+| `/bgtail <id> [lines]` | Tail a job's log (condensed, same as the tool). |
+| `/bgclean [days] [all]` | Remove old logs — session-scoped by default; `all` sweeps every session's. |
+
+`/bgrun` is deliberately not a command — starting jobs (and reacting to their
+wake messages) is the agent's workflow.
 
 ## Roadmap / not provided
 
@@ -97,6 +113,7 @@ config file (trusted projects only) ← environment variables**.
   "adoptForeignJobs": false,
   "showCompletedJobs": false,
   "cleanupDays": 7,
+  "globalAutoClean": true,
   "jobsDir": "/some/other/dir"
 }
 ```
@@ -108,15 +125,29 @@ Environment variables (same knobs, handy for one-off overrides):
 | `PI_BGRUN_DIR` | `~/.pi-bgrun/jobs` | Override where job logs are stored. |
 | `PI_BGRUN_FOREIGN_JOBS` | `false` | Adopt other sessions' running jobs into this session's widget and job list. Adopted jobs are polled so they leave the widget when they finish. |
 | `PI_BGRUN_SHOW_COMPLETED` | `false` | Include finished jobs in `bgstatus` listings by default. |
-| `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for auto-clean sweeps and the `bgclean` default. |
+| `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |
+| `PI_BGRUN_GLOBAL_AUTO_CLEAN` | `true` | Set `0`/`false` to disable the automatic global orphan sweep (see below). |
 
 ### Log cleanup
 
-- **Auto-sweep** runs at `session_start` and `session_shutdown`, no more often
-  than **once per `cleanupDays`** (tracked by a `.last-clean` marker in the jobs
-  dir). There is no background timer — sweeps happen at session boundaries, so
-  a machine with no sessions for a while simply sweeps at the next launch.
-- **Manual** `bgclean` always runs immediately and refreshes the marker.
+Cleanup follows the same principle as everything else: **one session should
+not delete another session's artifacts.**
+
+- **Session-scoped auto-sweep (default)** runs at `session_start` and
+  `session_shutdown` and removes only *this session's* finished logs older
+  than `cleanupDays`. Cheap and unthrottled.
+- **Global orphan sweep (default on; opt out with `globalAutoClean: false` /
+  `PI_BGRUN_GLOBAL_AUTO_CLEAN=0`)** — also sweeps the whole shared jobs dir at
+  session boundaries, removing *finished* logs (exit marker, or dead pid)
+  older than `cleanupDays`. This is what keeps orphans from sessions that
+  crashed or will never be resumed from accumulating: a week-old finished log
+  is garbage under the same retention its owning session would apply itself.
+  Throttled to once per `cleanupDays` via a `.last-clean` marker so
+  restart-heavy workflows don't re-sweep on every launch. Running jobs are
+  pid-protected, so live sessions are never affected.
+- **Manual**: `bgclean` cleans this session's old logs; `bgclean` with
+  `all: true` sweeps every session's logs immediately (and refreshes the
+  marker).
 - Running jobs are never swept while their pid is alive.
 
 ## Status
