@@ -15,7 +15,8 @@
       "./extension/index.ts"
     ],
     "skills": [
-      "./skill/run-bg"
+      "./skill/run-bg",
+      "./skill/digest-config"
     ]
   },
   "scripts": {
