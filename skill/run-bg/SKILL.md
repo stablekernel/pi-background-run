@@ -30,7 +30,8 @@ no polling.
 |---|---|
 | Start  | `bgrun(command: "make test-short", name: "unit-tests")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the status widget, and wake messages) |
 | Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
-| Tail   | `bgtail(<job-id>, 40)` |
+| Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing) |
+| Grep   | `bggrep(<job-id>, "pattern", context?)` — line-numbered matches, capped and condensed; default pattern = generic failure signatures (override when you know the format) |
 | Clean  | `bgclean()` for this session's old logs; `bgclean all` to sweep every session's (default 7-day retention) |
 
 ## Workflow
@@ -51,7 +52,8 @@ no polling.
 
 ### Reading results without flooding context
 
-- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker.
+- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing) — polling a running job is nearly free.
+- **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Works on global jobs dirs that `ctx_execute_file` cannot reach (it runs inside the extension). Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
 - **Whole-log failure analysis:** `ctx_execute_file` on the log path:
 
   ```javascript
