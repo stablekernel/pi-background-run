@@ -1860,6 +1860,49 @@ test("ensureGitExcluded: linked worktree (.git file) writes to the pointed git d
   }
 });
 
+test("ensureGitExcluded: gitdir pointer with spaces in the path", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const wt = mkdtempSync(join(tmpdir(), "pi-bgrun-wt-"));
+  const gd = join(tmpdir(), "pi-bgrun git dir with spaces");
+  mkdirSync(gd, { recursive: true });
+  try {
+    writeFileSync(join(wt, ".git"), `gitdir: ${gd}\n`);
+    assert.equal(
+      mod.ensureGitExcluded(join(wt, ".pi-bgrun", "jobs")),
+      true,
+    );
+    const exclude = readFileSync(join(gd, "info", "exclude"), "utf8");
+    assert.match(exclude, /^\.pi-bgrun\/jobs\/$/m);
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+    rmSync(gd, { recursive: true, force: true });
+  }
+});
+
+test("ensureGitExcluded: retries after a transient failure — memoizes only on success", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const repo = mkdtempSync(join(tmpdir(), "pi-bgrun-repo-"));
+  try {
+    mkdirSync(join(repo, ".git", "info"), { recursive: true });
+    // Block the exclude path with a directory → the append fails (EISDIR)
+    mkdirSync(join(repo, ".git", "info", "exclude"));
+    const jobsDir = join(repo, ".pi-bgrun", "jobs");
+    assert.equal(mod.ensureGitExcluded(jobsDir), false);
+
+    // Unblock: the next call must retry (failure was not memoized) and succeed
+    rmSync(join(repo, ".git", "info", "exclude"), { recursive: true });
+    assert.equal(mod.ensureGitExcluded(jobsDir), true);
+    const exclude = readFileSync(join(repo, ".git", "info", "exclude"), "utf8");
+    assert.match(exclude, /^\.pi-bgrun\/jobs\/$/m);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("bgrun: relative jobsDir in project config → project-local log + auto git-exclude", async () => {
   const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
   delete process.env.PI_BGRUN_DIR;

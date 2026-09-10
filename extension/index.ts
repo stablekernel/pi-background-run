@@ -154,27 +154,37 @@ export function resolveJobsDirPath(
 // Auto-ignore a project-local jobs dir in git so logs never pollute
 // `git status`: appends the dir pattern to the enclosing repo's
 // .git/info/exclude (local-only — the tracked .gitignore is never touched).
-// Memoized per dir; every step is best-effort and must never fail a bgrun.
+// Memoized only on SUCCESS — a transient failure (unwritable exclude file,
+// .git appearing later) is retried on the next bgrun. Every step is
+// best-effort and must never fail a bgrun.
 const gitExcludedDirs = new Set<string>();
 
-export function ensureGitExcluded(jobsDir: string): void {
-  if (gitExcludedDirs.has(jobsDir)) return;
-  gitExcludedDirs.add(jobsDir); // set first — best-effort, never retry-spam
+// Returns true when the dir is settled (pattern written, already present, or
+// legitimately nothing to do — no repo above, dir is the repo root itself).
+// False only on failure, so the caller retries next time.
+export function ensureGitExcluded(jobsDir: string): boolean {
+  if (gitExcludedDirs.has(jobsDir)) return true;
+  if (tryEnsureGitExcluded(jobsDir)) {
+    gitExcludedDirs.add(jobsDir);
+    return true;
+  }
+  return false;
+}
+
+function tryEnsureGitExcluded(jobsDir: string): boolean {
   try {
     // Walk up from jobsDir to the enclosing work tree.
     let cur = jobsDir;
     for (;;) {
       const dot = join(cur, ".git");
-      if (existsSync(dot)) {
-        appendExcludePattern(cur, dot, jobsDir);
-        return;
-      }
+      if (existsSync(dot)) return appendExcludePattern(cur, dot, jobsDir);
       const parent = dirname(cur);
-      if (parent === cur) return; // filesystem root — not inside a work tree
+      if (parent === cur) return true; // filesystem root — no repo above; nothing to do
       cur = parent;
     }
   } catch {
     // best-effort — ignore hygiene must never break job creation
+    return false;
   }
 }
 
@@ -182,15 +192,15 @@ function appendExcludePattern(
   repoRoot: string,
   dotGit: string,
   jobsDir: string,
-): void {
-  if (jobsDir === repoRoot) return; // can't exclude the whole repo
+): boolean {
+  if (jobsDir === repoRoot) return true; // can't exclude the whole repo; nothing to do
   // `.git` is a directory in a normal checkout, or a file pointing at the
   // real git dir in linked worktrees (git worktree add) and submodules.
   let gitDir = dotGit;
   if (statSync(dotGit).isFile()) {
-    const m = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(\S+)/);
-    if (!m) return;
-    gitDir = m[1];
+    const m = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)$/m);
+    if (!m) return false; // unparseable .git file — retry later
+    gitDir = m[1].trim();
   }
   const pattern = relative(repoRoot, jobsDir).split(sep).join("/") + "/";
   const excludePath = join(gitDir, "info", "exclude");
@@ -200,12 +210,13 @@ function appendExcludePattern(
   } catch {
     // no exclude file yet — we'll create it
   }
-  if (existing.split("\n").some((l) => l.trim() === pattern)) return;
+  if (existing.split("\n").some((l) => l.trim() === pattern)) return true;
   mkdirSync(join(gitDir, "info"), { recursive: true });
   appendFileSync(
     excludePath,
     `\n# pi-bgrun job logs (auto-added)\n${pattern}\n`,
   );
+  return true;
 }
 
 // Resolved per call (cheap: at most two small file reads) so env/config
