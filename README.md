@@ -134,32 +134,67 @@ Wake messages always lead with universal facts — exit code, duration, log line
 count. A project can additionally opt into a **digest scorecard**: a one-line
 pass/fail summary extracted from the log and appended to the wake.
 
+#### Setting it up
+
+Three ways, easiest first — pick the first one you're comfortable with:
+
+1. **Ask your agent (recommended).** Say: *"Set up the pi-bgrun digest for
+   this project."* The `digest-config` skill ships with this package and does
+   the whole job: it samples your project's real job logs, tries the shipped
+   presets against them, drafts a custom command if none fits, validates the
+   result on both a green and a red log, and writes the config. It sees your
+   actual output format, which is exactly what a good digest depends on —
+   and you never have to read a log yourself. The one-shot toast some
+   projects see on session start ("no digest configured") is pointing at
+   this same skill.
+2. **One-line preset if you know your stack.** Create
+   `<project>/.pi/pi-bgrun.json` (or merge into an existing one):
+
+   ```json
+   { "digest": { "preset": "go-test" } }
+   ```
+
+   | Preset | What it summarizes |
+   | --- | --- |
+   | `go-test` | Go test output: package ok/FAIL counts + failing test names |
+   | `jest` | Jest output: Tests/Test Suites summary + failed test names |
+   | `pytest` | pytest output: final passed/failed/error summary line + FAILED test ids |
+   | `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names |
+
+3. **Custom command.** For formats the presets don't cover:
+
+   ```json
+   { "digest": { "command": "grep -E 'FAIL|ok  ' \"$1\" | head -5" } }
+   ```
+
+   The command receives the job's log path as `$1` and its stdout is appended
+   to the wake. Worked example — a log containing:
+
+   ```text
+   PASS src/auth.test.ts (2.1s)
+   FAIL src/api.test.ts
+   Tests: 12 passed, 1 failed, 13 total
+   ```
+
+   plus the command `grep -E '^(PASS|FAIL|Tests:)' "$1" | head -5`, wakes with:
+
+   ```text
+   digest (project-config): FAIL src/api.test.ts
+   Tests: 12 passed, 1 failed, 13 total
+   ```
+
+   Rules of thumb: quote `"$1"`, end the pipeline in `head -N` so output is
+   bounded, and — this is the important one — **check the command against a
+   green and a red log before committing to it**. A scorecard that says "all
+   passing" on a failing log is worse than no scorecard. The `digest-config`
+   skill does this validation for you; if you'd rather hand-tune a command
+   yourself, you can also ask your agent to validate a specific command
+   against specific job logs.
+
 Opt in per project via `<project>/.pi/pi-bgrun.json` (read only for trusted
-projects):
+projects). If both `preset` and `command` are set, the preset wins.
 
-```json
-{ "digest": { "preset": "go-test" } }
-```
-
-or with a custom shell command:
-
-```json
-{ "digest": { "command": "grep -E 'FAIL|ok  ' \"$1\" | head -5" } }
-```
-
-The command receives the job's log path as `$1`; its stdout is appended to the
-wake. If both `preset` and `command` are set, the preset wins.
-
-Shipped presets:
-
-| Preset | What it summarizes |
-| --- | --- |
-| `go-test` | Go test output: package ok/FAIL counts + failing test names |
-| `jest` | Jest output: Tests/Test Suites summary + failed test names |
-| `pytest` | pytest output: final passed/failed/error summary line + FAILED test ids |
-| `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names |
-
-Guarantees:
+#### Guarantees
 
 - **Exit code always leads.** The digest is appended after the universal
   stats, labeled `digest (project-config):`. It never overrides or reorders
@@ -170,6 +205,17 @@ Guarantees:
   simply contributes nothing — it never breaks a wake.
 - **No config, no behavior.** Absent or invalid config contributes nothing;
   without a `digest` section the wake is unchanged.
+
+A configured wake reads like this:
+
+```text
+✅ Background job "tests" `abc123` finished (exit 1).
+Command: go test ./...
+Stats: 42.3s, 1204 lines
+Last output: FAIL example.com/api/handlers
+digest (project-config): 7 ok / 1 FAIL: TestResolveNotFound
+Review the result now: call `bgtail` ...
+```
 
 Shell safety: the command comes from trust-gated config and runs with your
 own privileges — the same trust boundary as the `jobsDir` setting.
