@@ -20,10 +20,17 @@ import {
   writeFileSync,
   existsSync,
   readdirSync,
+  mkdirSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
+import {
+  DIGEST_PRESETS,
+  DIGEST_PRESET_IDS,
+  resolveDigest,
+} from "./digestPresets.ts";
 
 interface CapturedWake {
   text: string;
@@ -1869,5 +1876,329 @@ test("wake message: missing log file — Stats shows duration only, wake still s
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── digest config + shipped presets (opt-in) ─────────────────────────────
+
+function writeJson(filePath: string, obj: unknown): void {
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify(obj));
+}
+
+test("resolveConfig: digest resolves from a trusted project config", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  ); // does not exist
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    const cfg = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => true,
+    });
+    assert.deepEqual(cfg.digest, { preset: "go-test" });
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: digest absent everywhere → undefined", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    const cfg = mod.resolveConfig({});
+    assert.equal(cfg.digest, undefined);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+  }
+});
+
+test("resolveConfig: untrusted project → no digest even when the project config has one", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    // No isProjectTrusted on ctx at all.
+    assert.equal(mod.resolveConfig({ cwd: proj }).digest, undefined);
+    // Explicitly untrusted.
+    assert.equal(
+      mod.resolveConfig({ cwd: proj, isProjectTrusted: () => false }).digest,
+      undefined,
+    );
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: layering — project digest replaces user digest wholesale; user used when project has none", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const home = mkdtempSync(join(tmpdir(), "pi-bgrun-home-"));
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(home, "user.json");
+  try {
+    writeJson(join(home, "user.json"), {
+      digest: { command: 'grep . "$1" | head -5' },
+    });
+    // No project digest → user digest stands.
+    let cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.deepEqual(cfg.digest, { command: 'grep . "$1" | head -5' });
+    // Project digest → replaces the user's digest object entirely (per-key
+    // merge on the digest object is a later question; keep it simple now).
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "jest" },
+    });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.deepEqual(cfg.digest, { preset: "jest" });
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort)", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    // Both invalid → no digest at all.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "nonsense", command: 42 },
+    });
+    let cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+    // Invalid preset dropped, valid command kept.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "nonsense", command: 'grep x "$1" | head -3' },
+    });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.deepEqual(cfg.digest, { command: 'grep x "$1" | head -3' });
+    // Whitespace-only command is not a command.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: "   " },
+    });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+    // digest section of the wrong shape (array / scalar) ignored.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: ["go-test"] });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveDigest: preset wins over command; normalization shapes", () => {
+  const goTest = DIGEST_PRESETS.find((p) => p.id === "go-test")!;
+  // Both configured → preset wins (curated beats hand-rolled).
+  const both = resolveDigest({
+    preset: "go-test",
+    command: 'grep x "$1" | head -3',
+  });
+  assert.deepEqual(both, { kind: "preset", command: goTest.command });
+  // Command only.
+  assert.deepEqual(resolveDigest({ command: 'grep x "$1" | head -3' }), {
+    kind: "command",
+    command: 'grep x "$1" | head -3',
+  });
+  // Unknown preset (bypassing config validation) falls back to command,
+  // else undefined.
+  assert.deepEqual(resolveDigest({ preset: "bogus", command: "x" }), {
+    kind: "command",
+    command: "x",
+  });
+  assert.equal(resolveDigest({ preset: "bogus" }), undefined);
+  assert.equal(resolveDigest(undefined), undefined);
+  assert.equal(resolveDigest({}), undefined);
+});
+
+// ── preset commands: scorecards against green and red fixture logs ─────────
+
+// Runs a preset command exactly the way the wake path will (Phase 3):
+// sh -c <command> digest <logPath>, so the log path arrives as $1.
+function runPreset(presetId: string, log: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-preset-"));
+  try {
+    const logPath = join(dir, "job.log");
+    writeFileSync(logPath, log);
+    const preset = DIGEST_PRESETS.find((p) => p.id === presetId)!;
+    const res = spawnSync(
+      "sh",
+      ["-c", preset.command, "digest", logPath],
+      { encoding: "utf8", timeout: 5000 },
+    );
+    assert.equal(
+      res.status,
+      0,
+      `${presetId} command should exit 0 (${res.stderr})`,
+    );
+    return res.stdout;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("preset go-test: green and red scorecards", () => {
+  const green = runPreset(
+    "go-test",
+    [
+      "=== RUN TestAlpha",
+      "--- PASS: TestAlpha (0.00s)",
+      "=== RUN TestBeta",
+      "--- PASS: TestBeta (0.00s)",
+      "PASS",
+      "ok  \texample.com/a\t0.01s",
+      "ok  \texample.com/b\t0.02s",
+    ].join("\n"),
+  );
+  assert.match(green, /pass: 2  fail: 0/);
+  assert.ok(!green.includes("Beta"), "no failing names on green");
+
+  const red = runPreset(
+    "go-test",
+    [
+      "=== RUN TestAlpha",
+      "--- PASS: TestAlpha (0.00s)",
+      "=== RUN TestBeta",
+      "--- FAIL: TestBeta (0.00s)",
+      "    a_test.go:12: boom",
+      "FAIL",
+      "ok  \texample.com/a\t0.01s",
+      "FAIL\texample.com/b\t0.02s",
+    ].join("\n"),
+  );
+  assert.match(red, /pass: 1  fail: 1/);
+  assert.match(red, /^TestBeta$/m, "failing test name listed");
+  assert.ok(!red.includes("Alpha"), "passing tests not listed");
+});
+
+test("preset jest: green and red scorecards", () => {
+  const green = runPreset(
+    "jest",
+    [
+      "PASS src/a.test.js",
+      "Test Suites: 1 passed, 1 total",
+      "Tests:       3 passed, 3 total",
+    ].join("\n"),
+  );
+  assert.match(green, /Tests:\s+3 passed, 3 total/);
+  assert.ok(!green.includes("failed"), "no failure mention on green");
+
+  const red = runPreset(
+    "jest",
+    [
+      "FAIL src/b.test.js",
+      "  ● b does the thing",
+      "",
+      "  ✕ b other thing",
+      "",
+      "Test Suites: 1 failed, 1 passed, 2 total",
+      "Tests:       1 failed, 2 passed, 3 total",
+    ].join("\n"),
+  );
+  assert.match(red, /Tests:\s+1 failed, 2 passed, 3 total/);
+  assert.match(red, /b does the thing/m, "failed test name listed");
+  assert.match(red, /b other thing/m, "verbose-style failure listed");
+});
+
+test("preset pytest: green and red scorecards", () => {
+  const green = runPreset(
+    "pytest",
+    [
+      "tests/test_a.py ....                                              [100%]",
+      "============================== 4 passed in 0.02s ==============================",
+    ].join("\n"),
+  );
+  assert.match(green, /4 passed in 0\.02s/);
+  assert.ok(!green.includes("failed"), "no failure mention on green");
+
+  const red = runPreset(
+    "pytest",
+    [
+      "tests/test_a.py F..                                               [ 75%]",
+      "tests/test_b.py .E                                               [100%]",
+      "=================================== FAILURES ===================================",
+      "_________________________________ test_boom __________________________________",
+      "E   assert False",
+      "========================= 1 failed, 1 error, 3 passed in 0.05s =========================",
+      "FAILED tests/test_a.py::test_boom - assert False",
+      "ERROR tests/test_b.py::test_err - RuntimeError: boom",
+    ].join("\n"),
+  );
+  assert.match(red, /1 failed, 1 error, 3 passed in 0\.05s/);
+  assert.match(red, /tests\/test_a\.py::test_boom/m, "FAILED id listed");
+});
+
+test("preset junit-xml: green and red scorecards", () => {
+  const green = runPreset(
+    "junit-xml",
+    [
+      '<?xml version="1.0" encoding="utf-8"?>',
+      "<testsuites>",
+      '  <testsuite name="pytest" tests="3" failures="0" errors="0">',
+      '    <testcase classname="tests.test_a" name="test_ok" time="0.001"/>',
+      '    <testcase classname="tests.test_a" name="test_ok2" time="0.002"/>',
+      "  </testsuite>",
+      "</testsuites>",
+    ].join("\n"),
+  );
+  assert.match(green, /failures: 0  errors: 0/);
+  assert.ok(!green.includes("test_ok"), "no testcase names on green");
+
+  const red = runPreset(
+    "junit-xml",
+    [
+      "<testsuites>",
+      '  <testsuite name="pytest" tests="3" failures="1" errors="1">',
+      '    <testcase classname="tests.test_a" name="test_boom" time="0.001">',
+      '      <failure message="assert False">traceback...</failure>',
+      "    </testcase>",
+      '    <testcase classname="tests.test_a" name="test_err" time="0.001">',
+      '      <error message="boom">RuntimeError</error>',
+      "    </testcase>",
+      '    <testcase classname="tests.test_a" name="test_ok" time="0.001"/>',
+      "  </testsuite>",
+      "</testsuites>",
+    ].join("\n"),
+  );
+  assert.match(red, /failures: 1  errors: 1/);
+  assert.match(red, /^test_boom$/m, "failing testcase name listed");
+  assert.match(red, /^test_err$/m, "errored testcase name listed");
+  assert.ok(!red.includes("test_ok\n") && !/^test_ok$/m.test(red), "passing testcase not listed");
+});
+
+test("shipped presets: ids are stable and every command ends in head (bounded output)", () => {
+  assert.deepEqual(DIGEST_PRESET_IDS, ["go-test", "jest", "pytest", "junit-xml"]);
+  for (const preset of DIGEST_PRESETS) {
+    assert.match(
+      preset.command,
+      /\|\s*head -\d+$/,
+      `${preset.id} command ends in head -N`,
+    );
   }
 });

@@ -47,6 +47,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { DIGEST_PRESET_IDS } from "./digestPresets.ts";
 
 // Exit marker appended to every log so the file is self-describing: the exit
 // code survives pi restarting. `;` (not `&&`) ensures the printf runs even when
@@ -84,6 +85,12 @@ interface BgrunConfig {
   // keep every sweep session-scoped (then only `bgclean all` touches foreign
   // logs).
   globalAutoClean: boolean;
+  // Opt-in digest scorecard, resolved to a normalized { preset, command } (or
+  // undefined when unconfigured or fully invalid). Presets are shipped sh
+  // commands (see digestPresets.ts); command is a custom sh command receiving
+  // the job's log path as $1. Resolved from trusted project config only —
+  // never runs pattern matching unless the project opted in.
+  digest?: { preset?: string; command?: string };
 }
 
 interface BgrunConfigFile {
@@ -92,6 +99,7 @@ interface BgrunConfigFile {
   showCompletedJobs?: unknown;
   cleanupDays?: unknown;
   globalAutoClean?: unknown;
+  digest?: unknown;
 }
 
 function parseBoolEnv(v: string | undefined): boolean | undefined {
@@ -113,13 +121,37 @@ function readConfigFile(path: string): BgrunConfigFile {
   return {};
 }
 
+// Digest config validation: invalid values are dropped from the resolved
+// config (best-effort — a malformed digest section must never break a wake or
+// the whole config), but the human gets exactly one console.error per process
+// so a typo is discoverable.
+let digestWarned = false;
+function warnDigestInvalid(field: string, value: unknown): void {
+  if (digestWarned) return;
+  digestWarned = true;
+  const hint =
+    field === "preset"
+      ? ` — valid presets: ${DIGEST_PRESET_IDS.join(", ")}`
+      : "";
+  console.error(
+    `[pi-bgrun] ignoring invalid digest.${field} in pi-bgrun.json: ${JSON.stringify(value)}${hint}`,
+  );
+}
+
 // Resolved per call (cheap: at most two small file reads) so env/config
 // changes are picked up without module reloads — and tests can isolate.
-function resolveConfig(ctx?: {
+// Exported for tests, like formatSince.
+export function resolveConfig(ctx?: {
   cwd?: string;
   isProjectTrusted?: () => boolean;
 }): BgrunConfig {
-  const user = readConfigFile(join(homedir(), ".pi", "agent", "pi-bgrun.json"));
+  // User config: $HOME/.pi/agent/pi-bgrun.json, overridable via
+  // PI_BGRUN_USER_CONFIG (mirrors the PI_BGRUN_DIR escape hatch — mainly for
+  // tests, which cannot swap the real home dir).
+  const user = readConfigFile(
+    process.env.PI_BGRUN_USER_CONFIG ||
+      join(homedir(), ".pi", "agent", "pi-bgrun.json"),
+  );
   let project: BgrunConfigFile = {};
   try {
     if (ctx?.isProjectTrusted?.()) {
@@ -155,6 +187,42 @@ function resolveConfig(ctx?: {
       : undefined;
   const envDays = Number(process.env.PI_BGRUN_CLEANUP_DAYS);
   const daysEnv = Number.isFinite(envDays) && envDays > 0 ? envDays : undefined;
+  // Digest section: normalize { preset, command }, dropping invalid values
+  // individually (warnDigestInvalid logs once for the first one). When both
+  // preset and command are valid, both are kept here — resolveDigest() gives
+  // the preset precedence.
+  let digest: BgrunConfig["digest"];
+  if (
+    merged.digest &&
+    typeof merged.digest === "object" &&
+    !Array.isArray(merged.digest)
+  ) {
+    const digestFile = merged.digest as { preset?: unknown; command?: unknown };
+    let preset: string | undefined;
+    if (digestFile.preset !== undefined) {
+      if (
+        typeof digestFile.preset === "string" &&
+        DIGEST_PRESET_IDS.includes(digestFile.preset)
+      ) {
+        preset = digestFile.preset;
+      } else {
+        warnDigestInvalid("preset", digestFile.preset);
+      }
+    }
+    let command: string | undefined;
+    if (digestFile.command !== undefined) {
+      if (typeof digestFile.command === "string" && digestFile.command.trim()) {
+        command = digestFile.command;
+      } else {
+        warnDigestInvalid("command", digestFile.command);
+      }
+    }
+    if (preset || command) {
+      digest = {};
+      if (preset) digest.preset = preset;
+      if (command) digest.command = command;
+    }
+  }
   return {
     jobsDir:
       process.env.PI_BGRUN_DIR ||
@@ -171,6 +239,7 @@ function resolveConfig(ctx?: {
       parseBoolEnv(process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN) ??
       globalCleanFile ??
       true,
+    digest,
   };
 }
 
