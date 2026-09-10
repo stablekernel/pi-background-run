@@ -209,7 +209,12 @@ function appendExcludePattern(
     if (!m) return false; // unparseable .git file — retry later
     gitDir = m[1].trim();
   }
-  const pattern = relative(repoRoot, jobsDir).split(sep).join("/") + "/";
+  const rel = relative(repoRoot, jobsDir);
+  // Defense-in-depth: the walk-up guarantees jobsDir sits under repoRoot, but
+  // a future caller or symlinked path could break that — ../-prefixed
+  // patterns are silently useless in gitignore semantics, so skip them.
+  if (rel.startsWith("..") || isAbsolute(rel)) return true;
+  const pattern = rel.split(sep).join("/") + "/";
   const excludePath = join(gitDir, "info", "exclude");
   let existing = "";
   try {
@@ -1078,7 +1083,10 @@ export default function (pi: ExtensionAPI) {
   // resets to a full tail. Bookmarks are in-memory only — a session restart
   // starts fresh with a full tail.
 
-  const tailBookmarks = new Map<string, { lines: number; bytes: number }>();
+  const tailBookmarks = new Map<
+    string,
+    { lines: number; bytes: number; first: string }
+  >();
 
   // Shared by the bgtail tool (agent-facing) and the /bgtail slash command
   // (human-facing).
@@ -1090,7 +1098,10 @@ export default function (pi: ExtensionAPI) {
     details: Record<string, unknown>;
     isError?: boolean;
   }> {
-    const { id, lines = 40, raw = false } = params;
+    const { id, lines: linesParam = 40, raw = false } = params;
+    // Clamp defensively — direct callers (e.g. the slash command) bypass the
+    // tool schema, and lines < 1 would corrupt slicing (slice(-0) = whole log).
+    const lines = Math.max(1, Math.floor(linesParam));
     if (!id) throw new Error("bgtail: id is required");
     // Prefer this session's record: its logPath stays correct even if the
     // config (and thus the resolved jobs dir) changes mid-session — e.g. a
@@ -1102,28 +1113,42 @@ export default function (pi: ExtensionAPI) {
       // Content lines only: the exit marker and blanks are filtered BEFORE the
       // window is sliced, so "last N lines" means the last N content lines
       // (matching pre-delta behavior) and bookmarks count content lines.
+      // /\r?\n/ keeps CRLF logs from leaving a stray \r on every line.
       const rawLines = content
-        .split("\n")
+        .split(/\r?\n/)
         .filter((l) => !l.startsWith(EXIT_MARKER) && l.trim().length > 0);
       const total = rawLines.length;
+      const first = rawLines[0]?.slice(0, 200) ?? "";
       const prev = tailBookmarks.get(id);
+      // Append-only logs never mutate earlier lines, so a changed first
+      // content line means the log was replaced or rotated — reset to a full
+      // tail. Catches same-size replacements the shrink checks cannot see.
+      // (A previously-empty log growing content is growth, not replacement.)
+      const replaced =
+        prev !== undefined && prev.lines > 0 && prev.first !== first;
       const shrank =
         prev !== undefined &&
         (prev.lines > total || prev.bytes > content.length);
       let window: string[];
       let header: string | undefined;
       let newLines: number | undefined;
-      if (raw || prev === undefined || shrank) {
+      if (raw || prev === undefined || shrank || replaced) {
         // Full tail: first read, raw mode, or a shrunken/replaced log (reset).
         window = rawLines.slice(-lines);
-        if (!raw && shrank) {
-          header = "log shrank since last read — showing full tail";
+        if (!raw && (shrank || replaced)) {
+          header = shrank
+            ? "log shrank since last read — showing full tail"
+            : "log was replaced since last read — showing full tail";
         }
       } else {
         const fresh = rawLines.slice(prev.lines);
         newLines = fresh.length;
         if (fresh.length === 0) {
-          tailBookmarks.set(id, { lines: total, bytes: content.length });
+          tailBookmarks.set(id, {
+            lines: total,
+            bytes: content.length,
+            first,
+          });
           return {
             content: [
               {
@@ -1147,15 +1172,16 @@ export default function (pi: ExtensionAPI) {
           `+${fresh.length} new line${fresh.length === 1 ? "" : "s"} since last read — ` +
           `log at ${total} lines${fresh.length > lines ? ` (showing last ${lines})` : ""}`;
       }
-      tailBookmarks.set(id, { lines: total, bytes: content.length });
+      tailBookmarks.set(id, {
+        lines: total,
+        bytes: content.length,
+        first,
+      });
       const shown = window;
       const { text, truncated } = condenseLogLines(shown, { raw });
-      const body =
-        shown.length === 0
-          ? newLines === undefined
-            ? "(empty log)"
-            : "(no new content lines since last read — only blanks or the exit marker)"
-          : text;
+      // Delta reads early-return above, so an empty window here can only be
+      // a first read of an empty log (full-tail path).
+      const body = shown.length === 0 ? "(empty log)" : text;
       const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
       const head = header ? `${header}\n` : "";
       return {
@@ -1185,14 +1211,17 @@ export default function (pi: ExtensionAPI) {
     name: "bgtail",
     label: "Tail Background Log",
     description:
-      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. For pattern search use bggrep; for whole-log analysis, ctx_execute_file on the log path.",
+      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. A shrunken or replaced log resets to a full tail. For pattern search use bggrep; for whole-log analysis, ctx_execute_file on the log path.",
     promptSnippet: "Read the last N lines of a bgrun job's log",
     parameters: Type.Object({
       id: Type.String({
         description: "Job id (from bgrun's 'started: <id>' response)",
       }),
       lines: Type.Optional(
-        Type.Number({ description: "Number of lines to show (default 40)" }),
+        Type.Number({
+          description: "Number of lines to show (default 40)",
+          minimum: 1,
+        }),
       ),
       raw: Type.Optional(
         Type.Boolean({
@@ -1225,7 +1254,10 @@ export default function (pi: ExtensionAPI) {
     details: Record<string, unknown>;
     isError?: boolean;
   }> {
-    const { id, pattern, context = 0 } = params;
+    const { id, pattern, context: contextParam = 0 } = params;
+    // Clamp defensively — negative context would exclude the match lines
+    // themselves from the context windows (lo > hi no-ops the inner loop).
+    const context = Math.max(0, Math.floor(contextParam));
     if (!id) throw new Error("bggrep: id is required");
     // Record-first, same as bgtail — correct across config changes.
     const logPath =
@@ -1242,11 +1274,12 @@ export default function (pi: ExtensionAPI) {
     let rawLines: string[];
     try {
       const content = readFileSync(logPath, "utf8");
-      rawLines = (
-        content.endsWith("\n")
-          ? content.split("\n").slice(0, -1)
-          : content.split("\n")
-      ).filter((l) => !l.startsWith(EXIT_MARKER));
+      // /\r?\n/ normalizes CRLF (a trailing \r would break $-anchored patterns
+      // and leak into output); blank lines are KEPT so L<n> numbers match the
+      // file. A trailing empty split element is dropped; "" yields zero lines.
+      const split = content === "" ? [] : content.split(/\r?\n/);
+      if (split.length > 0 && split[split.length - 1] === "") split.pop();
+      rawLines = split.filter((l) => !l.startsWith(EXIT_MARKER));
     } catch {
       return {
         content: [
@@ -1339,6 +1372,7 @@ export default function (pi: ExtensionAPI) {
         Type.Number({
           description:
             "Context lines around each match (default 0, grep -C style)",
+          minimum: 0,
         }),
       ),
     }),

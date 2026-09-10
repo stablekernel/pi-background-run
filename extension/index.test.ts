@@ -2347,3 +2347,223 @@ test("bgtail: a shrunken log resets to a full tail with a note", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("bgtail: a replaced log with the same line count resets to a full tail", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const res = await bgrun.execute(
+      "c1",
+      { command: "printf 'aaaa\\nbbbb\\ncccc\\n'" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    await waitForWakes(wakes, 1);
+    const logPath = join(dir, `${id}.log`);
+
+    // First read sets the bookmark (3 content lines, first line "aaaa")
+    await bgtail.execute("c2", { id }, undefined, undefined, ctx);
+    // Replacement: SAME line count, LARGER byte size (so the shrink checks
+    // cannot fire), different first line — only the first-line detector
+    // (append-only logs never mutate line 0) can catch this.
+    writeFileSync(
+      logPath,
+      "xxxxxxxxxxxxxxxxxx\nyyyyyyyyyyyyyyyyyy\nzzzzzzzzzzzzzzzzzz\n",
+    );
+    const t = await bgtail.execute("c3", { id }, undefined, undefined, ctx);
+    const text = t.content[0].text as string;
+    assert.match(text, /log was replaced since last read — showing full tail/);
+    assert.match(text, /xxxxxxxxxxxxxxxxxx/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bggrep and bgtail normalize CRLF logs", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const bggrep = tools.get("bggrep")!;
+    const res = await bgrun.execute(
+      "c1",
+      { command: "echo something" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    await waitForWakes(wakes, 1);
+    const logPath = join(dir, `${id}.log`);
+
+    writeFileSync(logPath, "alpha\r\nerror: boom\r\nomega\r\n");
+    // A $-anchored pattern must match despite the CRLF source
+    const g = await bggrep.execute(
+      "c2",
+      { id, pattern: "boom$" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(g.content[0].text as string, /L2: error: boom/);
+    // And no stray \r leaks into either tool's output
+    assert.ok(!(g.content[0].text as string).includes("\r"));
+    const t = await bgtail.execute("c3", { id }, undefined, undefined, ctx);
+    assert.ok(!(t.content[0].text as string).includes("\r"));
+    assert.match(t.content[0].text as string, /error: boom/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bggrep: empty log reports zero lines, and a missing log is notFound", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bggrep = tools.get("bggrep")!;
+    const res = await bgrun.execute(
+      "c1",
+      { command: "echo x" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    await waitForWakes(wakes, 1);
+
+    writeFileSync(join(dir, `${id}.log`), "");
+    const g = await bggrep.execute(
+      "c2",
+      { id, pattern: "Error:" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      g.content[0].text as string,
+      /0 matches for \/Error:\/ in 0 lines — none/,
+    );
+
+    const missing = await bggrep.execute(
+      "c3",
+      { id: "no-such-job-123", pattern: "x" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(missing.isError, true);
+    assert.equal(missing.details.notFound, true);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bggrep: context windows combine with the 50-match cap", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bggrep = tools.get("bggrep")!;
+    const res = await bgrun.execute(
+      "c1",
+      { command: "echo x" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    await waitForWakes(wakes, 1);
+
+    // 240 lines, a hit every 4th line → 60 matches (cap 50); with context: 1
+    // each window is [i-1, i+1] and consecutive windows leave a 1-line gap.
+    const lines: string[] = [];
+    for (let i = 1; i <= 240; i++) {
+      lines.push(i % 4 === 0 ? `hit ${i}` : `filler ${i}`);
+    }
+    writeFileSync(join(dir, `${id}.log`), lines.join("\n") + "\n");
+    const r = await bggrep.execute(
+      "c2",
+      { id, pattern: "^hit", context: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text = r.content[0].text as string;
+    assert.equal(r.details.matches, 60);
+    assert.equal(r.details.capped, true);
+    assert.match(text, /showing first 50; 10 more not shown/);
+    assert.match(text, /L4: hit 4/);
+    assert.match(text, /…\[1 line skipped\]…/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgtail and bggrep clamp nonsensical numeric params", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const bggrep = tools.get("bggrep")!;
+    const res = await bgrun.execute(
+      "c1",
+      { command: "printf 'one\\ntwo\\nthree\\nfour\\nfive\\n'" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    await waitForWakes(wakes, 1);
+
+    // lines: 0 must not mean "everything" (slice(-0) pitfall) — clamps to 1
+    const t = await bgtail.execute(
+      "c2",
+      { id, lines: 0 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(t.details.linesShown, 1);
+    assert.match(t.content[0].text as string, /five/);
+    assert.ok(!(t.content[0].text as string).includes("four"));
+
+    // negative context must not drop the match lines themselves — clamps to 0
+    const g = await bggrep.execute(
+      "c3",
+      { id, pattern: "^three", context: -1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(g.content[0].text as string, /L3: three/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

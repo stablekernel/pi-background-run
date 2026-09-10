@@ -34,7 +34,7 @@ Restart pi after install so the extension loads.
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Jobs from other sessions are only listed when `adoptForeignJobs` is enabled. |
 | `bgtail` | Read the newest lines of a job's log (default 40), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
-| `bggrep` | Regex search over a job's log: line-numbered matches, optional `context` lines, capped (~50 matches, ~8KB) and condensed. Runs inside the extension, so it reaches **any** jobs dir — including global logs that project-sandboxed tools (`ctx_execute_file`) cannot. With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
+| `bggrep` | Regex search over a job's log: line-numbered matches, optional `context` lines, capped (~50 matches, ~2KB/line, ~8KB) and condensed. Runs inside the extension, so it reaches **any** jobs dir — including global logs that project-sandboxed tools (`ctx_execute_file`) cannot. With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Pass `all: true` to sweep the whole shared jobs dir. Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
 
 ## Slash commands
@@ -87,12 +87,12 @@ Two-tier read model — the log file stays complete on disk for deep analysis;
 only bounded digests ever enter the conversation:
 
 - **Quick peek:** `bgtail <id>` — condensed newest lines (ANSI stripped, repeats
-  collapsed, ~8KB cap). The first read is the last-40-lines tail; each later
+  collapsed, ~2KB/line and ~8KB caps). The first read is the last-40-lines tail; each later
   read returns only what was appended since, so repeated polling is nearly
   free. The wake message itself already carries the exit code and the log's
   last line, so many turns need no follow-up read at all.
 - **Pattern search:** `bggrep <id> [pattern] [context]` — line-numbered matches,
-  capped and condensed; works on global jobs dirs that `ctx_execute_file`
+  capped and condensed (~50 matches, ~2KB/line, ~8KB); works on global jobs dirs that `ctx_execute_file`
   cannot reach. Pass your own pattern when you know the log's format.
 - **Whole-log analysis:** `ctx_execute_file` on the job's log path (reachable
   when logs are project-local) to extract only failure lines. Never `cat` or
@@ -101,7 +101,7 @@ only bounded digests ever enter the conversation:
 **Why `bggrep` instead of `bash grep` on the log?** A bash grep's output is
 uncapped — a retry-storm log can dump thousands of matching lines straight
 into context, and safety depends on remembering `| head` on every call.
-`bggrep` is bounded by design (~50 matches, ~8KB), takes the job id instead of
+`bggrep` is bounded by design (~50 matches, ~2KB/line, ~8KB), takes the job id instead of
 a reconstructed log path (no shell-quoting of the regex), runs on any jobs
 dir — including global logs that project-sandboxed tools like
 `ctx_execute_file` cannot reach — and reports match counts, line numbers, and

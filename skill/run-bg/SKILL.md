@@ -74,7 +74,7 @@ no polling.
 - `bash grep` output is uncapped — a retry-storm log can dump thousands of
   matching lines (megabytes) straight into context, and staying safe depends
   on remembering `| head` on every single call. `bggrep` is bounded by design
-  (~50 matches, ~8KB).
+  (~50 matches, ~2KB/line, ~8KB).
 - It takes the job id — no log-path reconstruction, no shell-quoting of the
   regex — and works on any jobs dir, including global logs that
   project-sandboxed `ctx_execute_file` cannot reach.
