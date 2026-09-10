@@ -1869,10 +1869,7 @@ test("ensureGitExcluded: gitdir pointer with spaces in the path", async () => {
   mkdirSync(gd, { recursive: true });
   try {
     writeFileSync(join(wt, ".git"), `gitdir: ${gd}\n`);
-    assert.equal(
-      mod.ensureGitExcluded(join(wt, ".pi-bgrun", "jobs")),
-      true,
-    );
+    assert.equal(mod.ensureGitExcluded(join(wt, ".pi-bgrun", "jobs")), true);
     const exclude = readFileSync(join(gd, "info", "exclude"), "utf8");
     assert.match(exclude, /^\.pi-bgrun\/jobs\/$/m);
   } finally {
