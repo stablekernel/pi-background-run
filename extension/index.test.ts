@@ -2202,3 +2202,307 @@ test("shipped presets: ids are stable and every command ends in head (bounded ou
     );
   }
 });
+
+// ── wake wiring: digest appended to the wake message (Phase 3) ─────────────
+
+// Isolated env for wake-wiring tests: temp jobsDir + a project dir with a
+// `.pi/pi-bgrun.json` + a user config path that does not exist (so only the
+// project layer can contribute a digest).
+function setupDigestEnv(): { dir: string; proj: string; home: string } {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-bgrun-home-"));
+  process.env.PI_BGRUN_DIR = dir;
+  process.env.PI_BGRUN_USER_CONFIG = join(home, "user.json"); // does not exist
+  return { dir, proj, home };
+}
+
+function teardownDigestEnv(dir: string, proj: string, home: string): void {
+  delete process.env.PI_BGRUN_DIR;
+  delete process.env.PI_BGRUN_USER_CONFIG;
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(proj, { recursive: true, force: true });
+  rmSync(home, { recursive: true, force: true });
+}
+
+// The fake ctx from makeFakePi has no cwd/isProjectTrusted; point it at the
+// project so resolveConfig reads its config, with controllable trust.
+function trustCtx(ctx: any, proj: string, trusted: boolean): any {
+  ctx.cwd = proj;
+  ctx.isProjectTrusted = () => trusted;
+  return ctx;
+}
+
+function digestBlockOf(wake: string): string | null {
+  const m = wake.match(/digest \(project-config\): ([\s\S]*?)\nReview the result/);
+  return m ? m[1] : null;
+}
+
+test("wake digest: preset scorecard appears on a green log", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg1",
+      {
+        command:
+          "printf 'ok  \\texample.com/a\\t0.01s\\nok  \\texample.com/b\\t0.02s\\n'",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    const digest = digestBlockOf(wake);
+    assert.ok(digest, "wake carries a digest (project-config) block");
+    assert.match(digest!, /pass: 2  fail: 0/);
+    assert.match(wake, /✅/);
+    assert.match(wake, /exit 0/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: preset scorecard appears on a red log", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg2",
+      {
+        command:
+          // printf's format can't start with `--` (parsed as an option), so
+          // use %s args; the tab is a literal character in the shell arg.
+          "printf '%s\\n' '--- FAIL: TestBeta (0.00s)' 'FAIL\texample.com/b\t0.02s'; exit 1",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    const digest = digestBlockOf(wake);
+    assert.ok(digest, "wake carries a digest (project-config) block");
+    assert.match(digest!, /pass: 0  fail: 1/);
+    assert.match(digest!, /^TestBeta$/m);
+    assert.match(wake, /❌/);
+    assert.match(wake, /exit 1/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: custom command output appears (first lines)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: "sed -n '1,2p' \"$1\"" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg3",
+      { command: "printf 'alpha\\nbeta\\ngamma\\n'" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const digest = digestBlockOf(wakes[0].text);
+    assert.ok(digest, "wake carries a digest (project-config) block");
+    assert.equal(digest, "alpha\nbeta");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: output capped at ~500 chars, first lines win", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: 'cat "$1"' },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    // 100 lines ≈ 780 chars of log — well past the 500-char digest budget.
+    await bgrun.execute(
+      "call-dg4",
+      { command: "seq 1 100 | sed 's/^/line /'" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const digest = digestBlockOf(wakes[0].text);
+    assert.ok(digest, "wake carries a digest (project-config) block");
+    assert.ok(
+      digest!.length <= 500,
+      `digest capped at 500 chars, got ${digest!.length}`,
+    );
+    assert.match(digest!, /^line 1$/m, "first line survives the cap");
+    assert.ok(!digest!.includes("line 100"), "tail lines are cut");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: hanging command times out silently, wake still arrives (~5s bound)", { timeout: 20000 }, async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: "sleep 30" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    const t0 = Date.now();
+    await bgrun.execute(
+      "call-dg5",
+      { command: "echo quick" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1, 8000);
+    const elapsed = Date.now() - t0;
+    const wake = wakes[0].text;
+    assert.ok(!wake.includes("digest (project-config)"), "timed-out digest contributes nothing");
+    assert.match(wake, /✅/);
+    assert.match(wake, /exit 0/);
+    assert.ok(elapsed < 7000, `wake arrived in ${elapsed}ms, within the ~5s digest bound + overhead`);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: failing digest command → no digest block, wake otherwise unchanged", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: 'grep "NO-SUCH-STRING" "$1"' },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg6",
+      { command: "echo hello world" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    assert.ok(!wake.includes("digest (project-config)"), "failing digest contributes nothing");
+    assert.match(wake, /✅/);
+    assert.match(wake, /exit 0/);
+    assert.match(wake, /Last output: hello world/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: no digest configured → wake shape unchanged (regression guard)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    // No digest section written for proj at all.
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg7",
+      { command: "echo hello world" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    const id = wake.match(/`([^`]+)`/)![1];
+    const lines = wake.split("\n");
+    // Pre-digest shape: exit line, Command, Stats (Phase 1), Last output,
+    // Review instruction — exactly five lines, nothing appended.
+    assert.equal(lines.length, 5);
+    assert.equal(lines[0], `✅ Background job \`${id}\` finished (exit 0).`);
+    assert.equal(lines[1], "Command: echo hello world");
+    assert.match(lines[2], /^Stats: /);
+    assert.equal(lines[3], "Last output: hello world");
+    assert.equal(
+      lines[4],
+      "Review the result now: call `bgtail` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.",
+    );
+    assert.ok(!wake.includes("digest (project-config)"));
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: untrusted project → digest absent even when configured", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    // Explicitly untrusted...
+    {
+      const { pi, wakes, tools, ctx } = makeFakePi();
+      trustCtx(ctx, proj, false);
+      await loadExtension(pi);
+      const bgrun = tools.get("bgrun")!;
+      await bgrun.execute(
+        "call-dg8",
+        { command: "echo hello world" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      await waitForWakes(wakes, 1);
+      assert.ok(!wakes[0].text.includes("digest (project-config)"), "untrusted → no digest");
+    }
+    // ...and a ctx with no isProjectTrusted at all.
+    {
+      const { pi, wakes, tools, ctx } = makeFakePi();
+      ctx.cwd = proj; // no isProjectTrusted — defaults to untrusted
+      await loadExtension(pi);
+      const bgrun = tools.get("bgrun")!;
+      await bgrun.execute(
+        "call-dg9",
+        { command: "echo hello world" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      await waitForWakes(wakes, 1);
+      assert.ok(!wakes[0].text.includes("digest (project-config)"), "no trust check → no digest");
+    }
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});

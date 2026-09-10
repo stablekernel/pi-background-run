@@ -47,7 +47,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { DIGEST_PRESET_IDS } from "./digestPresets.ts";
+import { DIGEST_PRESET_IDS, resolveDigest } from "./digestPresets.ts";
 
 // Exit marker appended to every log so the file is self-describing: the exit
 // code survives pi restarting. `;` (not `&&`) ensures the printf runs even when
@@ -913,7 +913,7 @@ export default function (pi: ExtensionAPI) {
       updateWidget(ctx);
 
       // ── exit handler: record exit, persist done entry, wake, notify, widget ─
-      child.on("exit", (code, signal) => {
+      child.on("exit", async (code, signal) => {
         const rec = jobs.get(id);
         if (!rec) return;
         rec.exitedAt = Date.now();
@@ -947,12 +947,39 @@ export default function (pi: ExtensionAPI) {
           exitedAt: rec.exitedAt,
         });
 
+        // Opt-in project-config digest (best-effort, silent-fail). rec.ctx is
+        // the ExtensionContext captured at tool-call time and retains
+        // everything resolveConfig needs (cwd + isProjectTrusted), so the
+        // digest config is resolved here at exit — config edits made while the
+        // job ran are picked up, and trust is evaluated against the same
+        // session that spawned the job. No spawn-time capture needed. When a
+        // digest is configured, the wake is sent only after this bounded
+        // attempt (≤ ~5s) completes; a digest that fails, times out, or prints
+        // nothing appends nothing, and the exit code / universal part above are
+        // never affected.
+        let digestBlock: string | undefined;
+        try {
+          const digest = resolveDigest(resolveConfig(rec.ctx).digest);
+          if (digest) {
+            const raw = await runDigestCommand(digest.command, logPath);
+            digestBlock = raw !== undefined ? capDigestOutput(raw) : undefined;
+          }
+        } catch (e) {
+          // Silent-fail: a broken digest never breaks a wake (ground rule 3).
+          console.error(
+            `[pi-bgrun] digest failed for job ${id}:`,
+            (e as Error).message,
+          );
+        }
+
         // Wake the agent.
         const namePrefix = rec.name ? `"${rec.name}" ` : "";
         let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
         wake += `Command: ${command}\n`;
         wake += `Stats: ${statsParts.join(", ")}\n`;
         if (lastLine) wake += `Last output: ${lastLine}\n`;
+        if (digestBlock)
+          wake += `digest (project-config): ${digestBlock}\n`;
         wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
         try {
           if (rec.ctx.isIdle()) {
@@ -1011,6 +1038,92 @@ export default function (pi: ExtensionAPI) {
     /[\u001B\u009B][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><]/g;
   const LINE_CAP = 2000; // chars per line after stripping
   const TOTAL_CAP = 8000; // chars for the whole bgtail result
+
+  // ── Digest: opt-in project-config scorecard appended to the wake ──────────
+  // Runs only when a trusted project (or the user file) configures a `digest`
+  // section. Best-effort, silent-fail: errors, timeouts, and empty output all
+  // contribute nothing, and the digest never affects the exit code, ordering,
+  // or the wake's universal part (ground rules 2-3).
+  const DIGEST_TIMEOUT_MS = 5000; // hard bound on added wake latency
+  const DIGEST_KILL_GRACE_MS = 250; // SIGTERM → SIGKILL grace
+  const DIGEST_TOTAL_CAP = 500; // chars appended to the wake, first lines win
+  const DIGEST_LINE_CAP = 200; // per-line cap, consistent with the condenser
+
+  // Run a digest command (log path arrives as $1) and collect stdout.
+  // Resolves undefined on spawn error, non-timeout failure semantics are the
+  // caller's concern (empty output is dropped when capping). A timed-out
+  // command contributes NOTHING — after SIGKILL we resolve immediately with
+  // undefined so the wake is never delayed past DIGEST_TIMEOUT_MS + grace.
+  function runDigestCommand(
+    cmd: string,
+    logPath: string,
+  ): Promise<string | undefined> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let timedOut = false;
+      const finish = (out: string | undefined) => {
+        if (settled) return;
+        settled = true;
+        resolve(out);
+      };
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn("sh", ["-c", cmd, "--", logPath], {
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+      } catch {
+        finish(undefined);
+        return;
+      }
+      let stdout = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      // Hard timeout: SIGTERM first, SIGKILL after a short grace.
+      const killTimer = setTimeout(() => {
+        timedOut = true;
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // already gone
+        }
+        setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // already gone
+          }
+          finish(undefined);
+        }, DIGEST_KILL_GRACE_MS);
+      }, DIGEST_TIMEOUT_MS);
+      child.on("error", () => {
+        clearTimeout(killTimer);
+        finish(undefined);
+      });
+      child.on("exit", () => {
+        clearTimeout(killTimer);
+        finish(timedOut ? undefined : stdout);
+      });
+    });
+  }
+
+  // Cap digest output for the wake: first lines win. ANSI stripped (reusing
+  // the condenser's regex), per-line cap for consistency, blank lines
+  // dropped, ~500 chars total. Nothing usable → undefined (nothing appended).
+  function capDigestOutput(raw: string): string | undefined {
+    const lines = raw
+      .replace(ANSI_RE, "")
+      .split("\n")
+      .map((l) => (l.length > DIGEST_LINE_CAP ? l.slice(0, DIGEST_LINE_CAP) : l))
+      .filter((l) => l.trim().length > 0);
+    if (lines.length === 0) return undefined;
+    const joined = lines.join("\n");
+    const capped =
+      joined.length > DIGEST_TOTAL_CAP
+        ? joined.slice(0, DIGEST_TOTAL_CAP)
+        : joined;
+    return capped.trim() || undefined;
+  }
 
   function condenseLogLines(
     lines: string[],
