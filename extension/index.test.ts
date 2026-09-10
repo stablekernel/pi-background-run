@@ -2009,9 +2009,8 @@ test("bggrep: line-numbered matches; explicit pattern wins; default pattern; no-
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     assert.ok(id, "got a job id");
     await waitForWakes(wakes, 1);
 
@@ -2032,7 +2031,10 @@ test("bggrep: line-numbered matches; explicit pattern wins; default pattern; no-
     const g2 = await bggrep.execute("c3", { id }, undefined, undefined, ctx);
     assert.equal(g2.details.matches, 1);
     assert.match(g2.content[0].text as string, /1 match for \//);
-    assert.equal(g2.details.pattern, "--- FAIL:|^FAIL\\b|^panic:|fatal error:|AssertionError|Error:|error:|make: \\*\\*\\*.*Error|✗|✖");
+    assert.equal(
+      g2.details.pattern,
+      "--- FAIL:|^FAIL\\b|^panic:|fatal error:|AssertionError|Error:|error:|make: \\*\\*\\*.*Error|✗|✖",
+    );
 
     // a log with no failure signatures → clean no-match (not an error)
     const res2 = await bgrun.execute(
@@ -2042,11 +2044,16 @@ test("bggrep: line-numbered matches; explicit pattern wins; default pattern; no-
       undefined,
       ctx,
     );
-    const id2 = ((res2.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id2 = ((res2.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     await waitForWakes(wakes, 2);
-    const g3 = await bggrep.execute("c5", { id: id2 }, undefined, undefined, ctx);
+    const g3 = await bggrep.execute(
+      "c5",
+      { id: id2 },
+      undefined,
+      undefined,
+      ctx,
+    );
     assert.equal(g3.details.matches, 0);
     assert.equal(g3.isError, undefined);
     assert.match(g3.content[0].text as string, /— none/);
@@ -2067,14 +2074,16 @@ test("bggrep: context lines with gap markers between distant matches", async () 
 
     const res = await bgrun.execute(
       "c1",
-      { command: "printf 'l1\\nMATCH one\\nl3\\nl4\\nl5\\nl6\\nl7\\nMATCH two\\nl9\\n'" },
+      {
+        command:
+          "printf 'l1\\nMATCH one\\nl3\\nl4\\nl5\\nl6\\nl7\\nMATCH two\\nl9\\n'",
+      },
       undefined,
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     assert.ok(id, "got a job id");
     await waitForWakes(wakes, 1);
 
@@ -2113,12 +2122,17 @@ test("bggrep: invalid pattern errors clearly", async () => {
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     await waitForWakes(wakes, 1);
     await assert.rejects(
-      bggrep.execute("c2", { id, pattern: "([unclosed" }, undefined, undefined, ctx),
+      bggrep.execute(
+        "c2",
+        { id, pattern: "([unclosed" },
+        undefined,
+        undefined,
+        ctx,
+      ),
       /bggrep: invalid pattern/,
     );
   } finally {
@@ -2142,9 +2156,8 @@ test("bggrep: caps at 50 matches with a not-shown note", async () => {
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     await waitForWakes(wakes, 1);
     const g = await bggrep.execute(
       "c2",
@@ -2155,7 +2168,10 @@ test("bggrep: caps at 50 matches with a not-shown note", async () => {
     );
     assert.equal(g.details.matches, 60);
     assert.equal(g.details.capped, true);
-    assert.match(g.content[0].text as string, /showing first 50; 10 more not shown/);
+    assert.match(
+      g.content[0].text as string,
+      /showing first 50; 10 more not shown/,
+    );
     assert.match(g.content[0].text as string, /L50: boom 50/);
     assert.doesNotMatch(g.content[0].text as string, /L51: boom 51/);
   } finally {
@@ -2187,9 +2203,8 @@ test("bggrep: prefers the session record's logPath when the jobsDir config chang
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     await waitForWakes(wakes, 1);
 
     const plainCtx = { ...ctx, cwd: undefined, isProjectTrusted: undefined };
@@ -2225,9 +2240,8 @@ test("bgtail: delta tailing — first read full tail, then only new lines, then 
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     assert.ok(id, "got a job id");
     await waitForWakes(wakes, 1);
     const logPath = join(dir, `${id}.log`);
@@ -2236,7 +2250,10 @@ test("bgtail: delta tailing — first read full tail, then only new lines, then 
     const t1 = await bgtail.execute("c2", { id }, undefined, undefined, ctx);
     assert.match(t1.content[0].text as string, /first line/);
     assert.equal(t1.details.newLines, undefined);
-    assert.doesNotMatch(t1.content[0].text as string, /new lines since last read/);
+    assert.doesNotMatch(
+      t1.content[0].text as string,
+      /new lines since last read/,
+    );
 
     // Log grows: only the new lines come back, with a +N header
     appendFileSync(logPath, "appended-A\nappended-B\n");
@@ -2273,9 +2290,8 @@ test("bgtail: raw:true keeps the verbatim window but still advances the bookmark
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     await waitForWakes(wakes, 1);
     const logPath = join(dir, `${id}.log`);
 
@@ -2314,9 +2330,8 @@ test("bgtail: a shrunken log resets to a full tail with a note", async () => {
       undefined,
       ctx,
     );
-    const id = ((res.content[0].text as string).match(
-      /^started: ([^\n]+)/,
-    ) || [])[1];
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
     await waitForWakes(wakes, 1);
     const logPath = join(dir, `${id}.log`);
 

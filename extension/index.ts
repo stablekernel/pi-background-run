@@ -1152,9 +1152,9 @@ export default function (pi: ExtensionAPI) {
       const { text, truncated } = condenseLogLines(shown, { raw });
       const body =
         shown.length === 0
-          ? newLines !== undefined
-            ? "(no new content lines since last read — only blanks or the exit marker)"
-            : "(empty log)"
+          ? newLines === undefined
+            ? "(empty log)"
+            : "(no new content lines since last read — only blanks or the exit marker)"
           : text;
       const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
       const head = header ? `${header}\n` : "";
@@ -1166,7 +1166,7 @@ export default function (pi: ExtensionAPI) {
           logPath,
           notFound: false,
           condensed: !raw,
-          ...(newLines !== undefined ? { newLines, totalLines: total } : {}),
+          ...(newLines === undefined ? {} : { newLines, totalLines: total }),
           ...(truncated.length > 0 ? { condenserNotes: truncated } : {}),
         },
       };
@@ -1336,7 +1336,8 @@ export default function (pi: ExtensionAPI) {
       ),
       context: Type.Optional(
         Type.Number({
-          description: "Context lines around each match (default 0, grep -C style)",
+          description:
+            "Context lines around each match (default 0, grep -C style)",
         }),
       ),
     }),
