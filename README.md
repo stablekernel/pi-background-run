@@ -128,6 +128,57 @@ Environment variables (same knobs, handy for one-off overrides):
 | `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |
 | `PI_BGRUN_GLOBAL_AUTO_CLEAN` | `true` | Set `0`/`false` to disable the automatic global orphan sweep (see below). |
 
+### Digest scorecard (opt-in)
+
+Wake messages always lead with universal facts — exit code, duration, log line
+count. A project can additionally opt into a **digest scorecard**: a one-line
+pass/fail summary extracted from the log and appended to the wake.
+
+Opt in per project via `<project>/.pi/pi-bgrun.json` (read only for trusted
+projects):
+
+```json
+{ "digest": { "preset": "go-test" } }
+```
+
+or with a custom shell command:
+
+```json
+{ "digest": { "command": "grep -E 'FAIL|ok  ' \"$1\" | head -5" } }
+```
+
+The command receives the job's log path as `$1`; its stdout is appended to the
+wake. If both `preset` and `command` are set, the preset wins.
+
+Shipped presets:
+
+| Preset | What it summarizes |
+| --- | --- |
+| `go-test` | Go test output: package ok/FAIL counts + failing test names |
+| `jest` | Jest output: Tests/Test Suites summary + failed test names |
+| `pytest` | pytest output: final passed/failed/error summary line + FAILED test ids |
+| `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names |
+
+Guarantees:
+
+- **Exit code always leads.** The digest is appended after the universal
+  stats, labeled `digest (project-config):`. It never overrides or reorders
+  the exit code, duration, or line count.
+- **Capped and timed.** Digest output is capped at ~500 chars; the digest
+  command gets a 5s hard timeout.
+- **Silent-fail.** A digest command that errors, times out, or prints nothing
+  simply contributes nothing — it never breaks a wake.
+- **No config, no behavior.** Absent or invalid config contributes nothing;
+  without a `digest` section the wake is unchanged.
+
+Shell safety: the command comes from trust-gated config and runs with your
+own privileges — the same trust boundary as the `jobsDir` setting.
+
+A user-level default digest works too: set `digest` in
+`~/.pi/agent/pi-bgrun.json` (path overridable via `PI_BGRUN_USER_CONFIG`), and
+any project without its own digest inherits it. The project `digest` section
+overrides the user-level one **wholesale** (no per-key merge).
+
 ### Log cleanup
 
 Cleanup follows the same principle as everything else: **one session should

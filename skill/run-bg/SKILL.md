@@ -51,6 +51,11 @@ no polling.
 
 ### Reading results without flooding context
 
+If the wake message carries a `digest (project-config):` block, read that
+first — it is a short pass/fail scorecard configured for this project and
+usually answers "what failed" without any follow-up read. `bgtail` stays the
+positional-peek tool for everything else.
+
 - **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker.
 - **Whole-log failure analysis:** `ctx_execute_file` on the log path:
 
