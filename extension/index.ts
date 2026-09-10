@@ -1321,6 +1321,7 @@ export default function (pi: ExtensionAPI) {
       "Search a background job's log with a regex; returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Runs inside the extension, so it works on any jobs dir — including global logs that project-sandboxed tools (ctx_execute_file) cannot reach. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
     promptSnippet: "Search a bgrun job's log for a pattern",
     promptGuidelines: [
+      "Never search a bgrun log with the bash tool — uncapped output can flood context, and it needs manual log-path reconstruction and regex shell-quoting; bggrep is bounded by design.",
       "Prefer bggrep over bash grep or reading a bgrun log — matches are line-numbered, capped, and condensed.",
       "Pass an explicit pattern when you know the tool's output format; the default only catches common failure signatures.",
     ],

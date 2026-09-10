@@ -69,8 +69,22 @@ no polling.
 
   A 10 000-line `make test` log collapses to a ~30-line summary in context.
 
-**Never `cat`, `Read`, or `bash cat` a full bgrun log.** Always `bgtail` or
-`ctx_execute_file`.
+**Why `bggrep` instead of `bash grep` on the log?**
+
+- `bash grep` output is uncapped — a retry-storm log can dump thousands of
+  matching lines (megabytes) straight into context, and staying safe depends
+  on remembering `| head` on every single call. `bggrep` is bounded by design
+  (~50 matches, ~8KB).
+- It takes the job id — no log-path reconstruction, no shell-quoting of the
+  regex — and works on any jobs dir, including global logs that
+  project-sandboxed `ctx_execute_file` cannot reach.
+- Output is self-describing: match count, line numbers, `…[N skipped]…` gap
+  markers, `— none` for no-match.
+
+Plain `grep` via bash is fine only for a one-off search you know is tiny.
+
+**Never `cat`, `Read`, `bash cat`, or `bash grep` a full bgrun log.** Always
+`bgtail`, `bggrep`, or `ctx_execute_file`.
 
 ## After a pi restart or session switch
 

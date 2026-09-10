@@ -98,6 +98,15 @@ only bounded digests ever enter the conversation:
   when logs are project-local) to extract only failure lines. Never `cat` or
   `Read` a full bgrun log.
 
+**Why `bggrep` instead of `bash grep` on the log?** A bash grep's output is
+uncapped — a retry-storm log can dump thousands of matching lines straight
+into context, and safety depends on remembering `| head` on every call.
+`bggrep` is bounded by design (~50 matches, ~8KB), takes the job id instead of
+a reconstructed log path (no shell-quoting of the regex), runs on any jobs
+dir — including global logs that project-sandboxed tools like
+`ctx_execute_file` cannot reach — and reports match counts, line numbers, and
+skip markers. Plain `grep` is fine only for a one-off search you know is tiny.
+
 ## Configuration
 
 The jobs dir (default `~/.pi-bgrun/jobs`, overridable via `jobsDir` / `PI_BGRUN_DIR`)
