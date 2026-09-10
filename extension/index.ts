@@ -58,6 +58,13 @@ const DEFAULT_CLEANUP_DAYS = 7;
 const STALE_POLL_MS = 30_000; // re-check interval for jobs with no live child handle
 const GLOBAL_JOBS_DIR = join(homedir(), ".pi-bgrun", "jobs");
 
+// Default regex for bggrep when the caller passes no pattern: common failure
+// signatures across test runners and build tools. ONLY a convenience default —
+// bggrep's contract is that the caller's own pattern always wins, because a
+// generic default on arbitrary tools/languages misses more than it catches.
+export const DEFAULT_GREP_PATTERN =
+  "--- FAIL:|^FAIL\\b|^panic:|fatal error:|AssertionError|Error:|error:|make: \\*\\*\\*.*Error|✗|✖";
+
 // ── Configuration ───────────────────────────────────────────────────────────
 //
 // Layered: defaults ← user config file ← project config file (trusted projects
@@ -202,7 +209,12 @@ function appendExcludePattern(
     if (!m) return false; // unparseable .git file — retry later
     gitDir = m[1].trim();
   }
-  const pattern = relative(repoRoot, jobsDir).split(sep).join("/") + "/";
+  const rel = relative(repoRoot, jobsDir);
+  // Defense-in-depth: the walk-up guarantees jobsDir sits under repoRoot, but
+  // a future caller or symlinked path could break that — ../-prefixed
+  // patterns are silently useless in gitignore semantics, so skip them.
+  if (rel.startsWith("..") || isAbsolute(rel)) return true;
+  const pattern = rel.split(sep).join("/") + "/";
   const excludePath = join(gitDir, "info", "exclude");
   let existing = "";
   try {
@@ -818,7 +830,7 @@ export default function (pi: ExtensionAPI) {
       "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
       "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
       "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
-      "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use ctx_execute_file on the log path only when the condensed tail is insufficient.",
+      "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search or ctx_execute_file on the log path for whole-log analysis.",
     ],
     parameters: Type.Object({
       command: Type.String({
@@ -1059,7 +1071,22 @@ export default function (pi: ExtensionAPI) {
     return { text: out.join("\n"), truncated: notes };
   }
 
-  // ── bgtail: read last N lines of a job's log, condensed for context ────────
+  // ── bgtail: read the newest lines of a job's log, condensed for context ────
+  //
+  // Delta tailing: each read bookmarks the total raw line count at read time
+  // (the high-water mark of what the caller has had the opportunity to see).
+  // The FIRST read for a job returns the full last-N tail; repeat reads return
+  // only lines appended since, so polling a running job never re-pays context
+  // for lines already seen. Deliberately-skipped prefix lines are never
+  // replayed as "new". raw: true keeps the verbatim last-N window (no delta
+  // header) but still advances the bookmark. A shrunken log (rotated/replaced)
+  // resets to a full tail. Bookmarks are in-memory only — a session restart
+  // starts fresh with a full tail.
+
+  const tailBookmarks = new Map<
+    string,
+    { lines: number; bytes: number; first: string }
+  >();
 
   // Shared by the bgtail tool (agent-facing) and the /bgtail slash command
   // (human-facing).
@@ -1071,7 +1098,10 @@ export default function (pi: ExtensionAPI) {
     details: Record<string, unknown>;
     isError?: boolean;
   }> {
-    const { id, lines = 40, raw = false } = params;
+    const { id, lines: linesParam = 40, raw = false } = params;
+    // Clamp defensively — direct callers (e.g. the slash command) bypass the
+    // tool schema, and lines < 1 would corrupt slicing (slice(-0) = whole log).
+    const lines = Math.max(1, Math.floor(linesParam));
     if (!id) throw new Error("bgtail: id is required");
     // Prefer this session's record: its logPath stays correct even if the
     // config (and thus the resolved jobs dir) changes mid-session — e.g. a
@@ -1080,20 +1110,89 @@ export default function (pi: ExtensionAPI) {
       jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
     try {
       const content = readFileSync(logPath, "utf8");
-      const all = content
-        .split("\n")
+      // Content lines only: the exit marker and blanks are filtered BEFORE the
+      // window is sliced, so "last N lines" means the last N content lines
+      // (matching pre-delta behavior) and bookmarks count content lines.
+      // /\r?\n/ keeps CRLF logs from leaving a stray \r on every line.
+      const rawLines = content
+        .split(/\r?\n/)
         .filter((l) => !l.startsWith(EXIT_MARKER) && l.trim().length > 0);
-      const tail = all.slice(-lines);
-      const { text, truncated } = condenseLogLines(tail, { raw });
+      const total = rawLines.length;
+      const first = rawLines[0]?.slice(0, 200) ?? "";
+      const prev = tailBookmarks.get(id);
+      // Append-only logs never mutate earlier lines, so a changed first
+      // content line means the log was replaced or rotated — reset to a full
+      // tail. Catches same-size replacements the shrink checks cannot see.
+      // (A previously-empty log growing content is growth, not replacement.)
+      const replaced =
+        prev !== undefined && prev.lines > 0 && prev.first !== first;
+      const shrank =
+        prev !== undefined &&
+        (prev.lines > total || prev.bytes > content.length);
+      let window: string[];
+      let header: string | undefined;
+      let newLines: number | undefined;
+      if (raw || prev === undefined || shrank || replaced) {
+        // Full tail: first read, raw mode, or a shrunken/replaced log (reset).
+        window = rawLines.slice(-lines);
+        if (!raw && (shrank || replaced)) {
+          header = shrank
+            ? "log shrank since last read — showing full tail"
+            : "log was replaced since last read — showing full tail";
+        }
+      } else {
+        const fresh = rawLines.slice(prev.lines);
+        newLines = fresh.length;
+        if (fresh.length === 0) {
+          tailBookmarks.set(id, {
+            lines: total,
+            bytes: content.length,
+            first,
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `(no new lines since last read — log at ${total} line${total === 1 ? "" : "s"})`,
+              },
+            ],
+            details: {
+              id,
+              linesShown: 0,
+              logPath,
+              notFound: false,
+              condensed: true,
+              newLines: 0,
+              totalLines: total,
+            },
+          };
+        }
+        window = fresh.length > lines ? fresh.slice(-lines) : fresh;
+        header =
+          `+${fresh.length} new line${fresh.length === 1 ? "" : "s"} since last read — ` +
+          `log at ${total} lines${fresh.length > lines ? ` (showing last ${lines})` : ""}`;
+      }
+      tailBookmarks.set(id, {
+        lines: total,
+        bytes: content.length,
+        first,
+      });
+      const shown = window;
+      const { text, truncated } = condenseLogLines(shown, { raw });
+      // Delta reads early-return above, so an empty window here can only be
+      // a first read of an empty log (full-tail path).
+      const body = shown.length === 0 ? "(empty log)" : text;
       const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
+      const head = header ? `${header}\n` : "";
       return {
-        content: [{ type: "text", text: text + notes || "(empty log)" }],
+        content: [{ type: "text", text: head + body + notes }],
         details: {
           id,
-          linesShown: tail.length,
+          linesShown: shown.length,
           logPath,
           notFound: false,
           condensed: !raw,
+          ...(newLines === undefined ? {} : { newLines, totalLines: total }),
           ...(truncated.length > 0 ? { condenserNotes: truncated } : {}),
         },
       };
@@ -1112,14 +1211,17 @@ export default function (pi: ExtensionAPI) {
     name: "bgtail",
     label: "Tail Background Log",
     description:
-      "Print the last N lines of a background job's log (default 40), condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. Pass raw: true for unprocessed output; use ctx_execute_file on the log path for whole-log failure analysis.",
+      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. A shrunken or replaced log resets to a full tail. For pattern search use bggrep; for whole-log analysis, ctx_execute_file on the log path.",
     promptSnippet: "Read the last N lines of a bgrun job's log",
     parameters: Type.Object({
       id: Type.String({
         description: "Job id (from bgrun's 'started: <id>' response)",
       }),
       lines: Type.Optional(
-        Type.Number({ description: "Number of lines to show (default 40)" }),
+        Type.Number({
+          description: "Number of lines to show (default 40)",
+          minimum: 1,
+        }),
       ),
       raw: Type.Optional(
         Type.Boolean({
@@ -1130,6 +1232,152 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       return bgtailCore(params, ctx);
+    },
+  });
+
+  // ── bggrep: pattern search over a job's log, capped for context ───────────
+  //
+  // The sandboxed whole-log path (ctx_execute_file) is confined to the
+  // project root, which a global jobs dir sits outside of — bggrep runs
+  // inside the extension with native fs access, so it works on any
+  // configured jobs dir. Matches are line-numbered (grep -n style),
+  // optionally with context lines, capped at MAX_GREP_MATCHES, and run
+  // through the same condenser as bgtail so a search can never flood context.
+
+  const MAX_GREP_MATCHES = 50;
+
+  async function bggrepCore(
+    params: { id: string; pattern?: string; context?: number },
+    ctx?: ExtensionContext,
+  ): Promise<{
+    content: { type: "text"; text: string }[];
+    details: Record<string, unknown>;
+    isError?: boolean;
+  }> {
+    const { id, pattern, context: contextParam = 0 } = params;
+    // Clamp defensively — negative context would exclude the match lines
+    // themselves from the context windows (lo > hi no-ops the inner loop).
+    const context = Math.max(0, Math.floor(contextParam));
+    if (!id) throw new Error("bggrep: id is required");
+    // Record-first, same as bgtail — correct across config changes.
+    const logPath =
+      jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
+    const source = pattern ?? DEFAULT_GREP_PATTERN;
+    let re: RegExp;
+    try {
+      re = new RegExp(source);
+    } catch (err) {
+      throw new Error(
+        `bggrep: invalid pattern ${JSON.stringify(source)}: ${(err as Error).message}`,
+      );
+    }
+    let rawLines: string[];
+    try {
+      const content = readFileSync(logPath, "utf8");
+      // /\r?\n/ normalizes CRLF (a trailing \r would break $-anchored patterns
+      // and leak into output); blank lines are KEPT so L<n> numbers match the
+      // file. A trailing empty split element is dropped; "" yields zero lines.
+      const split = content === "" ? [] : content.split(/\r?\n/);
+      if (split.length > 0 && split[split.length - 1] === "") split.pop();
+      rawLines = split.filter((l) => !l.startsWith(EXIT_MARKER));
+    } catch {
+      return {
+        content: [
+          { type: "text", text: `No log found for job ${id} at ${logPath}` },
+        ],
+        details: { id, matches: 0, logPath, notFound: true },
+        isError: true,
+      };
+    }
+    const matchIdx: number[] = [];
+    for (let i = 0; i < rawLines.length; i++) {
+      if (re.test(rawLines[i])) matchIdx.push(i);
+    }
+    const header =
+      `${matchIdx.length} match${matchIdx.length === 1 ? "" : "es"} for /${source}/ ` +
+      `in ${rawLines.length} line${rawLines.length === 1 ? "" : "s"}`;
+    if (matchIdx.length === 0) {
+      return {
+        content: [{ type: "text", text: `${header} — none` }],
+        details: {
+          id,
+          matches: 0,
+          linesSearched: rawLines.length,
+          logPath,
+          notFound: false,
+        },
+      };
+    }
+    const capped = matchIdx.length > MAX_GREP_MATCHES;
+    const shownIdx = capped ? matchIdx.slice(0, MAX_GREP_MATCHES) : matchIdx;
+    // Context windows, merged where they overlap or touch (grep -C style).
+    const include = new Set<number>();
+    for (const i of shownIdx) {
+      const lo = Math.max(0, i - context);
+      const hi = Math.min(rawLines.length - 1, i + context);
+      for (let j = lo; j <= hi; j++) include.add(j);
+    }
+    const sorted = [...include].sort((a, b) => a - b);
+    const out: string[] = [];
+    let prev = -2;
+    for (const i of sorted) {
+      if (prev >= 0 && i > prev + 1) {
+        const gap = i - prev - 1;
+        out.push(`…[${gap} line${gap === 1 ? "" : "s"} skipped]…`);
+      }
+      out.push(`L${i + 1}: ${rawLines[i]}`);
+      prev = i;
+    }
+    const { text, truncated } = condenseLogLines(out);
+    const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
+    const capNote = capped
+      ? ` — showing first ${MAX_GREP_MATCHES}; ${matchIdx.length - MAX_GREP_MATCHES} more not shown`
+      : "";
+    return {
+      content: [{ type: "text", text: `${header}${capNote}\n${text}${notes}` }],
+      details: {
+        id,
+        matches: matchIdx.length,
+        linesSearched: rawLines.length,
+        logPath,
+        notFound: false,
+        pattern: source,
+        capped,
+      },
+    };
+  }
+
+  pi.registerTool({
+    name: "bggrep",
+    label: "Grep Background Log",
+    description:
+      "Search a background job's log with a regex; returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Runs inside the extension, so it works on any jobs dir — including global logs that project-sandboxed tools (ctx_execute_file) cannot reach. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+    promptSnippet: "Search a bgrun job's log for a pattern",
+    promptGuidelines: [
+      "Never search a bgrun log with the bash tool — uncapped output can flood context, and it needs manual log-path reconstruction and regex shell-quoting; bggrep is bounded by design.",
+      "Prefer bggrep over bash grep or reading a bgrun log — matches are line-numbered, capped, and condensed.",
+      "Pass an explicit pattern when you know the tool's output format; the default only catches common failure signatures.",
+    ],
+    parameters: Type.Object({
+      id: Type.String({
+        description: "Job id (from bgrun's 'started: <id>' response)",
+      }),
+      pattern: Type.Optional(
+        Type.String({
+          description:
+            "Regex to search for. Default: generic failure signatures — override when you know the format.",
+        }),
+      ),
+      context: Type.Optional(
+        Type.Number({
+          description:
+            "Context lines around each match (default 0, grep -C style)",
+          minimum: 0,
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return bggrepCore(params, ctx);
     },
   });
 

@@ -30,7 +30,8 @@ no polling.
 |---|---|
 | Start  | `bgrun(command: "make test-short", name: "unit-tests")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the status widget, and wake messages) |
 | Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
-| Tail   | `bgtail(<job-id>, 40)` |
+| Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing) |
+| Grep   | `bggrep(<job-id>, "pattern", context?)` — line-numbered matches, capped and condensed; default pattern = generic failure signatures (override when you know the format) |
 | Clean  | `bgclean()` for this session's old logs; `bgclean all` to sweep every session's (default 7-day retention) |
 
 ## Workflow
@@ -51,7 +52,8 @@ no polling.
 
 ### Reading results without flooding context
 
-- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker.
+- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing) — polling a running job is nearly free.
+- **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Works on global jobs dirs that `ctx_execute_file` cannot reach (it runs inside the extension). Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
 - **Whole-log failure analysis:** `ctx_execute_file` on the log path:
 
   ```javascript
@@ -67,8 +69,22 @@ no polling.
 
   A 10 000-line `make test` log collapses to a ~30-line summary in context.
 
-**Never `cat`, `Read`, or `bash cat` a full bgrun log.** Always `bgtail` or
-`ctx_execute_file`.
+**Why `bggrep` instead of `bash grep` on the log?**
+
+- `bash grep` output is uncapped — a retry-storm log can dump thousands of
+  matching lines (megabytes) straight into context, and staying safe depends
+  on remembering `| head` on every single call. `bggrep` is bounded by design
+  (~50 matches, ~2KB/line, ~8KB).
+- It takes the job id — no log-path reconstruction, no shell-quoting of the
+  regex — and works on any jobs dir, including global logs that
+  project-sandboxed `ctx_execute_file` cannot reach.
+- Output is self-describing: match count, line numbers, `…[N skipped]…` gap
+  markers, `— none` for no-match.
+
+Plain `grep` via bash is fine only for a one-off search you know is tiny.
+
+**Never `cat`, `Read`, `bash cat`, or `bash grep` a full bgrun log.** Always
+`bgtail`, `bggrep`, or `ctx_execute_file`.
 
 ## After a pi restart or session switch
 
