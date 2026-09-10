@@ -54,7 +54,7 @@ no polling.
 - **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker.
 - **Whole-log failure analysis:** `ctx_execute_file` on the log path:
 
-  ```
+  ```javascript
   ctx_execute_file(
     path: "~/.pi-bgrun/jobs/<JOB>.log",
     language: "javascript",
@@ -85,7 +85,10 @@ no polling.
 
 - Call the tools; never hand-roll `nohup … &` inline.
 - One job = one id. Multiple concurrent jobs are fine — each has its own log.
-- Logs live in `~/.pi-bgrun/jobs` (override with `PI_BGRUN_DIR`).
+- Logs live in `~/.pi-bgrun/jobs` (override with `PI_BGRUN_DIR`). A **relative**
+  `jobsDir` in the project config (e.g. `.pi-bgrun/jobs`) puts logs inside the
+  project — auto-ignored via `.git/info/exclude` — which keeps them reachable
+  for project-sandboxed analysis tools like `ctx_execute_file`.
 - Cleanup: `bgclean` removes only THIS session's old logs; `bgclean all`
   sweeps every session's. Auto-sweeps at session start/shutdown are
   session-scoped plus a global orphan pass (default on — removes finished
