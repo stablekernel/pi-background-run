@@ -37,6 +37,7 @@ import {
   openSync,
   closeSync,
   readFileSync,
+  readSync,
   mkdirSync,
   readdirSync,
   renameSync,
@@ -198,6 +199,17 @@ export function formatSince(started: number, now: number = Date.now()): string {
   return `${ymd} ${time}`;
 }
 
+// Universal-stats duration formatting for the wake message's Stats line: one
+// decimal in seconds under a minute ("42.3s"), m:ss above ("5:07").
+// Exported for tests, like formatSince.
+export function formatDuration(ms: number): string {
+  const s = Math.max(0, ms) / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60) + (Math.round(s % 60) === 60 ? 1 : 0);
+  const rem = Math.round(s % 60) % 60;
+  return `${m}:${String(rem).padStart(2, "0")}`;
+}
+
 interface JobRecord {
   id: string;
   pid: number;
@@ -284,6 +296,38 @@ export default function (pi: ExtensionAPI) {
       return last.length > maxLen ? last.slice(0, maxLen) + "…" : last;
     } catch {
       return null;
+    }
+  }
+
+  // Count the log's total lines with a bounded-memory streaming scan (one
+  // fixed-size buffer, no full-file read). Missing/unreadable file → null:
+  // the Stats line then just omits the line count — best-effort, never
+  // breaks a wake.
+  function countLogLines(logPath: string): number | null {
+    let fd: number;
+    try {
+      fd = openSync(logPath, "r");
+    } catch {
+      return null;
+    }
+    try {
+      const buf = Buffer.alloc(64 * 1024);
+      let count = 0;
+      let lastByte = -1;
+      let bytesRead = 0;
+      do {
+        bytesRead = readSync(fd, buf, 0, buf.length, null);
+        for (let i = 0; i < bytesRead; i++) {
+          if (buf[i] === 0x0a) count++;
+        }
+        if (bytesRead > 0) lastByte = buf[bytesRead - 1];
+      } while (bytesRead === buf.length);
+      if (lastByte !== -1 && lastByte !== 0x0a) count++; // final unterminated line
+      return count;
+    } catch {
+      return null;
+    } finally {
+      closeSync(fd);
     }
   }
 
@@ -813,6 +857,14 @@ export default function (pi: ExtensionAPI) {
         const exitEmoji = exitCode === 0 ? "✅" : "❌";
         const lastLine = readLastLogLine(logPath);
 
+        // Universal stats — duration + log line count. Non-heuristic, always
+        // present, never pattern-based. A missing log contributes no line
+        // count (duration is always known).
+        const logLines = countLogLines(logPath);
+        const statsParts = [formatDuration(rec.exitedAt - rec.started)];
+        if (logLines !== null)
+          statsParts.push(`${logLines.toLocaleString("en-US")} lines`);
+
         // Persist the done-state entry.
         pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
           id,
@@ -830,6 +882,7 @@ export default function (pi: ExtensionAPI) {
         const namePrefix = rec.name ? `"${rec.name}" ` : "";
         let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
         wake += `Command: ${command}\n`;
+        wake += `Stats: ${statsParts.join(", ")}\n`;
         if (lastLine) wake += `Last output: ${lastLine}\n`;
         wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
         try {

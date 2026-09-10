@@ -1770,3 +1770,104 @@ test("formatSince: same-day shows time only; older days include the date", async
   assert.match(prevYearStr, /Dec 30/);
   assert.match(prevYearStr, /08:00:00/);
 });
+
+// ── universal stats in the wake message (digest foundation) ──────────────
+
+test("formatDuration: one decimal in seconds under a minute, m:ss above", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  assert.equal(typeof mod.formatDuration, "function");
+  assert.equal(mod.formatDuration(0), "0.0s");
+  assert.equal(mod.formatDuration(42_300), "42.3s");
+  assert.equal(mod.formatDuration(59_000), "59.0s");
+  assert.equal(mod.formatDuration(60_000), "1:00");
+  assert.equal(mod.formatDuration(307_000), "5:07");
+  assert.equal(mod.formatDuration(3_600_000), "60:00");
+});
+
+test("wake message: Stats line (duration + line count) sits between Command: and Last output: on a green run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-stats1",
+      { command: "echo hello world" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    // Duration (0.0s for an instant job) + line count (output, blank line,
+    // and exit marker).
+    assert.match(wake, /Stats: 0\.0s, 3 lines/);
+    const cmdIdx = wake.indexOf("Command: ");
+    const statsIdx = wake.indexOf("Stats: ");
+    const lastIdx = wake.indexOf("Last output: ");
+    assert.ok(
+      cmdIdx !== -1 && cmdIdx < statsIdx && statsIdx < lastIdx,
+      "Stats line sits between Command: and Last output:",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wake message: Stats line also present on a red (non-zero exit) run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-stats2",
+      { command: "echo failing; exit 7" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    assert.match(wakes[0].text, /Stats: \d+\.\ds, \d+ lines/);
+    assert.match(wakes[0].text, /exit 7/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wake message: missing log file — Stats shows duration only, wake still sent", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    // Unlink the log while the job runs; at exit the file is gone.
+    const res = await bgrun.execute(
+      "call-stats3",
+      { command: "sleep 0.3; echo late" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    rmSync(join(dir, `${id}.log`), { force: true });
+
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    assert.match(wake, /✅/);
+    assert.match(wake, /Stats: \d+\.\ds$/m, "duration only, no lines");
+    assert.ok(!wake.includes(" lines"), "unreadable log contributes nothing");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
