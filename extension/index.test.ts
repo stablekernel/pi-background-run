@@ -21,6 +21,7 @@ import {
   existsSync,
   readdirSync,
   mkdirSync,
+  renameSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -2502,6 +2503,140 @@ test("wake digest: untrusted project → digest absent even when configured", as
       await waitForWakes(wakes, 1);
       assert.ok(!wakes[0].text.includes("digest (project-config)"), "no trust check → no digest");
     }
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+// ── digest nudge: one-shot session_start toast ────────────────────────────
+
+const DIGEST_NUDGE_TEXT =
+  "pi-bgrun: no digest configured for this project — use the digest-config skill to set one up.";
+
+// Drop a finished job log into the jobs dir — a log carrying the
+// self-describing exit marker is exactly what the nudge scans for.
+function writeDoneLog(jobsDir: string, name: string, exit = 0): void {
+  mkdirSync(jobsDir, { recursive: true });
+  writeFileSync(join(jobsDir, name), `output\n__BGRUN_EXIT__=${exit}\n`);
+}
+
+function captureNotify(ctx: any): string[] {
+  const messages: string[] = [];
+  ctx.hasUI = true;
+  ctx.ui.notify = (text: string) => {
+    messages.push(text);
+  };
+  return messages;
+}
+
+test("digest nudge: fires on session_start (trusted, no digest, ≥1 done job) and writes the marker", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeDoneLog(dir, "myproj-1-12345.log");
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
+    assert.ok(existsSync(join(dir, ".digest-nudge-done")), "marker file created");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: silent when a digest IS configured (marker untouched)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    writeDoneLog(dir, "myproj-1-12345.log");
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [], "no toast when a digest is configured");
+    assert.ok(!existsSync(join(dir, ".digest-nudge-done")), "no marker written");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: silent when the project is untrusted", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeDoneLog(dir, "myproj-1-12345.log");
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, false);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [], "untrusted project → no toast");
+    assert.ok(!existsSync(join(dir, ".digest-nudge-done")), "no marker written");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: silent when no done jobs (no evidence of use)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    // A running job log (no exit marker yet) doesn't count as evidence either.
+    writeDoneLog(dir, "myproj-1-12345.log");
+    renameSync(join(dir, "myproj-1-12345.log"), join(dir, "running.log"));
+    writeFileSync(join(dir, "running.log"), "still going...\n");
+
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [], "no done jobs → no toast");
+    assert.ok(!existsSync(join(dir, ".digest-nudge-done")), "no marker written");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: silent when the marker file already exists", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeDoneLog(dir, "myproj-1-12345.log");
+    writeFileSync(join(dir, ".digest-nudge-done"), "1717000000000");
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [], "marker present → stay silent");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: a throwing ui.notify does not break session_start", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeDoneLog(dir, "myproj-1-12345.log");
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    ctx.hasUI = true;
+    ctx.ui.notify = () => {
+      throw new Error("toast exploded");
+    };
+    await loadExtension(pi);
+    await fireSessionStart(); // must not throw
+
+    // The failed toast counts as "not nudged" — the marker is intentionally
+    // not written, so the next session can try again. Session_start is intact.
+    assert.ok(!existsSync(join(dir, ".digest-nudge-done")));
   } finally {
     teardownDigestEnv(dir, proj, home);
   }

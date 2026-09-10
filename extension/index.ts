@@ -44,6 +44,7 @@ import {
   unlinkSync,
   statSync,
   writeFileSync,
+  existsSync,
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -785,6 +786,10 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // One-shot digest nudge (toast only, never the LLM context). All of its
+    // failure modes are swallowed inside — it must never break session_start.
+    maybeNudgeDigest(ctx);
+
     // Show the widget if anything is now running. revalidateStaleJobs()
     // inside clears zombies — reconstructed jobs that finished while pi was
     // down — before they ever render. Then start the stale poller for
@@ -1123,6 +1128,55 @@ export default function (pi: ExtensionAPI) {
         ? joined.slice(0, DIGEST_TOTAL_CAP)
         : joined;
     return capped.trim() || undefined;
+  }
+
+  // ── Digest nudge: one-shot session_start toast for digest-less projects ────
+  // When a trusted project has actually used bgrun (≥1 finished job log in the
+  // jobs dir) but never configured a digest, point the human at the
+  // digest-config skill once. Toast only — never sendUserMessage, so it costs
+  // zero LLM context. Dismissal is a marker file in the jobs dir; the user's
+  // config files are never written.
+  const DIGEST_NUDGE_MARKER = ".digest-nudge-done";
+  const DIGEST_NUDGE_TEXT =
+    "pi-bgrun: no digest configured for this project — use the digest-config skill to set one up.";
+
+  // Evidence of use: at least one finished job log — the self-describing exit
+  // marker is the same done signal the cleanup scan relies on.
+  function hasDoneJobLog(jobsDir: string): boolean {
+    let entries: string[];
+    try {
+      entries = readdirSync(jobsDir);
+    } catch {
+      return false; // jobs dir doesn't exist — no usage yet
+    }
+    for (const name of entries) {
+      if (!name.endsWith(".log")) continue;
+      if (parseExitFromLog(join(jobsDir, name)) !== null) return true;
+    }
+    return false;
+  }
+
+  function maybeNudgeDigest(ctx: ExtensionContext): void {
+    try {
+      if (!ctx.isProjectTrusted?.()) return;
+      const cfg = resolveConfig(ctx);
+      if (cfg.digest) return; // already configured — nothing to nudge
+      if (!ctx.hasUI) return; // toast-only feature; no UI → nothing to do
+      if (!hasDoneJobLog(cfg.jobsDir)) return;
+      const markerPath = join(cfg.jobsDir, DIGEST_NUDGE_MARKER);
+      if (existsSync(markerPath)) return; // already nudged once — stay silent
+      ctx.ui.notify(DIGEST_NUDGE_TEXT, "info");
+      try {
+        writeFileSync(markerPath, String(Date.now()));
+      } catch {
+        // best-effort — a marker write failure must never break session_start
+      }
+    } catch (err) {
+      console.error(
+        "[pi-bgrun] digest nudge failed:",
+        (err as Error).message,
+      );
+    }
   }
 
   function condenseLogLines(
