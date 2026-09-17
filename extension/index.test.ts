@@ -2027,6 +2027,42 @@ test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort
   }
 });
 
+test("resolveConfig: digest type normalized; invalid type drops entry; match dropped when type present", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: "TEST", label: "t", command: "echo t" },
+        { type: "test", match: { name: "x" }, command: "echo both" },
+        { type: 42, command: "echo bad" },
+        { type: "   ", command: "echo blank" },
+        { command: "echo default" },
+      ],
+    });
+    const cfg = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => true,
+    });
+    assert.deepEqual(cfg.digest, [
+      // type lowercased, kept.
+      { type: "test", label: "t", command: "echo t" },
+      // match dropped because type is the only selector.
+      { type: "test", command: "echo both" },
+      // invalid + blank type entries dropped.
+      { command: "echo default" },
+    ]);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
 test("resolveDigest: preset wins over command; normalization shapes", () => {
   const goTest = DIGEST_PRESETS.find((p) => p.id === "go-test")!;
   // Both configured → preset wins (curated beats hand-rolled).
@@ -2180,6 +2216,127 @@ test("selectDigestEntry: label precedence (label → match.name → project-conf
       { name: "unit", command: "go test" },
     ),
     { command: "echo first", label: "first" },
+  );
+});
+
+// ── type-first digest selection (job type declared at spawn) ──────────────
+
+test("selectDigestEntry: type-first selection (exact, case-insensitive) + fallback", () => {
+  const entries = [
+    { match: { name: "unit" }, label: "regex-unit", command: "echo regex-unit" },
+    { type: "test", command: "echo type-test" },
+    { label: "default", command: "echo default" },
+  ];
+  // A job declaring the type selects the type entry first, even though an
+  // earlier regex entry also matches.
+  assert.deepEqual(
+    selectDigestEntry(entries, {
+      type: "test",
+      name: "unit",
+      command: "go test",
+    }),
+    { command: "echo type-test", label: "test" },
+  );
+  // Case-insensitive exact match.
+  assert.deepEqual(
+    selectDigestEntry(entries, { type: "TEST", command: "go test" }),
+    { command: "echo type-test", label: "test" },
+  );
+  // A job type with no entry falls through to the regex/default scan.
+  assert.deepEqual(
+    selectDigestEntry(entries, {
+      type: "lint",
+      name: "unit",
+      command: "go test",
+    }),
+    { command: "echo regex-unit", label: "regex-unit" },
+  );
+  // No type at all: unchanged legacy behavior.
+  assert.deepEqual(selectDigestEntry(entries, { command: "ls" }), {
+    command: "echo default",
+    label: "default",
+  });
+});
+
+test("selectDigestEntry: type beats regex entries regardless of config order", () => {
+  const want = { command: "echo typed", label: "typed" };
+  const regexFirst = [
+    { match: { command: "go test" }, label: "regex", command: "echo regex" },
+    { type: "test", label: "typed", command: "echo typed" },
+  ];
+  const typeFirst = [
+    { type: "test", label: "typed", command: "echo typed" },
+    { match: { command: "go test" }, label: "regex", command: "echo regex" },
+  ];
+  assert.deepEqual(
+    selectDigestEntry(regexFirst, { type: "test", command: "go test" }),
+    want,
+  );
+  assert.deepEqual(
+    selectDigestEntry(typeFirst, { type: "test", command: "go test" }),
+    want,
+  );
+});
+
+test("selectDigestEntry: type + match on one entry → type wins (match ignored)", () => {
+  // Config normalization drops `match` on a type entry, but the selector is
+  // defensive: a direct caller passing both still gets type-first semantics.
+  assert.deepEqual(
+    selectDigestEntry(
+      [{ type: "test", match: { name: "never" }, command: "echo typed" }],
+      { type: "test", name: "unit", command: "go test" },
+    ),
+    { command: "echo typed", label: "test" },
+  );
+});
+
+test("selectDigestEntry: label precedence for type entries (label → type)", () => {
+  // Explicit label wins.
+  assert.deepEqual(
+    selectDigestEntry([{ type: "test", label: "unit", command: "echo hi" }], {
+      type: "test",
+      command: "go test",
+    }),
+    { command: "echo hi", label: "unit" },
+  );
+  // No label → the type string. (A valid type entry always has a non-empty
+  // type, so "project-config" is the documented terminal default but is
+  // unreachable here; normalization guarantees that.)
+  assert.deepEqual(
+    selectDigestEntry([{ type: "test", command: "echo hi" }], {
+      type: "test",
+      command: "go test",
+    }),
+    { command: "echo hi", label: "test" },
+  );
+});
+
+test("entryMatchesJob: name/command regexes are case-insensitive and unanchored", () => {
+  const target = { name: "unit-tests-run3", command: "go test ./..." };
+  // Unanchored substring — the whole point: a noisy job name still matches.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit-tests" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  // Case-insensitive.
+  assert.equal(
+    entryMatchesJob({ match: { name: "UNIT" }, preset: "go-test" }, target),
+    true,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { command: "GO TEST" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  // A non-matching pattern still fails.
+  assert.equal(
+    entryMatchesJob({ match: { name: "e2e" }, preset: "go-test" }, target),
+    false,
   );
 });
 
@@ -2383,6 +2540,7 @@ function digestBlockOf(wake: string): string | null {
   const m = wake.match(/digest \(project-config\): ([\s\S]*?)\nReview the result/);
   return m ? m[1] : null;
 }
+
 
 test("wake digest: preset scorecard appears on a green log", async () => {
   const { dir, proj, home } = setupDigestEnv();
@@ -2658,7 +2816,7 @@ test("wake digest: untrusted project → digest absent even when configured", as
 // Run one bgrun job against the shared digest env and return its wake text.
 async function runDigestJob(
   proj: string,
-  params: { command: string; name?: string },
+  params: { command: string; name?: string; type?: string },
   id = "call-multi",
 ): Promise<string> {
   const { pi, wakes, tools, ctx } = makeFakePi();
@@ -2797,6 +2955,167 @@ test("wake digest: empty array config produces no digest block", async () => {
     assert.match(wake, /✅/);
   } finally {
     teardownDigestEnv(dir, proj, home);
+  }
+});
+
+// ── wake digest: type-first selection ──────────────────────────────────────
+
+test("wake digest: job type selects the matching type entry (digest (test))", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: "test", preset: "go-test" },
+        { type: "build", label: "build", command: "echo build-ok" },
+      ],
+    });
+    const wake = await runDigestJob(proj, {
+      type: "test",
+      command: "printf 'ok  \\texample.com/a\\t0.01s\\n'",
+    });
+    const line = digestLineOf(wake);
+    assert.ok(line, "wake carries a digest line");
+    assert.match(line!, /^digest \(test\):/, "label falls back to the type string");
+    assert.match(line!, /pass: 1  fail: 0/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: type is case-insensitive; unknown type falls through to regex/default", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: "test", label: "typed-test", command: "echo typed" },
+        { match: { command: "run" }, label: "regex", command: "echo regex" },
+        { label: "default", command: "echo default" },
+      ],
+    });
+    // Case-insensitive exact type match.
+    let wake = await runDigestJob(proj, { type: "TEST", command: "echo hi" });
+    assert.match(digestLineOf(wake)!, /^digest \(typed-test\): typed$/);
+    // Unknown type → falls through to the regex scan.
+    wake = await runDigestJob(proj, {
+      type: "lint",
+      command: "npm run lint",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(regex\): regex$/);
+    // Unknown type + no regex match → default entry.
+    wake = await runDigestJob(proj, { type: "lint", command: "ls" });
+    assert.match(digestLineOf(wake)!, /^digest \(default\): default$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: type entry beats an earlier regex entry (type-first order)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { match: { command: "go test" }, label: "regex", command: "echo regex" },
+        { type: "test", label: "typed", command: "echo typed" },
+      ],
+    });
+    const wake = await runDigestJob(proj, {
+      type: "test",
+      command: "go test ./...",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(typed\): typed$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: invalid type entry dropped, other entries still work", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: 7, command: "echo broken" },
+        { type: "test", label: "typed", command: "echo typed" },
+      ],
+    });
+    const wake = await runDigestJob(proj, { type: "test", command: "echo hi" });
+    assert.match(digestLineOf(wake)!, /^digest \(typed\): typed$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("bgrun: type flows into the started result, entries, and resume reconstruction", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, entries, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const res = await bgrun.execute(
+      "call-ty1",
+      { command: "echo typed", name: "unit-tests", type: "Test" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const started = res.content[0].text as string;
+    const id = (started.match(/^started: ([^\n]+)/) || [])[1];
+    assert.ok(id, "got a job id");
+    assert.match(started, /^  name: unit-tests$/m);
+    // Types are lowercase-normalized so selection is an exact compare.
+    assert.match(started, /^  type: test$/m);
+    assert.equal((res.details as any).type, "test");
+    await waitForWakes(wakes, 1);
+
+    // The persisted done entry carries the type.
+    const done = entries.filter((e) => e.customType === "bgrun-job").at(-1);
+    assert.equal(done.data.type, "test");
+
+    // Resume: a fresh instance reconstructs the in-memory map from entries.
+    const {
+      pi: pi2,
+      tools: tools2,
+      ctx: ctx2,
+      fireSessionStart,
+    } = makeFakePi({ priorEntries: entries });
+    await loadExtension(pi2);
+    await fireSessionStart();
+    const bgstatus2 = tools2.get("bgstatus")!;
+    const status = await bgstatus2.execute(
+      "call-ty2",
+      { id },
+      undefined,
+      undefined,
+      ctx2,
+    );
+    const text = status.content[0].text as string;
+    assert.match(text, /^  type: test$/m, "reconstructed record carries the type");
+    assert.equal((status.details as any).type, "test");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: no type → no type line in the started result", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const res = await bgrun.execute(
+      "call-ty3",
+      { command: "echo plain" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!(res.content[0].text as string).includes("type:"));
+    assert.equal((res.details as any).type, undefined);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

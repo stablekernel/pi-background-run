@@ -145,9 +145,9 @@ function warnDigestInvalid(field: string, value: unknown): void {
       ? ` — valid presets: ${DIGEST_PRESET_IDS.join(", ")}`
       : "";
   // Point at the array form too: the same `digest` key accepts an ordered
-  // list of { match, label, preset, command } entries.
+  // list of { type, match, label, preset, command } entries.
   const shapeHint =
-    " — digest takes an object or an array of { match, label, preset, command } entries";
+    " — digest takes an object or an array of { type, match, label, preset, command } entries";
   console.error(
     `[pi-bgrun] ignoring invalid digest.${field} in pi-bgrun.json: ${JSON.stringify(value)}${hint}${shapeHint}`,
   );
@@ -169,14 +169,29 @@ function isValidRegexSource(src: string): boolean {
 function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const entry = raw as {
+    type?: unknown;
     match?: unknown;
     label?: unknown;
     preset?: unknown;
     command?: unknown;
   };
 
+  // `type` and `match` are mutually exclusive selectors: when `type` is present
+  // it is the ONLY selector for the entry, so any `match` is ignored (dropped
+  // below). An invalid `type` (present but not a non-empty string) drops the
+  // whole entry — same best-effort policy as an uncompilable regex. Types are
+  // lowercase-normalized so selection is a cheap exact comparison.
+  let type: string | undefined;
+  if (entry.type !== undefined) {
+    if (typeof entry.type !== "string" || !entry.type.trim()) {
+      warnDigestInvalid("type", entry.type);
+      return undefined;
+    }
+    type = entry.type.trim().toLowerCase();
+  }
+
   let match: DigestMatch | undefined;
-  if (entry.match !== undefined) {
+  if (type === undefined && entry.match !== undefined) {
     if (
       !entry.match ||
       typeof entry.match !== "object" ||
@@ -234,6 +249,7 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   if (!preset && !command) return undefined;
 
   const out: DigestEntry = {};
+  if (type) out.type = type;
   if (match) out.match = match;
   if (typeof entry.label === "string" && entry.label.trim()) {
     out.label = entry.label;
@@ -370,6 +386,7 @@ interface JobRecord {
   pid: number;
   cmd: string;
   name?: string; // optional human-readable label
+  type?: string; // optional job type used for digest scorecard selection
   started: number;
   logPath: string;
   exitedAt?: number;
@@ -386,6 +403,7 @@ interface BgrunJobEntryData {
   pid: number;
   cmd: string;
   name?: string;
+  type?: string;
   started: number;
   logPath: string;
   state: "running" | "done";
@@ -399,6 +417,7 @@ interface BgStatusDetails {
   exitCode?: number;
   cmd?: string;
   name?: string;
+  type?: string;
   count?: number;
   recovered?: boolean;
 }
@@ -439,6 +458,15 @@ export default function (pi: ExtensionAPI) {
     const trimmed = (name ?? "").trim();
     if (!trimmed) return undefined;
     return trimmed.slice(0, 80);
+  }
+
+  // Normalize an optional job type: short token, lowercase (so digest
+  // selection is a cheap exact compare against lowercase config types), blank
+  // → undefined, capped defensively.
+  function sanitizeType(type: string | undefined): string | undefined {
+    const trimmed = (type ?? "").trim().toLowerCase();
+    if (!trimmed) return undefined;
+    return trimmed.slice(0, 40);
   }
 
   function readLastLogLine(logPath: string, maxLen = 200): string | null {
@@ -698,6 +726,7 @@ export default function (pi: ExtensionAPI) {
           pid: rec.pid,
           cmd: rec.cmd,
           name: rec.name,
+          type: rec.type,
           started: rec.started,
           logPath: rec.logPath,
           state: "done",
@@ -817,6 +846,7 @@ export default function (pi: ExtensionAPI) {
           pid: d.pid,
           cmd: d.cmd,
           name: d.name,
+          type: d.type,
           started: d.started,
           logPath: d.logPath,
           exitedAt: d.exitedAt,
@@ -907,12 +937,14 @@ export default function (pi: ExtensionAPI) {
       "Run a long shell command detached in the background. Returns 'started: <job-id>' immediately. " +
       "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
       "expected to run >30s or emit >100 lines (tests, builds, linters). Optionally pass `name` for a " +
-      "short human-readable label used in the job id, status output, and wake messages.",
+      "short human-readable label used in the job id, status output, and wake messages, and `type` to " +
+      "select the project's digest scorecard.",
     promptSnippet:
       "Run a long command detached in the background; get woken on completion",
     promptGuidelines: [
       "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
       "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
+      "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard; the vocabulary comes from the project's `.pi/pi-bgrun.json` digest entries.",
       "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
       "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use ctx_execute_file on the log path only when the condensed tail is insufficient.",
     ],
@@ -928,13 +960,22 @@ export default function (pi: ExtensionAPI) {
             "Used in the job id, status output, the status widget, and wake messages.",
         }),
       ),
+      type: Type.Optional(
+        Type.String({
+          description:
+            "Optional job type used to select the project's digest scorecard (e.g. 'test', 'build', 'lint'). " +
+            "The vocabulary comes from the `type` fields in the project's `digest` config entries in " +
+            "`.pi/pi-bgrun.json`; when the project's digest config defines types, prefer passing the matching one.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { command, name: rawName } = params;
+      const { command, name: rawName, type: rawType } = params;
       if (!command || !command.trim()) {
         throw new Error("bgrun: command is required");
       }
       const name = sanitizeName(rawName);
+      const type = sanitizeType(rawType);
 
       const jobsDir = resolveConfig(ctx).jobsDir;
       mkdirSync(jobsDir, { recursive: true });
@@ -980,6 +1021,7 @@ export default function (pi: ExtensionAPI) {
         pid: childPid,
         cmd: command,
         name,
+        type,
         started: Date.now(),
         logPath,
         child,
@@ -993,6 +1035,7 @@ export default function (pi: ExtensionAPI) {
         pid: childPid,
         cmd: command,
         name,
+        type,
         started: Date.now(),
         logPath,
         state: "running",
@@ -1030,6 +1073,7 @@ export default function (pi: ExtensionAPI) {
           pid: rec.pid,
           cmd: rec.cmd,
           name: rec.name,
+          type: rec.type,
           started: rec.started,
           logPath,
           state: "done",
@@ -1054,6 +1098,7 @@ export default function (pi: ExtensionAPI) {
           // "project-config" for the legacy single-object config.
           const selected = selectDigestEntry(resolveConfig(rec.ctx).digest, {
             name: rec.name,
+            type: rec.type,
             command: rec.cmd,
           });
           if (selected) {
@@ -1117,13 +1162,14 @@ export default function (pi: ExtensionAPI) {
 
       const startedLines = [`started: ${id}`];
       if (name) startedLines.push(`  name: ${name}`);
+      if (type) startedLines.push(`  type: ${type}`);
       startedLines.push(
         `  log: ${logPath}`,
         `  You'll be woken automatically when it finishes.`,
       );
       return {
         content: [{ type: "text", text: startedLines.join("\n") }],
-        details: { id, name, logPath, pid: childPid },
+        details: { id, name, type, logPath, pid: childPid },
       };
     },
   });
@@ -1422,6 +1468,7 @@ export default function (pi: ExtensionAPI) {
         const exit = rec.exitCode === undefined ? "" : ` exit=${rec.exitCode}`;
         const lines = [`${id}: ${state}${exit}`];
         if (rec.name) lines.push(`  name: ${rec.name}`);
+        if (rec.type) lines.push(`  type: ${rec.type}`);
         lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -1431,6 +1478,7 @@ export default function (pi: ExtensionAPI) {
             exitCode: rec.exitCode ?? undefined,
             cmd: rec.cmd,
             name: rec.name,
+            type: rec.type,
             recovered: false,
           },
         };

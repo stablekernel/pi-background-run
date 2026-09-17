@@ -74,21 +74,32 @@ export interface DigestMatch {
 }
 
 /**
- * One scorecard entry in the `digest` config: an optional matcher, an optional
- * wake label, and either a shipped preset id or a custom sh command. Config
- * normalizes to an ordered list of these; the first entry that matches a job
- * wins (put the default entry last).
+ * One scorecard entry in the `digest` config: an optional job `type` OR an
+ * optional `match`, an optional wake label, and either a shipped preset id or
+ * a custom sh command. Config normalizes to an ordered list of these; the
+ * first entry that matches a job wins (put the default entry last).
+ *
+ * `type` and `match` are mutually exclusive selectors: when `type` is present
+ * it is the ONLY selector for the entry, and `match` is ignored (config
+ * normalization drops it). Use `type` for a first-class job type declared at
+ * spawn time; use `match` regexes only as the fallback for jobs without a type.
  */
 export interface DigestEntry {
+  type?: string;
   match?: DigestMatch;
   label?: string;
   preset?: string;
   command?: string;
 }
 
-/** The job a digest entry is selected against at wake time. */
+/**
+ * The job a digest entry is selected against at wake time. `type` is the
+ * job's agent-declared type (e.g. "test", "build"), matched exactly
+ * (case-insensitively) against type-gated entries before the regex fallback.
+ */
 export interface DigestJobTarget {
   name?: string;
+  type?: string;
   command: string;
 }
 
@@ -118,12 +129,15 @@ export function resolveDigest(
 }
 
 /**
- * Does a digest entry apply to this job? No `match` (or an empty one) matches
- * every job. A present `name`/`command` matcher must compile and test true;
- * `name` against a job with no name never matches. When both fields are
- * present both must match (AND). An uncompilable regex is treated as a
- * non-match rather than throwing (config normalization already drops those,
- * but the selector stays safe for direct callers).
+ * Does a digest entry's regex `match` apply to this job? No `match` (or an
+ * empty one) matches every job. A present `name`/`command` matcher must
+ * compile and test true; `name` against a job with no name never matches. When
+ * both fields are present both must match (AND). Matching is **unanchored
+ * (substring)** and **case-insensitive** — so `"unit-tests"` matches
+ * `"unit-tests-run3"` and `"Unit-Tests"`. An uncompilable regex is treated as
+ * a non-match rather than throwing (config normalization already drops those,
+ * but the selector stays safe for direct callers). This helper handles the
+ * regex matcher only; `type` gating is done in selectDigestEntry.
  */
 export function entryMatchesJob(
   entry: DigestEntry,
@@ -135,10 +149,10 @@ export function entryMatchesJob(
   try {
     if (match.name !== undefined) {
       if (target.name === undefined) return false;
-      if (!new RegExp(match.name).test(target.name)) return false;
+      if (!new RegExp(match.name, "i").test(target.name)) return false;
     }
     if (match.command !== undefined) {
-      if (!new RegExp(match.command).test(target.command)) return false;
+      if (!new RegExp(match.command, "i").test(target.command)) return false;
     }
   } catch {
     return false;
@@ -147,18 +161,47 @@ export function entryMatchesJob(
 }
 
 /**
- * Select the first digest entry that matches the job, in config order, and
- * resolve it to a concrete command + wake label. Label precedence: entry
- * `label` → matched `match.name` → "project-config" (the historical label for
- * the single-object config). Returns undefined when no entry matches or the
- * list is empty/unconfigured.
+ * Select the digest entry for a job and resolve it to a concrete command +
+ * wake label. Selection order:
+ *
+ *   1. Type entries first: an entry declaring `type` matches ONLY a job with
+ *      that same type (exact, case-insensitive) — checked in config order, and
+ *      ahead of every regex entry regardless of where it sits in the list.
+ *      First type match wins.
+ *   2. Fallback: ordered scan over entries WITHOUT a `type` — `match.name` /
+ *      `match.command` regexes (case-insensitive, unanchored) and no-`match`
+ *      defaults. First match wins. Jobs with no type therefore behave exactly
+ *      as before.
+ *   3. Nothing matched → undefined (no digest).
+ *
+ * Label precedence: entry `label` → (type entry) the type string → (match
+ * entry) the matched `match.name` → "project-config" (the historical label for
+ * the legacy single-object config). Returns undefined when the list is
+ * empty/unconfigured.
  */
 export function selectDigestEntry(
   entries: DigestEntry[] | undefined,
   target: DigestJobTarget,
 ): SelectedDigest | undefined {
   if (!entries) return undefined;
+
+  // 1. Type-first selection. Only entries declaring a type are eligible here,
+  // and only when the job declared one. Config order decides ties.
+  if (target.type !== undefined) {
+    const want = target.type.toLowerCase();
+    for (const entry of entries) {
+      if (!entry.type) continue;
+      if (entry.type.toLowerCase() !== want) continue;
+      const resolved = resolveDigest(entry);
+      if (!resolved) continue;
+      const label = entry.label || entry.type || "project-config";
+      return { command: resolved.command, label };
+    }
+  }
+
+  // 2. Regex/default fallback over entries without a type.
   for (const entry of entries) {
+    if (entry.type) continue;
     if (!entryMatchesJob(entry, target)) continue;
     const resolved = resolveDigest(entry);
     if (!resolved) continue;
