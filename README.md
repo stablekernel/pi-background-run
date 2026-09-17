@@ -191,8 +191,37 @@ Three ways, easiest first — pick the first one you're comfortable with:
    yourself, you can also ask your agent to validate a specific command
    against specific job logs.
 
+#### Multiple scorecards (one per job type)
+
+`digest` can also be an ordered **list** of scorecards, each optionally matched
+against the job it applies to. The first match wins, in config order:
+
+```json
+{
+  "digest": [
+    { "match": { "name": "unit-tests" }, "preset": "go-test" },
+    { "match": { "command": "cargo build" }, "label": "build",
+      "command": "grep -E '^error' \"$1\" | head -5" },
+    { "preset": "go-test" }
+  ]
+}
+```
+
+- `match.name` and `match.command` are **regexes** tested against the job's
+  `name` and command line. Both present → both must match.
+- An entry with no `match` (or an empty `match`) matches every job — put it
+  **last** as the default/fallback.
+- `label` sets the wake tag: `digest (<label>): …`. Without it, a matched
+  `match.name` is used; otherwise the tag stays `digest (project-config): …`.
+- First match wins; exactly one digest block is appended per wake.
+
+The legacy single-object form still works unchanged — `{ "digest": { "preset":
+"go-test" } }` is a one-entry list with no matchers.
+
 Opt in per project via `<project>/.pi/pi-bgrun.json` (read only for trusted
-projects). If both `preset` and `command` are set, the preset wins.
+projects). If both `preset` and `command` are set within one entry, the preset
+wins. An empty list (or one where every entry is invalid) counts as *not
+configured*.
 
 #### Guarantees
 
