@@ -26,24 +26,40 @@ both `preset` and `command` are set within one entry, the preset wins:
 ```json
 {
   "digest": [
-    { "match": { "name": "unit-tests" }, "preset": "go-test" },
-    { "match": { "command": "cargo build" }, "label": "build",
+    { "type": "test",  "preset": "go-test" },
+    { "type": "build", "label": "build",
       "command": "grep -E '^error' \"$1\" | head -5" },
+    { "match": { "command": "cargo" }, "label": "cargo", "preset": "go-test" },
     { "preset": "go-test" }
   ]
 }
 ```
 
-Matching (first match wins, in config order):
+Prefer a `type` on each entry: it is matched exactly (case-insensitive) against
+the `type:` the agent passes to `bgrun`, so it does not depend on job names or
+command lines staying stable. When you configure a `type`, tell the agent to
+pass it: `bgrun(command: …, name: …, type: "test")`.
+
+Selection (exactly one entry, or none):
+1. Entries with a `type` are checked **first**, in config order, and match only
+   a job declaring that exact type. First type match wins.
+2. Otherwise the entries **without** a `type` are scanned in config order:
+   `match.name` / `match.command` regexes and no-`match` defaults.
+3. No match → no digest.
+
+- `type` and `match` are mutually exclusive on one entry; `type` wins and any
+  `match` is ignored.
 - `match.name` / `match.command` are **regexes** tested against the job's
-  `name` and command line; both present → both must match.
+  `name` and command line; both present → both must match. They are
+  **case-insensitive and unanchored (substring)**.
 - An entry with no `match` (or an empty `match`) matches every job — put it
   **last** as the default. Include one so jobs you did not anticipate still
   get a scorecard.
-- `label` sets the wake tag; without it a matched `match.name` is used, else
-  `project-config`.
-- An invalid regex or an entry with no valid `preset`/`command` is dropped
-  silently; an empty/all-invalid list counts as unconfigured.
+- `label` sets the wake tag; without it a type entry uses its `type` string, a
+  regex entry uses the matched `match.name`, else `project-config`.
+- An invalid regex, an invalid `type`, or an entry with no valid
+  `preset`/`command` is dropped silently; an empty/all-invalid list counts as
+  unconfigured.
 
 Shipped presets: `go-test` (package ok/FAIL counts + failing test names),
 `jest` (Tests/Test Suites summary + failed test names), `pytest` (final
@@ -61,7 +77,8 @@ passed/failed/error summary line + FAILED test ids), `junit-xml`
    least a test job and a build job. Pick 2-3 logs per type — at least one
    green and one red run each — and inspect them with `ctx_execute_file`
    (context-mode sandbox, so only your printed summary enters context).
-   Identify the runner / output format for each type.
+   Identify the runner / output format for each type, and name the type with a
+   short token (`test`, `build`, `lint`, `e2e`).
 3. **Try a preset first, per type.** Run each shipped preset's command against
    a sample log (`sh -c '<preset command>' sh <logpath>`). Preset commands are
    data in the package's `extension/digestPresets.ts`. Clean scorecard on green
@@ -74,12 +91,14 @@ passed/failed/error summary line + FAILED test ids), `junit-xml`
    phantom failures on green logs, no missing failures on red ones. If a type
    has no reliable command, omit that entry (or leave the digest unconfigured)
    rather than shipping a wrong scorecard — say why.
-6. **Write the config.** Merge the entries into
-   `<project>/.pi/pi-bgrun.json`, preserving any existing keys and putting the
-   no-`match` default entry **last**. Use the job's `name` for `match.name`
-   where possible, a command regex otherwise. Create the file if absent.
+6. **Write the config, one `type` entry per job type.** Merge the entries into
+   `<project>/.pi/pi-bgrun.json`, preserving any existing keys, giving each
+   entry the `type` you identified in step 2, and putting the no-`match`
+   default entry **last**. Use `match.name` / `match.command` regexes only for
+   jobs that will not pass a `type`. Create the file if absent. Tell the user
+   (or the agent driving `bgrun`) which `type:` value to pass for each job.
 7. **Smoke-test each entry.** Start a real `bgrun` job of each configured type
-   (e.g. the test command AND the build command) and check that its wake
-   carries a correct `digest (<label>):` block for the right entry. If a block
-   is empty, wrong, or comes from the wrong entry, fix the command / ordering
-   and repeat step 7.
+   (e.g. the test command AND the build command), passing the matching
+   `type:`, and check that its wake carries a correct `digest (<label>):` block
+   for the right entry. If a block is empty, wrong, or comes from the wrong
+   entry, fix the command / type / ordering and repeat step 7.

@@ -193,26 +193,54 @@ Three ways, easiest first — pick the first one you're comfortable with:
 
 #### Multiple scorecards (one per job type)
 
-`digest` can also be an ordered **list** of scorecards, each optionally matched
-against the job it applies to. The first match wins, in config order:
+`digest` can also be an ordered **list** of scorecards. Give each a `type` and
+pass the matching `type:` when you start the job — the most reliable selector,
+because it does not depend on the agent naming every job consistently:
 
 ```json
 {
   "digest": [
-    { "match": { "name": "unit-tests" }, "preset": "go-test" },
-    { "match": { "command": "cargo build" }, "label": "build",
+    { "type": "test",  "preset": "go-test" },
+    { "type": "build", "label": "build",
       "command": "grep -E '^error' \"$1\" | head -5" },
+    { "match": { "command": "cargo" }, "label": "cargo", "preset": "go-test" },
     { "preset": "go-test" }
   ]
 }
 ```
 
+Start jobs with the matching type:
+
+```text
+bgrun(command: "go test ./...", name: "unit-tests", type: "test")
+```
+
+`type` is an optional `bgrun` parameter. The vocabulary is defined by the
+`type` fields of the project's digest config in `.pi/pi-bgrun.json`; when the
+project's digest config defines types, prefer passing the matching one.
+
+Selection order (exactly one entry, or none):
+
+1. **Type entries first.** An entry declaring a `type` matches ONLY a job that
+declared that same type — exact and case-insensitive (`"test"` matches
+`"Test"`). All type entries are checked first, in config order, regardless of
+where they sit relative to regex entries. First type match wins.
+2. **Regex/default fallback.** If no type entry matched — including when the
+job has no type — the entries *without* a `type` are scanned in config order:
+`match.name` / `match.command` regexes and no-`match` defaults, first match
+wins. Put a no-`match` default **last** so jobs you didn't anticipate still get
+a scorecard.
+3. No match → no digest.
+
+- `type` and `match` are mutually exclusive on one entry: when `type` is
+  present it is the only selector, and any `match` is ignored.
 - `match.name` and `match.command` are **regexes** tested against the job's
-  `name` and command line. Both present → both must match.
-- An entry with no `match` (or an empty `match`) matches every job — put it
-  **last** as the default/fallback.
-- `label` sets the wake tag: `digest (<label>): …`. Without it, a matched
-  `match.name` is used; otherwise the tag stays `digest (project-config): …`.
+  `name` and command line. Both present → both must match. Matching is
+  **case-insensitive and unanchored (substring)** — so `"unit-tests"` matches
+  `"unit-tests-run3"`.
+- `label` sets the wake tag: `digest (<label>): …`. Precedence: `label` →
+  (type entry) the type string → (matched regex entry) `match.name` →
+  `project-config`.
 - First match wins; exactly one digest block is appended per wake.
 
 The legacy single-object form still works unchanged — `{ "digest": { "preset":

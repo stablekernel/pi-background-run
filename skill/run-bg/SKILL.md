@@ -28,7 +28,7 @@ no polling.
 
 | Action | Tool |
 |---|---|
-| Start  | `bgrun(command: "make test-short", name: "unit-tests")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the status widget, and wake messages) |
+| Start  | `bgrun(command: "make test-short", name: "unit-tests", type: "test")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the status widget, and wake messages) |
 | Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
 | Tail   | `bgtail(<job-id>, 40)` |
 | Clean  | `bgclean()` for this session's old logs; `bgclean all` to sweep every session's (default 7-day retention) |
@@ -36,7 +36,9 @@ no polling.
 ## Workflow
 
 1. **Start:** call `bgrun` with the command (and a short `name`, e.g. `name: "unit-tests"`).
-   Note the returned job-id. Continue other
+   When the project's digest config defines `type` entries, also pass the
+   matching `type` (e.g. `type: "test"`) — like `name`, it helps the wake
+   select the right digest scorecard. Note the returned job-id. Continue other
    work; you will be woken automatically when the job finishes.
 2. **On wake:** check the exit status in the wake message first.
    - `exit: 0` → success. `bgtail` to confirm.
@@ -51,7 +53,8 @@ no polling.
 
 ### Reading results without flooding context
 
-If the wake message carries a `digest (project-config):` block, read that
+If the wake message carries a `digest (<label>):` block (the label is the
+entry's `label`, its type, or `project-config`), read that
 first — it is a short pass/fail scorecard configured for this project and
 usually answers "what failed" without any follow-up read. `bgtail` stays the
 positional-peek tool for everything else.
