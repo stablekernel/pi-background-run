@@ -64,6 +64,42 @@ export type ResolvedDigest =
   | { kind: "command"; command: string };
 
 /**
+ * Matchers selecting which jobs a digest entry applies to. Both are regex
+ * source strings tested against the bgrun job's `name` (optional) and command
+ * line respectively. An absent or empty `match` matches every job.
+ */
+export interface DigestMatch {
+  name?: string;
+  command?: string;
+}
+
+/**
+ * One scorecard entry in the `digest` config: an optional matcher, an optional
+ * wake label, and either a shipped preset id or a custom sh command. Config
+ * normalizes to an ordered list of these; the first entry that matches a job
+ * wins (put the default entry last).
+ */
+export interface DigestEntry {
+  match?: DigestMatch;
+  label?: string;
+  preset?: string;
+  command?: string;
+}
+
+/** The job a digest entry is selected against at wake time. */
+export interface DigestJobTarget {
+  name?: string;
+  command: string;
+}
+
+/** A digest entry resolved against a concrete job. */
+export interface SelectedDigest {
+  command: string;
+  label: string;
+}
+
+
+/**
  * Resolve a normalized digest config (from resolveConfig) into the command to
  * run. When both preset and command are configured, the preset wins — a
  * curated, shipped preset is preferred over a hand-rolled command pointing at
@@ -78,5 +114,56 @@ export function resolveDigest(
     if (preset) return { kind: "preset", command: preset.command };
   }
   if (digest.command) return { kind: "command", command: digest.command };
+  return undefined;
+}
+
+/**
+ * Does a digest entry apply to this job? No `match` (or an empty one) matches
+ * every job. A present `name`/`command` matcher must compile and test true;
+ * `name` against a job with no name never matches. When both fields are
+ * present both must match (AND). An uncompilable regex is treated as a
+ * non-match rather than throwing (config normalization already drops those,
+ * but the selector stays safe for direct callers).
+ */
+export function entryMatchesJob(
+  entry: DigestEntry,
+  target: DigestJobTarget,
+): boolean {
+  const match = entry.match;
+  if (!match) return true;
+  if (match.name === undefined && match.command === undefined) return true;
+  try {
+    if (match.name !== undefined) {
+      if (target.name === undefined) return false;
+      if (!new RegExp(match.name).test(target.name)) return false;
+    }
+    if (match.command !== undefined) {
+      if (!new RegExp(match.command).test(target.command)) return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Select the first digest entry that matches the job, in config order, and
+ * resolve it to a concrete command + wake label. Label precedence: entry
+ * `label` → matched `match.name` → "project-config" (the historical label for
+ * the single-object config). Returns undefined when no entry matches or the
+ * list is empty/unconfigured.
+ */
+export function selectDigestEntry(
+  entries: DigestEntry[] | undefined,
+  target: DigestJobTarget,
+): SelectedDigest | undefined {
+  if (!entries) return undefined;
+  for (const entry of entries) {
+    if (!entryMatchesJob(entry, target)) continue;
+    const resolved = resolveDigest(entry);
+    if (!resolved) continue;
+    const label = entry.label || entry.match?.name || "project-config";
+    return { command: resolved.command, label };
+  }
   return undefined;
 }

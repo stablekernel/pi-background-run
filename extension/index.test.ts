@@ -30,7 +30,9 @@ import { spawnSync } from "node:child_process";
 import {
   DIGEST_PRESETS,
   DIGEST_PRESET_IDS,
+  entryMatchesJob,
   resolveDigest,
+  selectDigestEntry,
 } from "./digestPresets.ts";
 
 interface CapturedWake {
@@ -1903,7 +1905,8 @@ test("resolveConfig: digest resolves from a trusted project config", async () =>
       cwd: proj,
       isProjectTrusted: () => true,
     });
-    assert.deepEqual(cfg.digest, { preset: "go-test" });
+    // The legacy object form normalizes to a single entry with no matchers.
+    assert.deepEqual(cfg.digest, [{ preset: "go-test" }]);
   } finally {
     delete process.env.PI_BGRUN_USER_CONFIG;
     rmSync(proj, { recursive: true, force: true });
@@ -1962,14 +1965,14 @@ test("resolveConfig: layering — project digest replaces user digest wholesale;
     });
     // No project digest → user digest stands.
     let cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
-    assert.deepEqual(cfg.digest, { command: 'grep . "$1" | head -5' });
+    assert.deepEqual(cfg.digest, [{ command: 'grep . "$1" | head -5' }]);
     // Project digest → replaces the user's digest object entirely (per-key
     // merge on the digest object is a later question; keep it simple now).
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: { preset: "jest" },
     });
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
-    assert.deepEqual(cfg.digest, { preset: "jest" });
+    assert.deepEqual(cfg.digest, [{ preset: "jest" }]);
   } finally {
     delete process.env.PI_BGRUN_USER_CONFIG;
     rmSync(home, { recursive: true, force: true });
@@ -1997,15 +2000,25 @@ test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort
       digest: { preset: "nonsense", command: 'grep x "$1" | head -3' },
     });
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
-    assert.deepEqual(cfg.digest, { command: 'grep x "$1" | head -3' });
+    assert.deepEqual(cfg.digest, [{ command: 'grep x "$1" | head -3' }]);
     // Whitespace-only command is not a command.
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: { command: "   " },
     });
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
     assert.equal(cfg.digest, undefined);
-    // digest section of the wrong shape (array / scalar) ignored.
+    // An array of non-entry scalars has no usable entries → undefined.
     writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: ["go-test"] });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+    // Empty array and all-invalid arrays normalize to undefined (the nudge
+    // checks `cfg.digest` truthiness).
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: [] });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ preset: "nonsense" }, { command: 42 }, { match: {} }],
+    });
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
     assert.equal(cfg.digest, undefined);
   } finally {
@@ -2036,6 +2049,138 @@ test("resolveDigest: preset wins over command; normalization shapes", () => {
   assert.equal(resolveDigest({ preset: "bogus" }), undefined);
   assert.equal(resolveDigest(undefined), undefined);
   assert.equal(resolveDigest({}), undefined);
+});
+
+// ── digest entry matching + selection (pure, multi-scorecard) ──────────────
+
+test("entryMatchesJob: absent/empty match, name, command, and AND semantics", () => {
+  const target = { name: "unit-tests", command: "go test ./..." };
+  // No matcher / empty matcher → matches every job.
+  assert.equal(entryMatchesJob({ preset: "go-test" }, target), true);
+  assert.equal(entryMatchesJob({ match: {}, preset: "go-test" }, target), true);
+  // Name regex.
+  assert.equal(
+    entryMatchesJob({ match: { name: "^unit-" }, preset: "go-test" }, target),
+    true,
+  );
+  assert.equal(
+    entryMatchesJob({ match: { name: "^e2e-" }, preset: "go-test" },
+      target),
+    false,
+  );
+  // A name matcher never matches a job that has no name.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit" }, preset: "go-test" },
+      { command: "go test" },
+    ),
+    false,
+  );
+  // Command regex.
+  assert.equal(
+    entryMatchesJob({ match: { command: "cargo build" }, preset: "go-test" },
+      target),
+    false,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { command: "go test" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  // Both present → AND.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit", command: "go test" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit", command: "cargo" }, preset: "go-test" },
+      target,
+    ),
+    false,
+  );
+  // Uncompilable regex → non-match, never throws.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "[" }, preset: "go-test" },
+      { command: "go test" },
+    ),
+    false,
+  );
+});
+
+test("selectDigestEntry: first match wins, default fallback, no match → undefined", () => {
+  const goTest = DIGEST_PRESETS.find((p) => p.id === "go-test")!;
+  const entries = [
+    { match: { name: "unit-tests" }, preset: "go-test" },
+    { match: { command: "cargo build" }, command: "echo build" },
+    { preset: "jest" },
+  ];
+  // First entry matches by name.
+  assert.deepEqual(
+    selectDigestEntry(entries, { name: "unit-tests", command: "go test" }),
+    { command: goTest.command, label: "unit-tests" },
+  );
+  // Second entry matches by command; no match.name → label falls back to the
+  // legacy "project-config" label.
+  assert.deepEqual(
+    selectDigestEntry(entries, { command: "cargo build --release" }),
+    { command: "echo build", label: "project-config" },
+  );
+  // Nothing matches the first two → the default entry (no match) wins.
+  assert.deepEqual(selectDigestEntry(entries, { command: "ls" }), {
+    command: DIGEST_PRESETS.find((p) => p.id === "jest")!.command,
+    label: "project-config",
+  });
+  // No default entry → undefined.
+  assert.equal(
+    selectDigestEntry([{ match: { name: "x" }, preset: "go-test" }], {
+      command: "ls",
+    }),
+    undefined,
+  );
+  // Unconfigured → undefined.
+  assert.equal(selectDigestEntry(undefined, { command: "ls" }), undefined);
+});
+
+test("selectDigestEntry: label precedence (label → match.name → project-config)", () => {
+  // Explicit label wins.
+  assert.deepEqual(
+    selectDigestEntry(
+      [{ match: { name: "unit" }, label: "unit", command: "echo hi" }],
+      { name: "unit", command: "go test" },
+    ),
+    { command: "echo hi", label: "unit" },
+  );
+  // No label → matched name.
+  assert.deepEqual(
+    selectDigestEntry([{ match: { name: "unit" }, command: "echo hi" }], {
+      name: "unit",
+      command: "go test",
+    }),
+    { command: "echo hi", label: "unit" },
+  );
+  // No label / no name matcher → project-config (legacy label).
+  assert.deepEqual(
+    selectDigestEntry([{ command: "echo hi" }], { command: "go test" }),
+    { command: "echo hi", label: "project-config" },
+  );
+  // First-match-wins ordering: a later entry that also matches is ignored.
+  assert.deepEqual(
+    selectDigestEntry(
+      [
+        { match: { name: "unit" }, label: "first", command: "echo first" },
+        { match: { name: "unit" }, label: "second", command: "echo second" },
+      ],
+      { name: "unit", command: "go test" },
+    ),
+    { command: "echo first", label: "first" },
+  );
 });
 
 // ── preset commands: scorecards against green and red fixture logs ─────────
@@ -2503,6 +2648,153 @@ test("wake digest: untrusted project → digest absent even when configured", as
       await waitForWakes(wakes, 1);
       assert.ok(!wakes[0].text.includes("digest (project-config)"), "no trust check → no digest");
     }
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+// ── wake digest: multiple scorecards with per-job matching ────────────────
+
+// Run one bgrun job against the shared digest env and return its wake text.
+async function runDigestJob(
+  proj: string,
+  params: { command: string; name?: string },
+  id = "call-multi",
+): Promise<string> {
+  const { pi, wakes, tools, ctx } = makeFakePi();
+  trustCtx(ctx, proj, true);
+  await loadExtension(pi);
+  const bgrun = tools.get("bgrun")!;
+  await bgrun.execute(id, params, undefined, undefined, ctx);
+  await waitForWakes(wakes, 1);
+  return wakes[0].text;
+}
+
+// First line of any `digest (<label>): <body>` block.
+function digestLineOf(wake: string): string | null {
+  const m = wake.match(/^digest \([^)]*\): .*$/m);
+  return m ? m[0] : null;
+}
+
+test("wake digest: match by job name chooses the matching entry", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { match: { name: "unit-tests" }, preset: "go-test" },
+        { label: "default", command: "echo default" },
+      ],
+    });
+    const wake = await runDigestJob(proj, {
+      name: "unit-tests",
+      command: "printf 'ok  \\texample.com/a\\t0.01s\\n'",
+    });
+    const line = digestLineOf(wake);
+    assert.ok(line, "wake carries a digest line");
+    assert.match(line!, /^digest \(unit-tests\):/, "label falls back to match.name");
+    assert.match(line!, /pass: 1  fail: 0/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: match by command line chooses the matching entry", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        {
+          match: { command: "cargo build" },
+          label: "build",
+          command: "echo build-ok",
+        },
+        { label: "default", command: "echo default" },
+      ],
+    });
+    const wake = await runDigestJob(proj, { command: "cargo build --release" });
+    const line = digestLineOf(wake);
+    assert.ok(line, "wake carries a digest line");
+    assert.match(line!, /^digest \(build\): build-ok$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: first match wins when two entries both match", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { label: "first", command: "echo first" },
+        { label: "second", command: "echo second" },
+      ],
+    });
+    const wake = await runDigestJob(proj, { command: "echo hi" });
+    assert.match(digestLineOf(wake)!, /^digest \(first\): first$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: default entry used when no matcher matches", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { match: { name: "e2e" }, command: "echo e2e" },
+        { label: "fallback", command: "echo fallback" },
+      ],
+    });
+    const wake = await runDigestJob(proj, {
+      name: "unit-tests",
+      command: "echo hi",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(fallback\): fallback$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: no entry matches and no default → no digest block", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ match: { name: "e2e" }, command: "echo e2e" }],
+    });
+    const wake = await runDigestJob(proj, {
+      name: "unit-tests",
+      command: "echo hi",
+    });
+    assert.equal(digestLineOf(wake), null);
+    assert.match(wake, /✅/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: invalid regex entry dropped, later valid entry used", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { match: { name: "[" }, label: "broken", command: "echo broken" },
+        { label: "ok", command: "echo ok" },
+      ],
+    });
+    const wake = await runDigestJob(proj, { command: "echo hi" });
+    assert.match(digestLineOf(wake)!, /^digest \(ok\): ok$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: empty array config produces no digest block", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: [] });
+    const wake = await runDigestJob(proj, { command: "echo hi" });
+    assert.equal(digestLineOf(wake), null);
+    assert.match(wake, /✅/);
   } finally {
     teardownDigestEnv(dir, proj, home);
   }

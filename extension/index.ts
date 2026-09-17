@@ -48,7 +48,12 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { DIGEST_PRESET_IDS, resolveDigest } from "./digestPresets.ts";
+import {
+  DIGEST_PRESET_IDS,
+  selectDigestEntry,
+  type DigestEntry,
+  type DigestMatch,
+} from "./digestPresets.ts";
 
 // Exit marker appended to every log so the file is self-describing: the exit
 // code survives pi restarting. `;` (not `&&`) ensures the printf runs even when
@@ -86,12 +91,17 @@ interface BgrunConfig {
   // keep every sweep session-scoped (then only `bgclean all` touches foreign
   // logs).
   globalAutoClean: boolean;
-  // Opt-in digest scorecard, resolved to a normalized { preset, command } (or
-  // undefined when unconfigured or fully invalid). Presets are shipped sh
-  // commands (see digestPresets.ts); command is a custom sh command receiving
-  // the job's log path as $1. Resolved from trusted project config only —
-  // never runs pattern matching unless the project opted in.
-  digest?: { preset?: string; command?: string };
+  // Opt-in digest scorecards, normalized to an ordered list of entries (or
+  // undefined when unconfigured or fully invalid — an empty array is normalized
+  // to undefined so the session_start nudge still sees "not configured"). The
+  // object form is normalized to a single entry with no matchers. Each entry
+  // carries an optional `match` (regexes against the job name / command line),
+  // an optional wake `label`, and a `preset` or custom `command`. At wake time
+  // the FIRST matching entry wins. Presets are shipped sh commands (see
+  // digestPresets.ts); command receives the job's log path as $1. Resolved from
+  // trusted project config only — never runs pattern matching unless the
+  // project opted in.
+  digest?: DigestEntry[];
 }
 
 interface BgrunConfigFile {
@@ -134,9 +144,103 @@ function warnDigestInvalid(field: string, value: unknown): void {
     field === "preset"
       ? ` — valid presets: ${DIGEST_PRESET_IDS.join(", ")}`
       : "";
+  // Point at the array form too: the same `digest` key accepts an ordered
+  // list of { match, label, preset, command } entries.
+  const shapeHint =
+    " — digest takes an object or an array of { match, label, preset, command } entries";
   console.error(
-    `[pi-bgrun] ignoring invalid digest.${field} in pi-bgrun.json: ${JSON.stringify(value)}${hint}`,
+    `[pi-bgrun] ignoring invalid digest.${field} in pi-bgrun.json: ${JSON.stringify(value)}${hint}${shapeHint}`,
   );
+}
+
+function isValidRegexSource(src: string): boolean {
+  try {
+    new RegExp(src);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Normalize one digest entry from the object-or-array config. Best-effort:
+// anything unusable is dropped (never throws). An entry without a usable
+// preset or command contributes nothing; a `match` regex that does not compile
+// drops the whole entry (the human gets the one-time warning).
+function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const entry = raw as {
+    match?: unknown;
+    label?: unknown;
+    preset?: unknown;
+    command?: unknown;
+  };
+
+  let match: DigestMatch | undefined;
+  if (entry.match !== undefined) {
+    if (
+      !entry.match ||
+      typeof entry.match !== "object" ||
+      Array.isArray(entry.match)
+    ) {
+      warnDigestInvalid("match", entry.match);
+      return undefined;
+    }
+    const rawMatch = entry.match as { name?: unknown; command?: unknown };
+    const normalized: DigestMatch = {};
+    if (rawMatch.name !== undefined) {
+      if (typeof rawMatch.name !== "string" || !isValidRegexSource(rawMatch.name)) {
+        warnDigestInvalid("match.name", rawMatch.name);
+        return undefined;
+      }
+      normalized.name = rawMatch.name;
+    }
+    if (rawMatch.command !== undefined) {
+      if (
+        typeof rawMatch.command !== "string" ||
+        !isValidRegexSource(rawMatch.command)
+      ) {
+        warnDigestInvalid("match.command", rawMatch.command);
+        return undefined;
+      }
+      normalized.command = rawMatch.command;
+    }
+    if (normalized.name !== undefined || normalized.command !== undefined) {
+      match = normalized;
+    }
+  }
+
+  let preset: string | undefined;
+  if (entry.preset !== undefined) {
+    if (
+      typeof entry.preset === "string" &&
+      DIGEST_PRESET_IDS.includes(entry.preset)
+    ) {
+      preset = entry.preset;
+    } else {
+      warnDigestInvalid("preset", entry.preset);
+    }
+  }
+
+  let command: string | undefined;
+  if (entry.command !== undefined) {
+    if (typeof entry.command === "string" && entry.command.trim()) {
+      command = entry.command;
+    } else {
+      warnDigestInvalid("command", entry.command);
+    }
+  }
+
+  // Neither preset nor command → nothing this entry can score. Drop it.
+  if (!preset && !command) return undefined;
+
+  const out: DigestEntry = {};
+  if (match) out.match = match;
+  if (typeof entry.label === "string" && entry.label.trim()) {
+    out.label = entry.label;
+  }
+  if (preset) out.preset = preset;
+  if (command) out.command = command;
+  return out;
 }
 
 // Resolved per call (cheap: at most two small file reads) so env/config
@@ -188,41 +292,22 @@ export function resolveConfig(ctx?: {
       : undefined;
   const envDays = Number(process.env.PI_BGRUN_CLEANUP_DAYS);
   const daysEnv = Number.isFinite(envDays) && envDays > 0 ? envDays : undefined;
-  // Digest section: normalize { preset, command }, dropping invalid values
-  // individually (warnDigestInvalid logs once for the first one). When both
-  // preset and command are valid, both are kept here — resolveDigest() gives
-  // the preset precedence.
+  // Digest section: accept either the legacy single-object form (normalized to
+  // one entry with no matchers) or an ordered array of entries. Invalid entries
+  // are dropped best-effort (warnDigestInvalid logs once for the first one).
+  // When both preset and command are valid within an entry, both are kept here
+  // — resolveDigest() gives the preset precedence. An empty array or an
+  // all-invalid array normalizes to undefined so `cfg.digest` truthiness still
+  // means "configured" (the session_start nudge relies on that).
   let digest: BgrunConfig["digest"];
-  if (
-    merged.digest &&
-    typeof merged.digest === "object" &&
-    !Array.isArray(merged.digest)
-  ) {
-    const digestFile = merged.digest as { preset?: unknown; command?: unknown };
-    let preset: string | undefined;
-    if (digestFile.preset !== undefined) {
-      if (
-        typeof digestFile.preset === "string" &&
-        DIGEST_PRESET_IDS.includes(digestFile.preset)
-      ) {
-        preset = digestFile.preset;
-      } else {
-        warnDigestInvalid("preset", digestFile.preset);
-      }
-    }
-    let command: string | undefined;
-    if (digestFile.command !== undefined) {
-      if (typeof digestFile.command === "string" && digestFile.command.trim()) {
-        command = digestFile.command;
-      } else {
-        warnDigestInvalid("command", digestFile.command);
-      }
-    }
-    if (preset || command) {
-      digest = {};
-      if (preset) digest.preset = preset;
-      if (command) digest.command = command;
-    }
+  if (Array.isArray(merged.digest)) {
+    const entries = merged.digest
+      .map((raw) => normalizeDigestEntry(raw))
+      .filter((e): e is DigestEntry => e !== undefined);
+    if (entries.length) digest = entries;
+  } else if (merged.digest && typeof merged.digest === "object") {
+    const entry = normalizeDigestEntry(merged.digest);
+    if (entry) digest = [entry];
   }
   return {
     jobsDir:
@@ -962,12 +1047,19 @@ export default function (pi: ExtensionAPI) {
         // attempt (≤ ~5s) completes; a digest that fails, times out, or prints
         // nothing appends nothing, and the exit code / universal part above are
         // never affected.
-        let digestBlock: string | undefined;
+        let digestBlock: { label: string; text: string } | undefined;
         try {
-          const digest = resolveDigest(resolveConfig(rec.ctx).digest);
-          if (digest) {
-            const raw = await runDigestCommand(digest.command, logPath);
-            digestBlock = raw !== undefined ? capDigestOutput(raw) : undefined;
+          // First matching entry wins, in config order. The label defaults to
+          // the entry's label, then a matched `match.name`, then the historical
+          // "project-config" for the legacy single-object config.
+          const selected = selectDigestEntry(resolveConfig(rec.ctx).digest, {
+            name: rec.name,
+            command: rec.cmd,
+          });
+          if (selected) {
+            const raw = await runDigestCommand(selected.command, logPath);
+            const text = raw === undefined ? undefined : capDigestOutput(raw);
+            if (text) digestBlock = { label: selected.label, text };
           }
         } catch (e) {
           // Silent-fail: a broken digest never breaks a wake (ground rule 3).
@@ -983,8 +1075,9 @@ export default function (pi: ExtensionAPI) {
         wake += `Command: ${command}\n`;
         wake += `Stats: ${statsParts.join(", ")}\n`;
         if (lastLine) wake += `Last output: ${lastLine}\n`;
-        if (digestBlock)
-          wake += `digest (project-config): ${digestBlock}\n`;
+        if (digestBlock) {
+          wake += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
+        }
         wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
         try {
           if (rec.ctx.isIdle()) {
