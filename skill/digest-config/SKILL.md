@@ -64,7 +64,10 @@ Selection (exactly one entry, or none):
 Shipped presets: `go-test` (package ok/FAIL counts + failing test names),
 `jest` (Tests/Test Suites summary + failed test names), `pytest` (final
 passed/failed/error summary line + FAILED test ids), `junit-xml`
-(`<failure>`/`<error>` counts + failing testcase names).
+(`<failure>`/`<error>` counts + failing testcase names). Each preset also
+carries a `suggestedType` (all `test`) — use it as the `type` when scaffolding
+an entry, e.g. `{ "type": "test", "preset": "go-test" }`. The suggestion is
+advisory; a preset entry with no `type` still applies to every job.
 
 ## Procedure
 
@@ -82,7 +85,9 @@ passed/failed/error summary line + FAILED test ids), `junit-xml`
 3. **Try a preset first, per type.** Run each shipped preset's command against
    a sample log (`sh -c '<preset command>' sh <logpath>`). Preset commands are
    data in the package's `extension/digestPresets.ts`. Clean scorecard on green
-   AND red samples → use that preset for that type. Repeat for each type.
+   AND red samples → use that preset for that type, seeding the entry's
+   `type` from the preset's `suggestedType` (all shipped presets suggest
+   `test`). Repeat for each type.
 4. **Draft custom commands** for types no preset fits. Use awk/sed/grep/jq; the
    command receives the log path as `$1` and MUST end in `head -N` so output is
    bounded. Keep it to a count line plus failed-item names.

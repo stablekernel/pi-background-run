@@ -154,12 +154,17 @@ Three ways, easiest first — pick the first one you're comfortable with:
    { "digest": { "preset": "go-test" } }
    ```
 
-   | Preset | What it summarizes |
-   | --- | --- |
-   | `go-test` | Go test output: package ok/FAIL counts + failing test names |
-   | `jest` | Jest output: Tests/Test Suites summary + failed test names |
-   | `pytest` | pytest output: final passed/failed/error summary line + FAILED test ids |
-   | `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names |
+   | Preset | What it summarizes | Suggested `type` |
+   | --- | --- | --- |
+   | `go-test` | Go test output: package ok/FAIL counts + failing test names | `test` |
+   | `jest` | Jest output: Tests/Test Suites summary + failed test names | `test` |
+   | `pytest` | pytest output: final passed/failed/error summary line + FAILED test ids | `test` |
+   | `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names | `test` |
+
+   All shipped presets are test runners, so they all suggest the conventional
+   type `test`. The suggestion is documentation, not behavior: you still write
+   the `type` on the entry yourself, and a preset entry with no `type` applies
+   to every job as before.
 
 3. **Custom command.** For formats the presets don't cover:
 

@@ -14,6 +14,14 @@ export interface DigestPreset {
   id: string;
   description: string;
   command: string;
+  /**
+   * Advisory only — the conventional job `type` this preset is meant for,
+   * used by docs and the digest-config skill when scaffolding a config
+   * (e.g. `{ "type": "test", "preset": "go-test" }`). It carries NO runtime
+   * semantics: a preset entry never selects itself by type; the project's
+   * config still declares the `type` on each entry.
+   */
+  suggestedType: string;
 }
 
 export const DIGEST_PRESETS: DigestPreset[] = [
@@ -21,6 +29,7 @@ export const DIGEST_PRESETS: DigestPreset[] = [
     id: "go-test",
     description:
       "Go test output: package ok/FAIL counts + failing test names",
+    suggestedType: "test",
     // Count `^ok `/`^FAIL` package lines, then list `--- FAIL: TestX` names
     // (duration suffix stripped). Ends in head.
     command:
@@ -29,6 +38,7 @@ export const DIGEST_PRESETS: DigestPreset[] = [
   {
     id: "jest",
     description: "Jest output: Tests/Test Suites summary + failed test names",
+    suggestedType: "test",
     // Jest prints `Tests:`/`Test Suites:` summary lines (with or without
     // color) and marks individual failures with `●` (default reporter) or
     // `✕`/`×` (verbose). Strip the leading bullet so names stay readable.
@@ -39,6 +49,7 @@ export const DIGEST_PRESETS: DigestPreset[] = [
     id: "pytest",
     description:
       "pytest output: final passed/failed/error summary line + FAILED test ids",
+    suggestedType: "test",
     // The short summary line looks like `===== 2 failed, 3 passed in 0.5s ===`;
     // with -rA/-rf each failure also gets a `FAILED tests/test_x.py::test_y` line.
     command:
@@ -48,6 +59,7 @@ export const DIGEST_PRESETS: DigestPreset[] = [
     id: "junit-xml",
     description:
       "JUnit XML: <failure>/<error> counts + failing testcase names",
+    suggestedType: "test",
     // Count failure/error elements (attributes like failures="0" don't match —
     // they lack the `<`), then pull the enclosing testcase's name attribute
     // (leading space in the regex avoids matching `classname="..."`).

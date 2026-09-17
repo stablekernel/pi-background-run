@@ -2506,6 +2506,25 @@ test("shipped presets: ids are stable and every command ends in head (bounded ou
   }
 });
 
+test("shipped presets: suggestedType is advisory metadata, not selection behavior", () => {
+  // Every preset suggests a type (all are test runners today) ...
+  for (const preset of DIGEST_PRESETS) {
+    assert.equal(
+      typeof preset.suggestedType,
+      "string",
+      `${preset.id} carries a suggestedType`,
+    );
+    assert.ok(preset.suggestedType.length > 0, `${preset.id} suggestion is non-empty`);
+  }
+  // ... but a preset entry with no `type` still selects every job (a job with
+  // no declared type included), so the suggestion never changes matching.
+  const selected = selectDigestEntry([{ preset: "go-test" }], {
+    command: "anything at all",
+  });
+  assert.ok(selected, "bare preset entry still matches a typeless job");
+  assert.equal(selected.label, "project-config");
+});
+
 // ── wake wiring: digest appended to the wake message (Phase 3) ─────────────
 
 // Isolated env for wake-wiring tests: temp jobsDir + a project dir with a
