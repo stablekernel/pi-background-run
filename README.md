@@ -249,4 +249,4 @@ not delete another session's artifacts.**
 
 ## Status
 
-Early / pre-release. See `.pi/wip/pi-port-plan.md` in the source tree for the design.
+Early / pre-release.
