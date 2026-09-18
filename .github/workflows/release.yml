@@ -14,6 +14,11 @@ on:
 
 permissions:
   contents: read
+  # The verify job reuses ci.yml, which requests pull-requests: write for the
+  # sticky PR report comment. A called workflow cannot request more permissions
+  # than its caller grants, so the caller must grant it here too — otherwise the
+  # whole release run dies as startup_failure.
+  pull-requests: write
 
 # Mutating workflow — do NOT cancel in progress.
 concurrency:

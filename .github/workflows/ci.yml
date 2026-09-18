@@ -11,9 +11,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
-# Least-privilege: read-only repo contents; no other scopes needed for lint+test.
+# Least-privilege: read-only repo contents + PR comments for the test report.
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   lint-test:
@@ -53,6 +54,46 @@ jobs:
           echo "$pack_output"
           file_count=$(echo "$pack_output" | grep -oP 'total files:\s*\K[0-9]+' || echo "?")
           echo "file_count=${file_count}" >> "$GITHUB_OUTPUT"
+
+      # Sticky PR comment: one report per PR, updated in place on every run
+      # (found via the hidden marker, so comments never stack up).
+      - name: PR report comment
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TSC_RESULT: ${{ steps.tsc.outcome }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          PACK_OUTCOME: ${{ steps.pack.outcome }}
+          PACK_FILES: ${{ steps.pack.outputs.file_count }}
+        run: |
+          marker="<!-- ci-report:v1 -->"
+          body_file=$(mktemp)
+          {
+            echo "$marker"
+            echo "## CI report"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| tsc --noEmit | ${TSC_RESULT} |"
+            echo "| tests | ${TESTS_OUTCOME} |"
+            echo "| npm pack --dry-run | ${PACK_OUTCOME} (${PACK_FILES} files in tarball) |"
+            echo ""
+            echo "Ref: \`${HEAD_SHA}\`"
+          } > "$body_file"
+
+          comment_id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.body | startswith("'"$marker"'")) | .id' | head -n1)
+
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" -F body=@"$body_file" >/dev/null
+            echo "Updated existing comment $comment_id"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F body=@"$body_file" >/dev/null
+            echo "Created new comment"
+          fi
 
       - name: Write run summary
         if: always()

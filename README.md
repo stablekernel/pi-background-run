@@ -33,7 +33,8 @@ Restart pi after install so the extension loads.
 | ------ | --------- |
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Jobs from other sessions are only listed when `adoptForeignJobs` is enabled. |
-| `bgtail` | Print the last N lines of a job's log (default 40), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. Pass `raw: true` to skip condensing. |
+| `bgtail` | Read the newest lines of a job's log (default 40), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
+| `bggrep` | Regex search over a job's log: line-numbered matches, optional `context` lines, capped (~50 matches, ~2KB/line, ~8KB) and condensed. Runs inside the extension, so it reaches **any** jobs dir — including global logs that project-sandboxed tools (`ctx_execute_file`) cannot. With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Pass `all: true` to sweep the whole shared jobs dir. Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
 
 ## Slash commands
@@ -85,11 +86,26 @@ exit code even after a restart.
 Two-tier read model — the log file stays complete on disk for deep analysis;
 only bounded digests ever enter the conversation:
 
-- **Quick peek:** `bgtail <id>` — condensed last-40-lines (ANSI stripped, repeats
-collapsed, ~8KB cap). The wake message itself already carries the exit code
-  and the log's last line, so many turns need no follow-up read at all.
-- **Whole-log analysis:** `ctx_execute_file` on the job's log path to extract
-  only failure lines. Never `cat` or `Read` a full bgrun log.
+- **Quick peek:** `bgtail <id>` — condensed newest lines (ANSI stripped, repeats
+  collapsed, ~2KB/line and ~8KB caps). The first read is the last-40-lines tail; each later
+  read returns only what was appended since, so repeated polling is nearly
+  free. The wake message itself already carries the exit code and the log's
+  last line, so many turns need no follow-up read at all.
+- **Pattern search:** `bggrep <id> [pattern] [context]` — line-numbered matches,
+  capped and condensed (~50 matches, ~2KB/line, ~8KB); works on global jobs dirs that `ctx_execute_file`
+  cannot reach. Pass your own pattern when you know the log's format.
+- **Whole-log analysis:** `ctx_execute_file` on the job's log path (reachable
+  when logs are project-local) to extract only failure lines. Never `cat` or
+  `Read` a full bgrun log.
+
+**Why `bggrep` instead of `bash grep` on the log?** A bash grep's output is
+uncapped — a retry-storm log can dump thousands of matching lines straight
+into context, and safety depends on remembering `| head` on every call.
+`bggrep` is bounded by design (~50 matches, ~2KB/line, ~8KB), takes the job id instead of
+a reconstructed log path (no shell-quoting of the regex), runs on any jobs
+dir — including global logs that project-sandboxed tools like
+`ctx_execute_file` cannot reach — and reports match counts, line numbers, and
+skip markers. Plain `grep` is fine only for a one-off search you know is tiny.
 
 ## Configuration
 
@@ -118,11 +134,41 @@ config file (trusted projects only) ← environment variables**.
 }
 ```
 
+### Project-local logs
+
+A **relative** `jobsDir` (from any config layer, or `PI_BGRUN_DIR`) opts into
+project-local logs: it resolves against the session's project root, so job logs
+land inside the workspace — e.g. `"jobsDir": ".pi-bgrun/jobs"` in the project
+config writes logs to `<project>/.pi-bgrun/jobs`.
+
+Why you might want this:
+
+- Logs sit inside the project sandbox, so project-confined analysis tools
+  (e.g. context-mode's `ctx_execute_file` / `ctx_index`) can process whole logs
+  without pulling raw bytes into the context window.
+- Each checkout/worktree gets its own logs — no cross-project clutter in the
+  shared dir.
+- The dir is auto-added to the repo's `.git/info/exclude` (local-only — the
+  tracked `.gitignore` is never touched), so logs never pollute `git status`.
+  Works in linked worktrees too (`.git` file → pointed git dir).
+
+Rules and migration notes:
+
+- Absolute `jobsDir` values behave exactly as in older versions — nothing
+  moves, nothing breaks on upgrade.
+- If the session cwd is not a recognizable project root (no `.git`/`.pi`), a
+  relative path falls back to the global dir rather than scattering logs
+  across arbitrary directories.
+- Tools resolve a job's log from the session's job record first, so jobs
+  started before a config change stay readable after it.
+- Existing logs in the old global dir are not migrated (they're ephemeral,
+  `cleanupDays`-retained); `bgclean all` sweeps them once you've switched.
+
 Environment variables (same knobs, handy for one-off overrides):
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `PI_BGRUN_DIR` | `~/.pi-bgrun/jobs` | Override where job logs are stored. |
+| `PI_BGRUN_DIR` | `~/.pi-bgrun/jobs` | Override where job logs are stored. An absolute path is used as-is; a **relative** path resolves against the project root (see [project-local logs](#project-local-logs)), falling back to the default when there is no project root. |
 | `PI_BGRUN_FOREIGN_JOBS` | `false` | Adopt other sessions' running jobs into this session's widget and job list. Adopted jobs are polled so they leave the widget when they finish. |
 | `PI_BGRUN_SHOW_COMPLETED` | `false` | Include finished jobs in `bgstatus` listings by default. |
 | `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |
