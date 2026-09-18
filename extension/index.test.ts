@@ -27,7 +27,6 @@ import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
   DIGEST_PRESETS,
   DIGEST_PRESET_IDS,
@@ -36,6 +35,11 @@ import {
   resolveDigest,
   selectDigestEntry,
 } from "./digestPresets.ts";
+import {
+  DIGEST_NUDGE_TEXT,
+  digestNudgeMarkerPath,
+  jobUsageMarkerPath,
+} from "./index.ts";
 
 interface CapturedWake {
   text: string;
@@ -117,16 +121,11 @@ function makeFakePi(
   };
 }
 
-// Captured so tests can assert the extension's exported values (e.g.
-// DIGEST_NUDGE_TEXT) instead of re-declaring copies.
-let indexModule: any;
-
 async function loadExtension(
   fakePi: any,
 ): Promise<Map<string, { execute: (...args: any[]) => Promise<any> }>> {
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod = await import(url);
-  indexModule = mod;
   mod.default(fakePi);
   return fakePi.tools as Map<
     string,
@@ -1658,6 +1657,17 @@ test("bgclean all: sweeps stale per-project digest markers, keeps fresh ones", a
       assert.ok(!existsSync(join(dir, name)), `stale marker swept: ${name}`);
     }
     assert.ok(existsSync(join(dir, freshMarker)), "fresh marker kept");
+
+    // A session-scoped sweep (no `all`) also drops stale markers: they are not
+    // session data, so the default bgclean still cleans them.
+    const stale2 = join(dir, ".digest-nudge-stale2");
+    fs.writeFileSync(stale2, "1");
+    fs.utimesSync(stale2, old, old);
+    await bgclean.execute("call-mk2", { days: 1 }, undefined, undefined, ctx);
+    assert.ok(
+      !existsSync(stale2),
+      "session-scoped sweep also drops stale markers",
+    );
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
@@ -3126,6 +3136,14 @@ test("selectDigestEntry: a glob match.name labels the wake with wildcards stripp
     }),
     { command: "echo hi", label: "command" },
   );
+  // Escapes are unwrapped; the now-literal `*` is kept.
+  assert.deepEqual(
+    selectDigestEntry([{ match: { name: "e2e-\\*" }, command: "echo hi" }], {
+      name: "e2e-*",
+      command: "go test",
+    }),
+    { command: "echo hi", label: "e2e-*" },
+  );
 });
 
 // ── type-first digest selection (job type declared at spawn) ──────────────
@@ -3283,6 +3301,21 @@ test("entryMatchesJob: glob is whole-string, case-insensitive, * and ? wildcards
       target,
     ),
     true,
+  );
+  // `\` escapes a wildcard so it matches literally.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit\\*tests" }, preset: "go-test" },
+      { name: "unit*tests", command: "go test" },
+    ),
+    true,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit\\*tests" }, preset: "go-test" },
+      { name: "unitXtests", command: "go test" },
+    ),
+    false,
   );
   // A non-matching pattern still fails.
   assert.equal(
@@ -3452,6 +3485,31 @@ test("preset junit-xml: green and red scorecards (real single-line pytest output
   // testsuite's own name, "pytest", instead of the failing test.
   assert.ok(!red.includes("pytest"), "testsuite name is not reported");
   assert.ok(!/^test_ok$/m.test(red), "passing testcase not listed");
+
+  // Pretty-printed XML (attributes on their own line) must work too.
+  const pretty = runPreset(
+    "junit-xml",
+    [
+      '<?xml version="1.0" encoding="utf-8"?>',
+      '<testsuites name="pytest tests">',
+      '  <testsuite name="pytest" tests="1" failures="1" errors="0">',
+      "    <testcase",
+      '      classname="tests.test_a"',
+      '      name="test_boom"',
+      '      time="0.001">',
+      '      <failure message="assert False">E   assert False</failure>',
+      "    </testcase>",
+      "  </testsuite>",
+      "</testsuites>",
+    ].join("\n"),
+  );
+  assert.match(pretty, /failures: 1 {2}errors: 0/);
+  assert.match(
+    pretty,
+    /^test_boom$/m,
+    "pretty-printed XML also names the failure",
+  );
+  assert.ok(!pretty.includes("pytest"), "no testsuite name leak");
 });
 
 test("shipped presets: ids are stable and every command ends in head (bounded output)", () => {
@@ -4230,30 +4288,13 @@ test("bgrun: no type → no type line in the started result", async () => {
 
 // ── digest nudge: one-shot session_start toast ────────────────────────────
 
-// Mirror of the exported jobUsageMarkerPath(): evidence-of-use is a per-project
-// marker written at spawn, not a scan of the shared jobs dir.
+// Real exported paths — no local mirror to drift from the implementation.
+const usageMarker = jobUsageMarkerPath;
+const nudgeMarker = digestNudgeMarkerPath;
+
 function writeUsageMarker(jobsDir: string, projectDir: string): void {
   mkdirSync(jobsDir, { recursive: true });
   writeFileSync(usageMarker(jobsDir, projectDir), "1");
-}
-
-function usageMarker(jobsDir: string, projectDir: string): string {
-  const key = createHash("sha256")
-    .update(projectDir)
-    .digest("hex")
-    .slice(0, 16);
-  return join(jobsDir, `.bgrun-used-${key}`);
-}
-
-// Mirror of the exported digestNudgeMarkerPath(): the nudge marker is keyed by
-// project dir so one project's nudge does not silence every other project that
-// shares the jobs dir.
-function nudgeMarker(jobsDir: string, projectDir: string): string {
-  const key = createHash("sha256")
-    .update(projectDir)
-    .digest("hex")
-    .slice(0, 16);
-  return join(jobsDir, `.digest-nudge-${key}`);
 }
 
 function captureNotify(ctx: any): string[] {
@@ -4275,7 +4316,7 @@ test("digest nudge: fires on session_start (trusted, no digest, usage marker set
     await loadExtension(pi);
     await fireSessionStart();
 
-    assert.deepEqual(messages, [indexModule.DIGEST_NUDGE_TEXT]);
+    assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
     assert.ok(existsSync(nudgeMarker(dir, proj)), "marker file created");
   } finally {
     teardownDigestEnv(dir, proj, home);
@@ -4388,7 +4429,7 @@ test("digest nudge: marker is per-project — a second project sharing the jobs 
       const messages = captureNotify(ctx);
       await loadExtension(pi);
       await fireSessionStart();
-      assert.deepEqual(messages, [indexModule.DIGEST_NUDGE_TEXT]);
+      assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
       assert.ok(existsSync(nudgeMarker(dir, proj)), "project 1 marker written");
     }
 
@@ -4401,7 +4442,7 @@ test("digest nudge: marker is per-project — a second project sharing the jobs 
       await fireSessionStart();
       assert.deepEqual(
         messages,
-        [indexModule.DIGEST_NUDGE_TEXT],
+        [DIGEST_NUDGE_TEXT],
         "each project gets its own one-shot nudge",
       );
       assert.ok(

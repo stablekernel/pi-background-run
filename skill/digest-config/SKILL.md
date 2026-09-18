@@ -56,7 +56,7 @@ Selection (exactly one entry, or none):
 - `match.name` / `match.command` are **globs** tested against the job's
   `name` and command line; both present → both must match. They are
   **case-insensitive and whole-string** (`*` any run, `?` one character;
-  write `*text*` for a substring).
+  write `*text*` for a substring; `\` escapes the next character).
 - An entry with no `match` (or an empty `match`) matches every job — put it
   **last** as the default. Include one so jobs you did not anticipate still
   get a scorecard.

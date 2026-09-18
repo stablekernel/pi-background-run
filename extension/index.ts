@@ -256,12 +256,12 @@ function appendExcludePattern(
 // Digest config validation: invalid values are dropped from the resolved
 // config (best-effort — a malformed digest section must never break a wake or
 // the whole config), but the human gets one console.error per distinct invalid
-// field (capped) so typos are discoverable without flooding the log.
+// field so typos are discoverable without flooding the log. The field set is a
+// fixed, code-defined list (preset / command / match / type / ...), so the
+// dedupe set is naturally bounded.
 const digestWarned = new Set<string>();
-const DIGEST_WARN_CAP = 5;
 function warnDigestInvalid(field: string, value: unknown): void {
   if (digestWarned.has(field)) return;
-  if (digestWarned.size >= DIGEST_WARN_CAP) return;
   digestWarned.add(field);
   const hint =
     field === "preset"
@@ -283,10 +283,11 @@ function projectHash(projectDir: string): string {
 }
 
 /**
- * Per-project "this project has run a bgrun job" marker in the jobs dir.
- * Written (best-effort) at spawn and read at session_start by the digest nudge
- * — so evidence of use stays project-scoped even when the jobs dir is the
- * shared machine-global one.
+ * Per-project "this project has run a bgrun job" marker in the jobs dir,
+ * keyed by the session's project directory (cwd) — the same key
+ * resolveJobsDirPath uses. Written (best-effort) at spawn and read at
+ * session_start by the digest nudge, so evidence of use stays project-scoped
+ * even when the jobs dir is the shared machine-global one.
  */
 export function jobUsageMarkerPath(
   jobsDir: string,
@@ -335,8 +336,8 @@ function normalizeType(raw: unknown): string | undefined {
 
 // Normalize one digest entry from the object-or-array config. Best-effort:
 // anything unusable is dropped (never throws). An entry without a usable
-// preset or command contributes nothing; a `match` regex that does not compile
-// drops the whole entry (the human gets the one-time warning).
+// preset or command contributes nothing; a non-string `match` field drops the
+// whole entry (the human gets the one-time warning).
 function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const entry = raw as {
@@ -679,39 +680,28 @@ export default function (pi: ExtensionAPI) {
     }
     try {
       const buf = Buffer.alloc(64 * 1024);
-      // Keep the last ≤256 bytes so the wrapper's appended exit marker (and any
-      // blank separator it introduces) can be excluded from the count.
-      const tail = Buffer.alloc(256);
-      let tailLen = 0;
-      let count = 0;
-      let lastByte = -1;
+      let newlines = 0;
+      let size = 0;
       let bytesRead = 0;
       do {
         bytesRead = readSync(fd, buf, 0, buf.length, null);
+        if (bytesRead <= 0) break;
+        size += bytesRead;
         for (let i = 0; i < bytesRead; i++) {
-          if (buf[i] === 0x0a) count++;
-        }
-        if (bytesRead > 0) {
-          if (bytesRead >= tail.length) {
-            buf.copy(tail, 0, bytesRead - tail.length, bytesRead);
-            tailLen = tail.length;
-          } else {
-            const combined = tailLen + bytesRead;
-            if (combined > tail.length) {
-              tail.copy(tail, 0, combined - tail.length, tailLen);
-              tailLen = tail.length - bytesRead;
-            }
-            buf.copy(tail, tailLen, 0, bytesRead);
-            tailLen += bytesRead;
-          }
-          lastByte = buf[bytesRead - 1];
+          if (buf[i] === 0x0a) newlines++;
         }
       } while (bytesRead === buf.length);
-      if (lastByte !== -1 && lastByte !== 0x0a) count++; // final unterminated line
+      if (size === 0) return 0;
+      // One bounded pread of the tail for the final-byte + exit-marker check.
+      const tailLen = Math.min(size, 512);
+      const tail = Buffer.alloc(tailLen);
+      readSync(fd, tail, 0, tailLen, size - tailLen);
+      const tailText = tail.toString("latin1");
+      const endsWithNewline = tailText.charCodeAt(tailText.length - 1) === 0x0a;
+      let count = newlines + (endsWithNewline ? 0 : 1);
       // The wrapper appends "\n<EXIT_MARKER><ec>\n" — those newlines are not
       // command output. Drop the marker line, plus the blank separator when the
       // output already ended in a newline.
-      const tailText = tail.subarray(0, tailLen).toString("latin1");
       const markerAt = tailText.lastIndexOf("\n" + EXIT_MARKER);
       if (markerAt !== -1) {
         let extra = 0;
@@ -778,6 +768,33 @@ export default function (pi: ExtensionAPI) {
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
 
+  // Sweep stale per-project digest markers (.bgrun-used-*, .digest-nudge-*).
+  // They aren't session-scoped, so they'd otherwise accumulate one per project
+  // forever; a project that runs bgrun again re-writes its usage marker at
+  // spawn, so removing a stale one can at most re-enable one future nudge.
+  function sweepStaleMarkers(jobsDir: string, cutoff: number): void {
+    let names: string[];
+    try {
+      names = readdirSync(jobsDir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (
+        !name.startsWith(".bgrun-used-") &&
+        !name.startsWith(".digest-nudge-")
+      )
+        continue;
+      try {
+        const markerPath = join(jobsDir, name);
+        if (statSync(markerPath).mtimeMs > cutoff) continue;
+        unlinkSync(markerPath);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   function cleanOldJobs(
     days: number,
     jobsDir: string,
@@ -830,24 +847,7 @@ export default function (pi: ExtensionAPI) {
         // ignore
       }
     }
-    // Per-project digest markers (.bgrun-used-*, .digest-nudge-*) are not
-    // session-scoped, so they'd otherwise accumulate one-per-project forever.
-    // Sweep the ones whose project has been quiet past the retention window;
-    // a project that runs bgrun again re-writes its usage marker at spawn.
-    for (const name of entries) {
-      if (
-        !name.startsWith(".bgrun-used-") &&
-        !name.startsWith(".digest-nudge-")
-      )
-        continue;
-      const markerPath = join(jobsDir, name);
-      try {
-        if (statSync(markerPath).mtimeMs > cutoff) continue;
-        unlinkSync(markerPath);
-      } catch {
-        // ignore
-      }
-    }
+    sweepStaleMarkers(jobsDir, cutoff);
     if (result.removed > 0 && ctx?.hasUI) {
       ctx.ui.notify(`bgrun: cleaned ${result.removed} old job log(s)`, "info");
     }
@@ -887,6 +887,9 @@ export default function (pi: ExtensionAPI) {
         // ignore
       }
     }
+    // Markers aren't session data, so a session-scoped sweep may still drop
+    // stale ones from this jobs dir.
+    sweepStaleMarkers(resolveConfig(ctx).jobsDir, cutoff);
     if (result.removed > 0 && ctx?.hasUI) {
       ctx.ui.notify(`bgrun: cleaned ${result.removed} old job log(s)`, "info");
     }
@@ -1360,12 +1363,17 @@ export default function (pi: ExtensionAPI) {
             // job's type/name plus the configured types, once per distinct
             // diagnostic (capped), so a type mismatch or dead glob is visible.
             const warning = digestNoMatchWarning(digestTarget, digestEntries);
-            if (
-              !digestNoMatchWarned.has(warning) &&
-              digestNoMatchWarned.size < DIGEST_NO_MATCH_WARN_CAP
-            ) {
-              digestNoMatchWarned.add(warning);
-              console.error(warning);
+            if (!digestNoMatchWarned.has(warning)) {
+              if (digestNoMatchWarned.size < DIGEST_NO_MATCH_WARN_CAP) {
+                digestNoMatchWarned.add(warning);
+                console.error(warning);
+              } else if (!digestNoMatchSuppressed) {
+                // Don't silently drop further distinct mismatches.
+                digestNoMatchSuppressed = true;
+                console.error(
+                  `[pi-bgrun] further digest no-match diagnostics suppressed (cap ${DIGEST_NO_MATCH_WARN_CAP})`,
+                );
+              }
             }
           }
         } catch (e) {
@@ -1497,9 +1505,13 @@ export default function (pi: ExtensionAPI) {
         if (stdout.length > DIGEST_TOTAL_CAP) return;
         stdout += chunk.toString();
       });
-      // Kill the whole process group (see `detached` above), falling back to
-      // the child handle if the group is already gone.
+      // Kill the whole process group (see `detached` above). Process groups
+      // are POSIX-only; the `child.kill` fallback covers platforms where the
+      // negative-pid kill fails. `childExited` guards against signalling a
+      // group whose pid may already have been recycled after the child exits.
+      let childExited = false;
       const killGroup = (signal: NodeJS.Signals) => {
+        if (childExited) return;
         const pid = child.pid;
         try {
           if (pid === undefined) throw new Error("no pid");
@@ -1527,10 +1539,12 @@ export default function (pi: ExtensionAPI) {
         if (graceTimer) clearTimeout(graceTimer);
       };
       child.on("error", () => {
+        childExited = true;
         stopTimers();
         finish(undefined);
       });
       child.on("exit", (code) => {
+        childExited = true;
         stopTimers();
         // Contract: a digest that ERRORS contributes nothing. Gate on the exit
         // code so partial output from a failed command never reaches the wake.
@@ -1563,6 +1577,7 @@ export default function (pi: ExtensionAPI) {
   // No-match diagnostics seen this process (capped) — keyed by the full
   // warning string so a type mismatch and a dead regex each surface once.
   const digestNoMatchWarned = new Set<string>();
+  let digestNoMatchSuppressed = false;
   const DIGEST_NO_MATCH_WARN_CAP = 3;
 
   // ── Digest nudge: one-shot session_start toast for digest-less projects ────

@@ -61,10 +61,11 @@ export const DIGEST_PRESETS: DigestPreset[] = [
   // Count failure/error elements (attributes like failures="0" don't match —
   // they lack the `<`), then pull the enclosing testcase's name attribute.
   // Real pytest --junitxml emits the whole document on ONE line, so the scan
-  // is record-based (`RS='<testcase'`, not line-based) and matches ` name="`
-  // with a leading space so it never picks up `classname="..."`.
+  // is record-based (`RS='<testcase'`, not line-based); it trims each record at
+  // `</testcase>` and matches `[[:space:]]name="` so it never picks up
+  // `classname="..."` nor a `<failure` from text after the element.
   command:
-   "printf 'failures: %s  errors: %s\\n' \"$(grep -o '<failure' \"$1\" | wc -l | tr -d ' ')\" \"$(grep -o '<error' \"$1\" | wc -l | tr -d ' ')\"; awk -v RS='<testcase' 'NR>1 { if (match($0, / name=\"[^\"]*\"/)) { name=substr($0, RSTART+7, RLENGTH-8); if ($0 ~ /<failure|<error/) print name } }' \"$1\" | sort -u | head -10",
+   "printf 'failures: %s  errors: %s\\n' \"$(grep -o '<failure' \"$1\" | wc -l | tr -d ' ')\" \"$(grep -o '<error' \"$1\" | wc -l | tr -d ' ')\"; awk -v RS='<testcase' 'NR>1 { r=$0; e=index(r,\"</testcase>\"); if (e) r=substr(r,1,e-1); if (match(r,/[[:space:]]name=\"[^\"]*\"/)) { n=substr(r,RSTART+7,RLENGTH-8); if (r ~ /<failure|<error/) print n } }' \"$1\" | sort -u | head -10",
  },
 ];
 
@@ -73,10 +74,11 @@ export const DIGEST_PRESET_IDS = DIGEST_PRESETS.map((p) => p.id);
 /**
  * Matchers selecting which jobs a digest entry applies to. Both are glob
  * patterns tested against the bgrun job's `name` (optional) and command line
- * respectively. `*` matches any run of characters (including none), `?`
- * matches exactly one; everything else is literal. Matching is
- * case-insensitive and **whole-string** (write `*text*` for a substring). An
- * absent, empty, or blank `match` matches every job.
+ * respectively. `*` matches any run of characters (including none) and `?`
+ * matches exactly one UTF-16 code unit; everything else is literal, and `\`
+ * escapes the next character so `\*` / `\?` / `\\` match literally. Matching
+ * is case-insensitive and **whole-string** (write `*text*` for a substring).
+ * An absent, empty, or blank `match` matches every job.
  */
 export interface DigestMatch {
  name?: string;
@@ -150,13 +152,26 @@ export function resolveDigest(
  */
 function globMatches(pattern: string, text: string): boolean {
  let re = "^";
- for (const ch of pattern) {
-  if (ch === "*") re += "[\\s\\S]*";
-  else if (ch === "?") re += "[\\s\\S]";
-  else re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+ for (let i = 0; i < pattern.length; i++) {
+  const ch = pattern[i];
+  // `\` escapes the next character, so `\*` / `\?` / `\\` match literally.
+  if (ch === "\\" && i + 1 < pattern.length) {
+   re += escapeRegexChar(pattern[++i]);
+  } else if (ch === "*") {
+   re += "[\\s\\S]*";
+  } else if (ch === "?") {
+   re += "[\\s\\S]";
+  } else {
+   re += escapeRegexChar(ch);
+  }
  }
  re += "$";
  return new RegExp(re, "i").test(text);
+}
+
+/** Escape one literal character for a RegExp, so it can never be a metacharacter. */
+function escapeRegexChar(ch: string): string {
+ return ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
@@ -191,9 +206,19 @@ function defaultDigestLabel(entry: DigestEntry): string {
  return entry.preset ?? "command";
 }
 
-/** Wake label derived from a glob pattern: drop the wildcards. */
+/**
+ * Wake label derived from a glob pattern: drop the (unescaped) wildcards,
+ * unwrap escapes, so `*cargo*` → `cargo` and `e2e-\*` → `e2e-*`.
+ */
 function labelFromMatchName(pattern: string): string {
- return pattern.replace(/[*?]/g, "").trim();
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "\\" && i + 1 < pattern.length) out += pattern[++i];
+    else if (ch === "*" || ch === "?") continue;
+    else out += ch;
+  }
+  return out.trim();
 }
 
 /**

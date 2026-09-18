@@ -35,7 +35,7 @@ Restart pi after install so the extension loads.
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Jobs from other sessions are only listed when `adoptForeignJobs` is enabled. |
 | `bgtail` | Read the newest lines of a job's log (default 40), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
 | `bggrep` | Regex search over a job's log: line-numbered matches, optional `context` lines, capped (~50 matches, ~2KB/line, ~8KB) and condensed. Runs inside the extension, so it reaches **any** jobs dir — including global logs that project-sandboxed tools (`ctx_execute_file`) cannot. With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
-| `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Pass `all: true` to sweep the whole shared jobs dir; that also sweeps stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`). Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
+| `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Cleanup also sweeps stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`). Pass `all: true` to sweep the whole shared jobs dir. Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
 
 ## Slash commands
 
@@ -176,9 +176,10 @@ Environment variables (same knobs, handy for one-off overrides):
 
 ### Digest scorecard (opt-in)
 
-Wake messages always lead with universal facts — exit code, duration, log line
-count. A project can additionally opt into a **digest scorecard**: a one-line
-pass/fail summary extracted from the log and appended to the wake.
+Wake messages always lead with universal facts — exit code, duration, and the
+command's own log line count (the internal exit marker is excluded). A project
+can additionally opt into a **digest scorecard**: a one-line pass/fail summary
+extracted from the log and appended to the wake.
 
 #### Job identity: name, type, command
 
@@ -208,8 +209,8 @@ Three ways, easiest first — pick the first one you're comfortable with:
    result on both a green and a red log, and writes the config. It sees your
    actual output format, which is exactly what a good digest depends on —
    and you never have to read a log yourself. The one-shot toast some
-   projects see on session start ("no digest configured") is pointing at
-   this same skill.
+   projects see on session start ("no digest configured") — once per project
+   that has run a bgrun job — is pointing at this same skill.
 2. **One-line preset if you know your stack.** Create
    `<project>/.pi/pi-bgrun.json` (or merge into an existing one):
 
@@ -310,8 +311,9 @@ a scorecard.
 - `match.name` and `match.command` are **globs** tested against the job's
   `name` and command line. Both present → both must match. Matching is
   **case-insensitive and whole-string** — `*` matches any run, `?` exactly one
-  character, everything else is literal — so `"*unit*"` matches
-  `"unit-tests-run3"` while a bare `"unit-tests"` matches only exactly that.
+  character, everything else is literal, and `\` escapes the next character
+  (`\*` is a literal star) — so `"*unit*"` matches `"unit-tests-run3"` while a
+  bare `"unit-tests"` matches only exactly that.
 - `label` sets the wake tag: `digest (<label>): …`. Precedence: `label` →
   (type entry) the type string → (matched glob entry) `match.name` → the
   entry's preset id (else `command`). So a bare `{ "preset": "go-test" }`
