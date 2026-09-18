@@ -65,7 +65,7 @@ export const DIGEST_PRESETS: DigestPreset[] = [
   // `</testcase>` and matches `[[:space:]]name="` so it never picks up
   // `classname="..."` nor a `<failure` from text after the element.
   command:
-   "printf 'failures: %s  errors: %s\\n' \"$(grep -o '<failure' \"$1\" | wc -l | tr -d ' ')\" \"$(grep -o '<error' \"$1\" | wc -l | tr -d ' ')\"; awk -v RS='<testcase' 'NR>1 { r=$0; e=index(r,\"</testcase>\"); if (e) r=substr(r,1,e-1); if (match(r,/[[:space:]]name=\"[^\"]*\"/)) { n=substr(r,RSTART+7,RLENGTH-8); if (r ~ /<failure|<error/) print n } }' \"$1\" | sort -u | head -10",
+   'printf \'failures: %s  errors: %s\\n\' "$(grep -o \'<failure\' "$1" | wc -l | tr -d \' \')" "$(grep -o \'<error\' "$1" | wc -l | tr -d \' \')"; awk -v RS=\'<testcase\' \'NR>1 { r=$0; e=index(r,"</testcase>"); if (e) r=substr(r,1,e-1); if (match(r,/[[:space:]]name="[^"]*"/)) { n=substr(r,RSTART+7,RLENGTH-8); if (r ~ /<failure|<error/) print n } }\' "$1" | sort -u | head -10',
  },
 ];
 
@@ -211,14 +211,14 @@ function defaultDigestLabel(entry: DigestEntry): string {
  * unwrap escapes, so `*cargo*` → `cargo` and `e2e-\*` → `e2e-*`.
  */
 function labelFromMatchName(pattern: string): string {
-  let out = "";
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i];
-    if (ch === "\\" && i + 1 < pattern.length) out += pattern[++i];
-    else if (ch === "*" || ch === "?") continue;
-    else out += ch;
-  }
-  return out.trim();
+ let out = "";
+ for (let i = 0; i < pattern.length; i++) {
+  const ch = pattern[i];
+  if (ch === "\\" && i + 1 < pattern.length) out += pattern[++i];
+  else if (ch === "*" || ch === "?") continue;
+  else out += ch;
+ }
+ return out.trim();
 }
 
 /**
