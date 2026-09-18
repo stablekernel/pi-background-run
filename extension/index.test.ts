@@ -59,6 +59,12 @@ process.on("exit", () => {
 const TEST_GLOBAL_JOBS_DIR = mkTmp("pi-bgrun-global-");
 process.env.PI_BGRUN_GLOBAL_DIR = TEST_GLOBAL_JOBS_DIR;
 
+// Isolate the user config too: a real ~/.pi/agent/pi-bgrun.json could carry
+// adoptForeignJobs / digest / globalAutoClean settings that change results.
+// Tests that need their own user config override this and restore it here.
+const TEST_USER_CONFIG = join(TEST_TMP_ROOT, "no-user-config.json");
+process.env.PI_BGRUN_USER_CONFIG = TEST_USER_CONFIG;
+
 // Drop every artifact a test created in the machine-global dir without
 // unsetting the env var (globalJobsDir() resolves it per call). Keeps
 // `.last-clean` and stray logs from leaking across tests.
@@ -2055,6 +2061,29 @@ test("resolveJobsDirPath: a symlinked home is still recognized as the home dir",
   }
 });
 
+test("resolveJobsDirPath: a cwd reached via a symlink to the home dir is still not project-local", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const home = mkTmp("pi-bgrun-home-");
+  const linkParent = mkTmp("pi-bgrun-link-");
+  try {
+    mkdirSync(join(home, ".pi"), { recursive: true });
+    const link = join(linkParent, "home-link");
+    symlinkSync(home, link);
+    // home is passed as the REAL home; only the cwd is symlinked.
+    const r = mod.resolveJobsDirPath(undefined, {
+      cwd: join(link, "scratch"),
+      home,
+    });
+    assert.equal(r.dir, TEST_GLOBAL_JOBS_DIR);
+    assert.equal(r.projectLocal, false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(linkParent, { recursive: true, force: true });
+  }
+});
+
 test("resolveJobsDirPath: expands a leading ~ to the home dir (not project-local)", async () => {
   const mod = await import(
     pathToFileURL(join(process.cwd(), "extension/index.ts")).href
@@ -2347,6 +2376,57 @@ test("bgclean all: adds git-exclusion for an existing local jobs dir even with n
   }
 });
 
+test("bgclean all: never writes .git/info/exclude into the repo holding the global dir", async () => {
+  const proj = mkTmp("pi-bgrun-proj-");
+  const globalRepo = mkTmp("pi-bgrun-global-repo-");
+  delete process.env.PI_BGRUN_DIR;
+  const savedGlobal = process.env.PI_BGRUN_GLOBAL_DIR;
+  const fs = await import("node:fs");
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    mkdirSync(join(proj, ".pi-bgrun", "jobs"), { recursive: true });
+    // The global jobs dir sits inside its own git repo, like $HOME under a
+    // dotfiles repo — the sweep must not edit THAT repo's exclude file.
+    mkdirSync(join(globalRepo, ".git"), { recursive: true });
+    const globalJobs = join(globalRepo, ".pi-bgrun", "jobs");
+    mkdirSync(globalJobs, { recursive: true });
+    process.env.PI_BGRUN_GLOBAL_DIR = globalJobs;
+    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const log = join(globalJobs, "foreign-old-1000000000-999992.log");
+    fs.writeFileSync(log, "global\n__BGRUN_EXIT__=0\n");
+    fs.utimesSync(log, oldTime, oldTime);
+
+    const { pi, tools, ctx } = makeFakePi({
+      ctxFields: { cwd: proj, isProjectTrusted: () => true },
+    });
+    await loadExtension(pi);
+    const bgclean = tools.get("bgclean")!;
+    await bgclean.execute(
+      "call-global-exclude",
+      { days: 7, all: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.ok(!fs.existsSync(log), "old global log swept");
+    assert.ok(
+      !existsSync(join(globalRepo, ".git", "info", "exclude")),
+      "the global dir's repo must not get a jobs-dir exclude",
+    );
+    const exclude = join(proj, ".git", "info", "exclude");
+    assert.ok(existsSync(exclude), "project-local dir is still excluded");
+    assert.match(readFileSync(exclude, "utf8"), /^\.pi-bgrun\/jobs\/$/m);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    if (savedGlobal === undefined) delete process.env.PI_BGRUN_GLOBAL_DIR;
+    else process.env.PI_BGRUN_GLOBAL_DIR = savedGlobal;
+    rmSync(proj, { recursive: true, force: true });
+    rmSync(globalRepo, { recursive: true, force: true });
+    resetGlobalJobsDir();
+  }
+});
+
 test("bgclean all: an EPERM pid reads as alive, so an unfinished old log is kept", async () => {
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
@@ -2386,21 +2466,22 @@ test("bgclean all: an EPERM pid reads as alive, so an unfinished old log is kept
   }
 });
 
-test("bgclean all: project-local dir aliasing the global dir is cleaned once, not double-counted", async () => {
+test("bgclean all: project-local dir aliasing the global dir is visited once, not double-counted", async () => {
   const proj = mkTmp("pi-bgrun-proj-");
   delete process.env.PI_BGRUN_DIR;
   const savedGlobal = process.env.PI_BGRUN_GLOBAL_DIR;
+  const fs = await import("node:fs");
   try {
     mkdirSync(join(proj, ".git"), { recursive: true });
     const projJobs = join(proj, ".pi-bgrun", "jobs");
     mkdirSync(projJobs, { recursive: true });
     // Point the machine-global dir at the same physical dir as the project's.
     process.env.PI_BGRUN_GLOBAL_DIR = projJobs;
-    const fs = await import("node:fs");
-    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const log = join(projJobs, "alias-old-1000000000-999994.log");
+    // A FRESH log: the first pass would KEEP it, so with dedup the dir is
+    // visited once (kept === 1) and without dedup twice (kept === 2). An old
+    // log would be removed on the first pass and mask the double-visit.
+    const log = join(projJobs, "alias-fresh-1000000000-999994.log");
     fs.writeFileSync(log, "alias\n__BGRUN_EXIT__=0\n");
-    fs.utimesSync(log, oldTime, oldTime);
 
     const { pi, tools, ctx } = makeFakePi({
       ctxFields: { cwd: proj, isProjectTrusted: () => true },
@@ -2414,8 +2495,48 @@ test("bgclean all: project-local dir aliasing the global dir is cleaned once, no
       undefined,
       ctx,
     );
-    assert.ok(!fs.existsSync(log), "aliased old log removed");
-    assert.equal(result.details.removed, 1, "removed exactly once");
+    assert.ok(fs.existsSync(log), "fresh aliased log kept");
+    assert.equal(result.details.kept, 1, "dir visited exactly once");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    if (savedGlobal === undefined) delete process.env.PI_BGRUN_GLOBAL_DIR;
+    else process.env.PI_BGRUN_GLOBAL_DIR = savedGlobal;
+    rmSync(proj, { recursive: true, force: true });
+    resetGlobalJobsDir();
+  }
+});
+
+test("bgclean all: a symlinked global dir aliasing the project dir is visited once", async () => {
+  const proj = mkTmp("pi-bgrun-proj-");
+  delete process.env.PI_BGRUN_DIR;
+  const savedGlobal = process.env.PI_BGRUN_GLOBAL_DIR;
+  const fs = await import("node:fs");
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    const projJobs = join(proj, ".pi-bgrun", "jobs");
+    mkdirSync(projJobs, { recursive: true });
+    // The global dir is a SYMLINK to the project's jobs dir. String equality
+    // would miss this, so this exercises the safeRealpath dedup branch.
+    const alias = join(proj, "global-alias");
+    symlinkSync(projJobs, alias, "dir");
+    process.env.PI_BGRUN_GLOBAL_DIR = alias;
+    const log = join(projJobs, "alias-symlink-fresh-1000000000-999993.log");
+    fs.writeFileSync(log, "alias\n__BGRUN_EXIT__=0\n");
+
+    const { pi, tools, ctx } = makeFakePi({
+      ctxFields: { cwd: proj, isProjectTrusted: () => true },
+    });
+    await loadExtension(pi);
+    const bgclean = tools.get("bgclean")!;
+    const result = await bgclean.execute(
+      "call-alias-link",
+      { days: 7, all: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(fs.existsSync(log), "fresh aliased log kept");
+    assert.equal(result.details.kept, 1, "symlinked dir visited exactly once");
   } finally {
     delete process.env.PI_BGRUN_DIR;
     if (savedGlobal === undefined) delete process.env.PI_BGRUN_GLOBAL_DIR;
@@ -3341,7 +3462,7 @@ test("resolveConfig: digest resolves from a trusted project config", async () =>
     // The legacy object form normalizes to a single entry with no matchers.
     assert.deepEqual(cfg.digest, [{ preset: "go-test" }]);
   } finally {
-    delete process.env.PI_BGRUN_USER_CONFIG;
+    process.env.PI_BGRUN_USER_CONFIG = TEST_USER_CONFIG;
     rmSync(proj, { recursive: true, force: true });
   }
 });
@@ -3357,7 +3478,7 @@ test("resolveConfig: digest absent everywhere → undefined", async () => {
     const cfg = mod.resolveConfig({});
     assert.equal(cfg.digest, undefined);
   } finally {
-    delete process.env.PI_BGRUN_USER_CONFIG;
+    process.env.PI_BGRUN_USER_CONFIG = TEST_USER_CONFIG;
   }
 });
 
@@ -3381,7 +3502,7 @@ test("resolveConfig: untrusted project → no digest even when the project confi
       undefined,
     );
   } finally {
-    delete process.env.PI_BGRUN_USER_CONFIG;
+    process.env.PI_BGRUN_USER_CONFIG = TEST_USER_CONFIG;
     rmSync(proj, { recursive: true, force: true });
   }
 });
@@ -3430,7 +3551,7 @@ test("resolveConfig: layering — project digest replaces user digest wholesale;
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
     assert.deepEqual(cfg.digest, [{ preset: "jest" }]);
   } finally {
-    delete process.env.PI_BGRUN_USER_CONFIG;
+    process.env.PI_BGRUN_USER_CONFIG = TEST_USER_CONFIG;
     rmSync(home, { recursive: true, force: true });
     rmSync(proj, { recursive: true, force: true });
   }
@@ -3488,7 +3609,7 @@ test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
     assert.equal(cfg.digest, undefined);
   } finally {
-    delete process.env.PI_BGRUN_USER_CONFIG;
+    process.env.PI_BGRUN_USER_CONFIG = TEST_USER_CONFIG;
     rmSync(proj, { recursive: true, force: true });
   }
 });
@@ -3519,7 +3640,7 @@ test("resolveConfig: digest label is trimmed and capped at 60", async () => {
       { command: "echo c" },
     ]);
   } finally {
-    delete process.env.PI_BGRUN_USER_CONFIG;
+    process.env.PI_BGRUN_USER_CONFIG = TEST_USER_CONFIG;
     rmSync(proj, { recursive: true, force: true });
   }
 });
@@ -3558,7 +3679,7 @@ test("resolveConfig: digest type normalized; invalid type drops entry; match kep
       { command: "echo default" },
     ]);
   } finally {
-    delete process.env.PI_BGRUN_USER_CONFIG;
+    process.env.PI_BGRUN_USER_CONFIG = TEST_USER_CONFIG;
     rmSync(proj, { recursive: true, force: true });
   }
 });
@@ -4183,7 +4304,7 @@ function setupDigestEnv(): { dir: string; proj: string; home: string } {
 
 function teardownDigestEnv(dir: string, proj: string, home: string): void {
   delete process.env.PI_BGRUN_DIR;
-  delete process.env.PI_BGRUN_USER_CONFIG;
+  process.env.PI_BGRUN_USER_CONFIG = TEST_USER_CONFIG;
   rmSync(dir, { recursive: true, force: true });
   rmSync(proj, { recursive: true, force: true });
   rmSync(home, { recursive: true, force: true });

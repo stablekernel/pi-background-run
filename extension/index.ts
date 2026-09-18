@@ -1009,7 +1009,12 @@ export default function (pi: ExtensionAPI) {
     cleanSessionJobs(cfg.cleanupDays, ctx);
     if (!cfg.globalAutoClean) return;
     for (const dir of sharedJobsDirs(cfg.jobsDir, cfg.jobsDirProjectLocal)) {
-      if (cfg.jobsDirProjectLocal && !trusted && dir === cfg.jobsDir) continue;
+      if (
+        cfg.jobsDirProjectLocal &&
+        !trusted &&
+        safeRealpath(dir) === safeRealpath(cfg.jobsDir)
+      )
+        continue;
       const markerPath = join(dir, ".last-clean");
       try {
         const last = Number(readFileSync(markerPath, "utf8").trim());
@@ -1934,8 +1939,8 @@ export default function (pi: ExtensionAPI) {
   //
   // The sandboxed whole-log path (ctx_execute_file) is confined to the
   // project root, which a global jobs dir sits outside of — bggrep runs
-  // inside the extension with native fs access, so it works on any
-  // configured jobs dir. Matches are line-numbered (grep -n style),
+  // inside the extension with native fs access, so it reaches the configured
+  // jobs dir (including a global one). Matches are line-numbered (grep -n style),
   // optionally with context lines, capped at MAX_GREP_MATCHES, and run
   // through the same condenser as bgtail so a search can never flood context.
 
@@ -2046,7 +2051,7 @@ export default function (pi: ExtensionAPI) {
     name: "bggrep",
     label: "Grep Background Log",
     description:
-      "Search a background job's log with a regex; returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Runs inside the extension, so it works on any jobs dir — including global logs that project-sandboxed tools (ctx_execute_file) cannot reach. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+      "Search a background job's log with a regex; returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Runs inside the extension, so it reaches the configured jobs dir (including a global one) that project-sandboxed tools (ctx_execute_file) cannot reach. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
     promptSnippet: "Search a bgrun job's log for a pattern",
     promptGuidelines: [
       "Never search a bgrun log with the bash tool — uncapped output can flood context, and it needs manual log-path reconstruction and regex shell-quoting; bggrep is bounded by design.",
@@ -2140,9 +2145,10 @@ export default function (pi: ExtensionAPI) {
       }
     }
     // List: this session's jobs (running by default; finished only when
-    // includeDone / showCompletedJobs is set), plus — when opted in — other
-    // sessions' jobs from the shared jobs dir. Hidden disk logs get a
-    // one-line count instead of spamming the listing.
+    // includeDone / showCompletedJobs is set). Other sessions' RUNNING jobs
+    // appear only when adoptForeignJobs is opted in; finished foreign logs
+    // from the shared dir can also appear when finished jobs are included.
+    // Hidden disk logs get a one-line count instead of spamming the listing.
     const showDone = params.includeDone ?? cfg.showCompletedJobs;
     revalidateStaleJobs();
     updateWidget(ctx);
@@ -2206,7 +2212,8 @@ export default function (pi: ExtensionAPI) {
     description:
       "Show status of background jobs. With an id: one job's state + exit code. Without: list this session's " +
       "running jobs (finished jobs are hidden by default — pass includeDone or set showCompletedJobs to list " +
-      "them; other sessions' jobs are only listed when adoptForeignJobs is enabled).",
+      "them). Other sessions' running jobs are listed only when adoptForeignJobs is enabled; finished foreign " +
+      "logs from the shared dir can also appear when finished jobs are included.",
     promptSnippet: "Check status of bgrun jobs",
     parameters: Type.Object({
       id: Type.Optional(
@@ -2256,7 +2263,11 @@ export default function (pi: ExtensionAPI) {
         // would dirty git status in a repo with no jobs (and mutate an
         // untrusted repo). Only refresh the marker when the dir already exists.
         if (!existsSync(dir)) continue;
-        if (cfg.jobsDirProjectLocal) ensureGitExcluded(dir);
+        // Only the project-local dir may be git-excluded. The shared global
+        // dir must NOT be excluded in whatever repo happens to contain it
+        // (e.g. $HOME being a dotfiles repo).
+        if (cfg.jobsDirProjectLocal && dir === cfg.jobsDir)
+          ensureGitExcluded(dir);
         try {
           writeFileSync(join(dir, ".last-clean"), String(Date.now()));
         } catch {
