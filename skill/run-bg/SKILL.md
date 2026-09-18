@@ -67,7 +67,7 @@ positional-peek tool for everything else.
 
   ```javascript
   ctx_execute_file(
-    path: "~/.pi-bgrun/jobs/<JOB>.log",
+    path: "<project>/.pi-bgrun/jobs/<JOB>.log",
     language: "javascript",
     code: "const L=FILE_CONTENT.split('\\n'); \
            const fails=L.filter(l=>/(--- FAIL|FAIL|panic:|Error:)/.test(l)); \
@@ -110,14 +110,15 @@ Plain `grep` via bash is fine only for a one-off search you know is tiny.
 
 - Call the tools; never hand-roll `nohup … &` inline.
 - One job = one id. Multiple concurrent jobs are fine — each has its own log.
-- Logs live in `~/.pi-bgrun/jobs` (override with `PI_BGRUN_DIR`). A **relative**
-  `jobsDir` in the project config (e.g. `.pi-bgrun/jobs`) puts logs inside the
-  project — auto-ignored via `.git/info/exclude` — which keeps them reachable
-  for project-sandboxed analysis tools like `ctx_execute_file`.
+- Logs default to `<project>/.pi-bgrun/jobs` in a repo (else `~/.pi-bgrun/jobs`;
+  override with `PI_BGRUN_DIR` or `jobsDir`). Project-local dirs are
+  auto-ignored via `.git/info/exclude`, which keeps them reachable for
+  project-sandboxed analysis tools like `ctx_execute_file`.
 - Cleanup: `bgclean` removes only THIS session's old logs; `bgclean all`
   sweeps every session's. Auto-sweeps at session start/shutdown are
-  session-scoped plus a global orphan pass (default on — removes finished
-  week-old logs from crashed/abandoned sessions; disable with
+  session-scoped plus an orphan pass over the machine-global `~/.pi-bgrun/jobs`
+  and the current project's jobs dir (default on — removes finished week-old
+  logs from crashed/abandoned sessions; disable with
   `globalAutoClean: false` / `PI_BGRUN_GLOBAL_AUTO_CLEAN=0`). Retention is
   `cleanupDays` (default 7, configurable).
 - To stop a running job, use `bash` with `kill <pid>` (the pid is in the `bgstatus`

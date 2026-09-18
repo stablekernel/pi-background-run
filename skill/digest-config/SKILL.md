@@ -76,10 +76,11 @@ advisory; a preset entry with no `type` still applies to every job.
 
 ## Procedure
 
-1. **Find done-job logs.** Locate the project's jobsDir: `bgstatus` shows it,
-   or it comes from the config layering (project-local `jobsDir`, global
-   `~/.pi-bgrun/jobs`, or `PI_BGRUN_DIR`). List the `*.log` files of finished
-   jobs.
+1. **Find done-job logs.** Locate the project's jobsDir: `bgstatus` shows it.
+   In a project root it defaults to `<project>/.pi-bgrun/jobs`; otherwise to
+   the machine-global `~/.pi-bgrun/jobs`. An explicit `jobsDir` (any config
+   layer) or `PI_BGRUN_DIR` overrides it; `PI_BGRUN_GLOBAL_DIR` retargets the
+   machine-global base. List the `*.log` files of finished jobs.
 2. **Sample the formats across job types.** Group the logs by job type using
    each job's `name` and command line (from `bgstatus`); most projects have at
    least a test job and a build job. Pick 2-3 logs per type — at least one

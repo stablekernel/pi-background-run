@@ -24,7 +24,7 @@ import {
   readdirSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import {
@@ -40,6 +40,11 @@ import {
   digestNudgeMarkerPath,
   jobUsageMarkerPath,
 } from "./index.ts";
+
+// Isolate the machine-global jobs dir for the whole file so tests never read
+// from or delete the real ~/.pi-bgrun/jobs. globalJobsDir() reads this per call.
+const TEST_GLOBAL_JOBS_DIR = mkdtempSync(join(tmpdir(), "pi-bgrun-global-"));
+process.env.PI_BGRUN_GLOBAL_DIR = TEST_GLOBAL_JOBS_DIR;
 
 interface CapturedWake {
   text: string;
@@ -1867,18 +1872,132 @@ test("resolveJobsDirPath: relative resolves against a project root; absolute and
     assert.equal(rel.dir, join(proj, ".pi-bgrun", "jobs"));
     assert.equal(rel.projectLocal, true);
 
-    // unset → global default
+    // unset + project root → project-local default
     const none = mod.resolveJobsDirPath(undefined, { cwd: proj });
-    assert.equal(none.dir, join(homedir(), ".pi-bgrun", "jobs"));
-    assert.equal(none.projectLocal, false);
+    assert.equal(none.dir, join(proj, ".pi-bgrun", "jobs"));
+    assert.equal(none.projectLocal, true);
+
+    // unset + cwd that is not a project → global fallback
+    const noProj = mod.resolveJobsDirPath(undefined, { cwd: scratch });
+    assert.equal(noProj.dir, TEST_GLOBAL_JOBS_DIR);
+    assert.equal(noProj.projectLocal, false);
 
     // relative + cwd that is not a project → global fallback, never cwd-relative
     const fb = mod.resolveJobsDirPath(".pi-bgrun/jobs", { cwd: scratch });
-    assert.equal(fb.dir, join(homedir(), ".pi-bgrun", "jobs"));
+    assert.equal(fb.dir, TEST_GLOBAL_JOBS_DIR);
     assert.equal(fb.projectLocal, false);
   } finally {
     rmSync(proj, { recursive: true, force: true });
     rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("resolveJobsDirPath: finds an enclosing project root from a subdirectory; .pi counts; worktree .git file counts", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  const piOnly = mkdtempSync(join(tmpdir(), "pi-bgrun-pionly-"));
+  const worktree = mkdtempSync(join(tmpdir(), "pi-bgrun-wt-"));
+  try {
+    // .git dir at the root; session cwd is a nested subdirectory
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    const sub = join(proj, "packages", "foo");
+    mkdirSync(sub, { recursive: true });
+    const nested = mod.resolveJobsDirPath(undefined, { cwd: sub });
+    assert.equal(nested.dir, join(proj, ".pi-bgrun", "jobs"));
+    assert.equal(nested.projectLocal, true);
+
+    // a RELATIVE override resolves against the enclosing root too
+    const nestedRel = mod.resolveJobsDirPath("var/logs", { cwd: sub });
+    assert.equal(nestedRel.dir, join(proj, "var", "logs"));
+    assert.equal(nestedRel.projectLocal, true);
+
+    // a project detected by .pi alone (no .git) still defaults locally
+    mkdirSync(join(piOnly, ".pi"), { recursive: true });
+    const piDetected = mod.resolveJobsDirPath(undefined, { cwd: piOnly });
+    assert.equal(piDetected.dir, join(piOnly, ".pi-bgrun", "jobs"));
+    assert.equal(piDetected.projectLocal, true);
+
+    // linked worktree: .git is a FILE pointing at the real git dir
+    writeFileSync(join(worktree, ".git"), "gitdir: /tmp/elsewhere\n");
+    const wt = mod.resolveJobsDirPath(undefined, { cwd: worktree });
+    assert.equal(wt.dir, join(worktree, ".pi-bgrun", "jobs"));
+    assert.equal(wt.projectLocal, true);
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    rmSync(piOnly, { recursive: true, force: true });
+    rmSync(worktree, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: falls back to the machine-global jobs dir when cwd is not a project root", async () => {
+  const scratch = mkdtempSync(join(tmpdir(), "pi-bgrun-scratch-"));
+  delete process.env.PI_BGRUN_DIR;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi({
+      ctxFields: { cwd: scratch },
+    });
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    const res = await bgrun.execute(
+      "call-globalfb",
+      { command: "echo global-fallback" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    assert.ok(id, "got a job id");
+    await waitForWakes(wakes, 1);
+
+    const logPath = join(TEST_GLOBAL_JOBS_DIR, `${id}.log`);
+    assert.ok(existsSync(logPath), "log written to the machine-global dir");
+    assert.match(readFileSync(logPath, "utf8"), /global-fallback/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("bgclean all: sweeps BOTH the current project dir and the machine-global dir", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  delete process.env.PI_BGRUN_FOREIGN_JOBS;
+  try {
+    const fs = await import("node:fs");
+    const backdate = (path: string) => {
+      const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      fs.utimesSync(path, oldTime, oldTime);
+    };
+    const projLog = join(dir, "proj-old-1000000000-99990.log");
+    fs.writeFileSync(projLog, "proj\n__BGRUN_EXIT__=0\n");
+    backdate(projLog);
+    const globalLog = join(
+      TEST_GLOBAL_JOBS_DIR,
+      "global-old-1000000000-99991.log",
+    );
+    fs.writeFileSync(globalLog, "global\n__BGRUN_EXIT__=0\n");
+    backdate(globalLog);
+
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgclean = tools.get("bgclean")!;
+    const result = await bgclean.execute(
+      "call-bgclean-both",
+      { days: 7, all: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!fs.existsSync(projLog), "project-dir old log removed");
+    assert.ok(!fs.existsSync(globalLog), "machine-global old log removed");
+    assert.ok(result.details.removed >= 2, "both removals counted");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -1962,6 +2081,45 @@ test("ensureGitExcluded: retries after a transient failure — memoizes only on 
     assert.match(exclude, /^\.pi-bgrun\/jobs\/$/m);
   } finally {
     rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: defaults to project-local logs in a project with no jobsDir override", async () => {
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  delete process.env.PI_BGRUN_DIR;
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    const { pi, wakes, tools, ctx } = makeFakePi({
+      ctxFields: { cwd: proj },
+    });
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    const res = await bgrun.execute(
+      "call-def1",
+      { command: "echo default-local" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    assert.ok(id, "got a job id");
+    await waitForWakes(wakes, 1);
+
+    const logPath = join(proj, ".pi-bgrun", "jobs", `${id}.log`);
+    assert.ok(existsSync(logPath), "log written inside the project by default");
+    assert.match(readFileSync(logPath, "utf8"), /default-local/);
+
+    const exclude = join(proj, ".git", "info", "exclude");
+    assert.ok(
+      existsSync(exclude),
+      "exclude file created for default local dir",
+    );
+    assert.match(readFileSync(exclude, "utf8"), /^\.pi-bgrun\/jobs\/$/m);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(proj, { recursive: true, force: true });
   }
 });
 
@@ -4452,6 +4610,31 @@ test("digest nudge: marker is per-project — a second project sharing the jobs 
     }
   } finally {
     rmSync(proj2, { recursive: true, force: true });
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: keys the usage marker by project root, so any cwd in the checkout counts", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    // A real project root plus a nested cwd inside it.
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    const sub = join(proj, "packages", "foo");
+    mkdirSync(sub, { recursive: true });
+    writeUsageMarker(dir, proj); // evidence was written at the project root
+
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, sub, true); // session started in the subdirectory
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
+    assert.ok(
+      existsSync(nudgeMarker(dir, proj)),
+      "nudge marker keyed by the project root, not the raw cwd",
+    );
+  } finally {
     teardownDigestEnv(dir, proj, home);
   }
 });

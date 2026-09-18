@@ -66,7 +66,17 @@ const EXIT_MARKER = "__BGRUN_EXIT__=";
 
 const DEFAULT_CLEANUP_DAYS = 7;
 const STALE_POLL_MS = 30_000; // re-check interval for jobs with no live child handle
-const GLOBAL_JOBS_DIR = join(homedir(), ".pi-bgrun", "jobs");
+/** Default jobs dir inside a recognizable project root (`.git` or `.pi`). */
+const PROJECT_LOCAL_JOBS_REL = ".pi-bgrun/jobs";
+
+// Machine-global jobs dir. Resolved per call (not a module constant) so
+// PI_BGRUN_GLOBAL_DIR can redirect it — used by tests to stay off the real
+// ~/.pi-bgrun, and available for setups with a custom home or shared scratch.
+function globalJobsDir(): string {
+  return (
+    process.env.PI_BGRUN_GLOBAL_DIR || join(homedir(), ".pi-bgrun", "jobs")
+  );
+}
 
 // Default regex for bggrep when the caller passes no pattern: common failure
 // signatures across test runners and build tools. ONLY a convenience default —
@@ -86,9 +96,10 @@ export const DEFAULT_GREP_PATTERN =
 
 interface BgrunConfig {
   jobsDir: string;
-  // True when jobsDir came from a RELATIVE path resolved against the project
-  // root (project-local logs). Only then does bgrun auto-ignore the dir in
-  // .git/info/exclude — an absolute dir is the user's explicit choice.
+  // True when jobsDir resolves inside the project root (the default in a
+  // recognizable project, or an explicit RELATIVE path). Only then does bgrun
+  // auto-ignore the dir in .git/info/exclude — an absolute dir is the user's
+  // explicit choice.
   jobsDirProjectLocal: boolean;
   // Adopt other sessions' running jobs (found in the shared jobs dir) into
   // this session's widget and job list. Default false — most sessions don't
@@ -99,9 +110,11 @@ interface BgrunConfig {
   showCompletedJobs: boolean;
   // Log retention for cleanup (auto-sweeps and the bgclean default).
   cleanupDays: number;
-  // Auto-sweep the WHOLE shared jobs dir at session boundaries for orphans —
+  // Auto-sweep the shared jobs dirs at session boundaries for orphans —
   // finished (exit marker or dead pid) logs older than cleanupDays from
-  // sessions that crashed or are never resumed again. Running jobs are always
+  // sessions that crashed or are never resumed again. Both the machine-global
+  // dir and the current project's dir are swept (see sharedJobsDirs), so
+  // pre-project-local logs are still reclaimed. Running jobs are always
   // pid-protected. Throttled to once per cleanupDays via a .last-clean marker.
   // Default true — without it, orphaned logs accumulate forever. Set false to
   // keep every sweep session-scoped (then only `bgclean all` touches foreign
@@ -150,15 +163,15 @@ function readConfigFile(path: string): BgrunConfigFile {
 
 // ── Project-local jobs dir ──────────────────────────────────────────────────
 //
-// A RELATIVE `jobsDir` (from any config layer, or PI_BGRUN_DIR) opts into
-// project-local logs: it resolves against the session's project root, so logs
-// land inside the workspace. That keeps them within the project sandbox —
-// analysis tools confined to the project root (e.g. context-mode's
-// ctx_execute_file/ctx_index) can then process whole logs without flooding
-// context. Absolute paths behave exactly as in older versions
-// (migration-safe), and with no recognizable project root a relative path
-// falls back to the global dir instead of scattering logs across whatever
-// directory pi happened to start in.
+// By default, when the session cwd is inside a recognizable project root
+// (`.git` or `.pi`), logs land at `<project>/.pi-bgrun/jobs`. The root is found
+// by walking up from the cwd, so a session started in a subdirectory still
+// resolves project-locally. With no project root the default falls back to the
+// machine-global `~/.pi-bgrun/jobs`. An explicit RELATIVE `jobsDir` (from any
+// config layer, or PI_BGRUN_DIR) resolves the same way; an absolute path is
+// used as-is (migration-safe). Project-local logs stay inside the workspace
+// sandbox so analysis tools confined to the project root (e.g. context-mode's
+// ctx_execute_file/ctx_index) can process whole logs without flooding context.
 
 function isProjectRootLike(dir: string): boolean {
   // Cheap heuristic: a directory holding .git or pi's config dir is a project.
@@ -167,17 +180,42 @@ function isProjectRootLike(dir: string): boolean {
   );
 }
 
+// Nearest ancestor of `start` (inclusive) that looks like a project root.
+function findProjectRoot(start: string): string | undefined {
+  let cur = start;
+  for (;;) {
+    if (isProjectRootLike(cur)) return cur;
+    const parent = dirname(cur);
+    if (parent === cur) return undefined; // filesystem root — no project above
+    cur = parent;
+  }
+}
+
+// Project/worktree root for identity keys — the enclosing project root when
+// there is one, else the directory itself (so a non-project cwd still gets a
+// stable key). Matches the root resolveJobsDirPath uses for project-local
+// logs, so two cwds in the same checkout share one digest-nudge key.
+function projectRootFor(dir: string): string {
+  return findProjectRoot(dir) ?? dir;
+}
+
 export function resolveJobsDirPath(
   raw: string | undefined,
   ctx?: { cwd?: string },
 ): { dir: string; projectLocal: boolean } {
-  if (!raw) return { dir: GLOBAL_JOBS_DIR, projectLocal: false };
-  if (isAbsolute(raw)) return { dir: raw, projectLocal: false };
-  const root = ctx?.cwd ?? process.cwd();
-  if (!root || !isProjectRootLike(root)) {
-    return { dir: GLOBAL_JOBS_DIR, projectLocal: false };
+  // Absolute paths are the user's explicit choice: used as-is, never flagged
+  // project-local, and no ancestor walk needed.
+  if (raw && isAbsolute(raw)) return { dir: raw, projectLocal: false };
+  const cwd = ctx?.cwd ?? process.cwd();
+  const root = cwd ? findProjectRoot(cwd) : undefined;
+  if (!raw) {
+    return root
+      ? { dir: join(root, PROJECT_LOCAL_JOBS_REL), projectLocal: true }
+      : { dir: globalJobsDir(), projectLocal: false };
   }
-  return { dir: join(root, raw), projectLocal: true };
+  return root
+    ? { dir: join(root, raw), projectLocal: true }
+    : { dir: globalJobsDir(), projectLocal: false };
 }
 
 // Auto-ignore a project-local jobs dir in git so logs never pollute
@@ -284,10 +322,11 @@ function projectHash(projectDir: string): string {
 
 /**
  * Per-project "this project has run a bgrun job" marker in the jobs dir,
- * keyed by the session's project directory (cwd) — the same key
- * resolveJobsDirPath uses. Written (best-effort) at spawn and read at
- * session_start by the digest nudge, so evidence of use stays project-scoped
- * even when the jobs dir is the shared machine-global one.
+ * keyed by the project/worktree root (the enclosing root found by walking up
+ * from cwd, falling back to cwd itself). Written (best-effort) at spawn and
+ * read at session_start by the digest nudge, so evidence of use stays
+ * project-scoped even when the jobs dir is shared (an absolute/global
+ * `jobsDir`); project-local dirs get the same per-project key harmlessly.
  */
 export function jobUsageMarkerPath(
   jobsDir: string,
@@ -297,10 +336,12 @@ export function jobUsageMarkerPath(
 }
 
 /**
- * Per-project marker path for the one-shot digest nudge. The jobs dir is
- * shared machine-wide, so a bare `.digest-nudge-done` marker would silence the
- * nudge for every other project after the first to earn it. Key the marker by
- * the project directory so each project gets its own one-shot.
+ * Per-project marker path for the one-shot digest nudge. When the jobs dir is
+ * shared (an absolute/global `jobsDir`), a bare `.digest-nudge-done` marker
+ * would silence the nudge for every other project after the first to earn it;
+ * keying by the project/worktree root gives each project its own one-shot.
+ * Under the project-local default the dir is already per-project, so the key
+ * is redundant but harmless.
  */
 export function digestNudgeMarkerPath(
   jobsDir: string,
@@ -896,39 +937,54 @@ export default function (pi: ExtensionAPI) {
     return result;
   }
 
+  // Every shared jobs dir the orphan sweep should touch: the machine-global
+  // default (so logs written before project-local became the default, and logs
+  // from checkouts never revisited, still get reclaimed) plus the current
+  // project's dir when it is a different location.
+  function sharedJobsDirs(projectDir: string): string[] {
+    const global = globalJobsDir();
+    return projectDir === global ? [global] : [global, projectDir];
+  }
+
   // Auto-clean at session boundaries. Two parts:
   //  1. Session-scoped sweep — this session's old logs only; cheap,
   //     unthrottled.
-  //  2. Global orphan sweep (default on; disable via globalAutoClean: false /
-  //     PI_BGRUN_GLOBAL_AUTO_CLEAN=0) — the whole shared jobs dir, removing
-  //     FINISHED logs (exit marker, or dead pid) older than cleanupDays. This
-  //     is what keeps orphans from crashed / never-resumed sessions from
-  //     accumulating: a week-old finished log is garbage under the same
-  //     retention the owning session would apply itself, and running jobs are
-  //     always pid-protected. Throttled to one sweep per cleanupDays via a
-  //     .last-clean marker so restart-heavy workflows don't re-sweep on every
-  //     launch.
+  //  2. Orphan sweep (default on; disable via globalAutoClean: false /
+  //     PI_BGRUN_GLOBAL_AUTO_CLEAN=0) — every shared jobs dir (see
+  //     sharedJobsDirs), removing FINISHED logs (exit marker, or dead pid)
+  //     older than cleanupDays. This is what keeps orphans from crashed /
+  //     never-resumed sessions from accumulating: a week-old finished log is
+  //     garbage under the same retention the owning session would apply
+  //     itself, and running jobs are always pid-protected. Throttled to one
+  //     sweep per cleanupDays via a .last-clean marker in each dir so
+  //     restart-heavy workflows don't re-sweep on every launch.
   function autoCleanJobs(ctx: ExtensionContext): void {
     const cfg = resolveConfig(ctx);
+    // Make sure a project-local jobs dir is git-ignored even when no bgrun has
+    // run yet this session (the dir is created below for the .last-clean
+    // marker).
+    if (cfg.jobsDirProjectLocal) ensureGitExcluded(cfg.jobsDir);
     cleanSessionJobs(cfg.cleanupDays, ctx);
     if (!cfg.globalAutoClean) return;
-    const markerPath = join(cfg.jobsDir, ".last-clean");
-    try {
-      const last = Number(readFileSync(markerPath, "utf8").trim());
-      if (
-        Number.isFinite(last) &&
-        Date.now() - last < cfg.cleanupDays * 24 * 60 * 60 * 1000
-      )
-        return;
-    } catch {
-      // no marker yet — run the sweep
-    }
-    cleanOldJobs(cfg.cleanupDays, cfg.jobsDir, ctx);
-    try {
-      mkdirSync(cfg.jobsDir, { recursive: true });
-      writeFileSync(markerPath, String(Date.now()));
-    } catch {
-      // best-effort
+    for (const dir of sharedJobsDirs(cfg.jobsDir)) {
+      const markerPath = join(dir, ".last-clean");
+      try {
+        const last = Number(readFileSync(markerPath, "utf8").trim());
+        if (
+          Number.isFinite(last) &&
+          Date.now() - last < cfg.cleanupDays * 24 * 60 * 60 * 1000
+        )
+          continue;
+      } catch {
+        // no marker yet — run the sweep
+      }
+      cleanOldJobs(cfg.cleanupDays, dir, ctx);
+      try {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(markerPath, String(Date.now()));
+      } catch {
+        // best-effort
+      }
     }
   }
 
@@ -1223,7 +1279,7 @@ export default function (pi: ExtensionAPI) {
       // THIS project has run bgrun, without scanning the shared jobs dir.
       try {
         writeFileSync(
-          jobUsageMarkerPath(jobsDir, ctx.cwd ?? process.cwd()),
+          jobUsageMarkerPath(jobsDir, projectRootFor(ctx.cwd ?? process.cwd())),
           String(Date.now()),
         );
       } catch {
@@ -1592,7 +1648,7 @@ export default function (pi: ExtensionAPI) {
       const cfg = resolveConfig(ctx);
       if (cfg.digest) return; // already configured — nothing to nudge
       if (!ctx.hasUI) return; // toast-only feature; no UI → nothing to do
-      const projectDir = ctx.cwd ?? process.cwd();
+      const projectDir = projectRootFor(ctx.cwd ?? process.cwd());
       // Project-scoped evidence of use (written at spawn) — never the shared
       // jobs dir as a whole, which would toast every project on the machine.
       if (!existsSync(jobUsageMarkerPath(cfg.jobsDir, projectDir))) return;
@@ -2147,14 +2203,22 @@ export default function (pi: ExtensionAPI) {
     }
     let result;
     if (all) {
-      result = cleanOldJobs(days, cfg.jobsDir, ctx);
-      // A manual global clean refreshes the throttle marker so the next
-      // auto-sweep doesn't immediately redo this work.
-      try {
-        mkdirSync(cfg.jobsDir, { recursive: true });
-        writeFileSync(join(cfg.jobsDir, ".last-clean"), String(Date.now()));
-      } catch {
-        // best-effort
+      result = { removed: 0, kept: 0, skippedRunning: 0 };
+      // "all" spans every shared jobs dir — the current project's plus the
+      // machine-global default (so pre-project-local logs are still reachable).
+      for (const dir of sharedJobsDirs(cfg.jobsDir)) {
+        const r = cleanOldJobs(days, dir, ctx);
+        result.removed += r.removed;
+        result.kept += r.kept;
+        result.skippedRunning += r.skippedRunning;
+        // A manual clean refreshes the throttle marker so the next auto-sweep
+        // doesn't immediately redo this work.
+        try {
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(join(dir, ".last-clean"), String(Date.now()));
+        } catch {
+          // best-effort
+        }
       }
     } else {
       // Session-scoped by default: bg* commands apply to the current
@@ -2174,8 +2238,9 @@ export default function (pi: ExtensionAPI) {
     label: "Clean Old Background Jobs",
     description:
       "Remove old background job logs from disk. Default scope: THIS session's jobs only (other sessions' logs are " +
-      "untouched). Pass all: true to sweep the whole shared jobs dir. Retention: cleanupDays config (default 7 days). " +
-      "Never removes a running job's log. Prints a summary of what was removed vs kept.",
+      "untouched). Pass all: true to sweep every shared jobs dir — the current project's jobs dir plus the " +
+      "machine-global one — including stale per-project digest markers. Retention: cleanupDays config (default 7 " +
+      "days). Never removes a running job's log. Prints a summary of what was removed vs kept.",
     promptSnippet:
       "Remove old bgrun job logs (this session by default; all: true for every session's)",
     parameters: Type.Object({
@@ -2187,7 +2252,7 @@ export default function (pi: ExtensionAPI) {
       all: Type.Optional(
         Type.Boolean({
           description:
-            "Sweep the whole shared jobs dir (all sessions' logs), not just this session's (default false)",
+            "Sweep every shared jobs dir (all sessions' logs), not just this session's (default false)",
         }),
       ),
     }),
