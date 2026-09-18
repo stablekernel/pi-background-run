@@ -3180,7 +3180,7 @@ test("preset go-test: green and red scorecards", () => {
       "ok  \texample.com/b\t0.02s",
     ].join("\n"),
   );
-  assert.match(green, /pass: 2  fail: 0/);
+  assert.match(green, /pass: 2 {2}fail: 0/);
   assert.ok(!green.includes("Beta"), "no failing names on green");
 
   const red = runPreset(
@@ -3196,7 +3196,7 @@ test("preset go-test: green and red scorecards", () => {
       "FAIL\texample.com/b\t0.02s",
     ].join("\n"),
   );
-  assert.match(red, /pass: 1  fail: 1/);
+  assert.match(red, /pass: 1 {2}fail: 1/);
   assert.match(red, /^TestBeta$/m, "failing test name listed");
   assert.ok(!red.includes("Alpha"), "passing tests not listed");
 });
@@ -3271,7 +3271,7 @@ test("preset junit-xml: green and red scorecards", () => {
       "</testsuites>",
     ].join("\n"),
   );
-  assert.match(green, /failures: 0  errors: 0/);
+  assert.match(green, /failures: 0 {2}errors: 0/);
   assert.ok(!green.includes("test_ok"), "no testcase names on green");
 
   const red = runPreset(
@@ -3290,7 +3290,7 @@ test("preset junit-xml: green and red scorecards", () => {
       "</testsuites>",
     ].join("\n"),
   );
-  assert.match(red, /failures: 1  errors: 1/);
+  assert.match(red, /failures: 1 {2}errors: 1/);
   assert.match(red, /^test_boom$/m, "failing testcase name listed");
   assert.match(red, /^test_err$/m, "errored testcase name listed");
   assert.ok(
@@ -3399,7 +3399,7 @@ test("wake digest: preset scorecard appears on a green log", async () => {
     const wake = wakes[0].text;
     const digest = digestBlockOf(wake);
     assert.ok(digest, "wake carries a digest (project-config) block");
-    assert.match(digest!, /pass: 2  fail: 0/);
+    assert.match(digest!, /pass: 2 {2}fail: 0/);
     assert.match(wake, /✅/);
     assert.match(wake, /exit 0/);
   } finally {
@@ -3434,7 +3434,7 @@ test("wake digest: preset scorecard appears on a red log", async () => {
     const wake = wakes[0].text;
     const digest = digestBlockOf(wake);
     assert.ok(digest, "wake carries a digest (project-config) block");
-    assert.match(digest!, /pass: 0  fail: 1/);
+    assert.match(digest!, /pass: 0 {2}fail: 1/);
     assert.match(digest!, /^TestBeta$/m);
     assert.match(wake, /❌/);
     assert.match(wake, /exit 1/);
@@ -3703,7 +3703,7 @@ test("wake digest: match by job name chooses the matching entry", async () => {
       /^digest \(unit-tests\):/,
       "label falls back to match.name",
     );
-    assert.match(line!, /pass: 1  fail: 0/);
+    assert.match(line!, /pass: 1 {2}fail: 0/);
   } finally {
     teardownDigestEnv(dir, proj, home);
   }
@@ -3833,7 +3833,7 @@ test("wake digest: job type selects the matching type entry (digest (test))", as
       /^digest \(test\):/,
       "label falls back to the type string",
     );
-    assert.match(line!, /pass: 1  fail: 0/);
+    assert.match(line!, /pass: 1 {2}fail: 0/);
   } finally {
     teardownDigestEnv(dir, proj, home);
   }
@@ -3922,9 +3922,9 @@ test("bgrun: type flows into the started result, entries, and resume reconstruct
     const started = res.content[0].text as string;
     const id = (started.match(/^started: ([^\n]+)/) || [])[1];
     assert.ok(id, "got a job id");
-    assert.match(started, /^  name: unit-tests$/m);
+    assert.match(started, /^ {2}name: unit-tests$/m);
     // Types are lowercase-normalized so selection is an exact compare.
-    assert.match(started, /^  type: test$/m);
+    assert.match(started, /^ {2}type: test$/m);
     assert.equal((res.details as any).type, "test");
     await waitForWakes(wakes, 1);
 
@@ -3952,7 +3952,7 @@ test("bgrun: type flows into the started result, entries, and resume reconstruct
     const text = status.content[0].text as string;
     assert.match(
       text,
-      /^  type: test$/m,
+      /^ {2}type: test$/m,
       "reconstructed record carries the type",
     );
     assert.equal((status.details as any).type, "test");
