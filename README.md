@@ -112,10 +112,10 @@ skip markers. Plain `grep` is fine only for a one-off search you know is tiny.
 The jobs dir defaults to `<project>/.pi-bgrun/jobs` when the session cwd is
 inside a recognizable project root (`.git` or `.pi`, found by walking up from
 the cwd); otherwise it falls back to `~/.pi-bgrun/jobs`. **Warning:** a
-`jobsDir` equal to your home directory is dangerous — cleanup removes matching
-`*.log` files directly there. The home directory
-itself is never treated as a project root — pi's global `~/.pi/agent` dir would
-otherwise make every cwd under `$HOME` resolve to `$HOME` (a symlinked `$HOME`
+`jobsDir` (or a `PI_BGRUN_GLOBAL_DIR` target) equal to your home directory is
+dangerous — cleanup removes matching `*.log` files directly there. The home
+directory itself is never treated as a project root — pi's global `~/.pi/agent`
+dir would otherwise make every cwd under `$HOME` resolve to `$HOME` (a symlinked
 is still recognized). Override via `jobsDir` / `PI_BGRUN_DIR`. Within a project,
 the dir is shared by every pi session working in that checkout — that sharing
 enables cross-session job lookup, session-restart reconstruction, and

@@ -11,7 +11,7 @@
  *   - assert exit handling, log marker, bgtail, bgstatus
  */
 
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import {
   mkdtempSync,
@@ -23,6 +23,7 @@ import {
   appendFileSync,
   readdirSync,
   symlinkSync,
+  utimesSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -46,7 +47,10 @@ import {
 // stay trivial — nothing is written into the repo or the real $HOME.
 const TEST_TMP_ROOT = mkdtempSync(join(tmpdir(), "pi-bgrun-tests-"));
 const mkTmp = (prefix: string) => mkdtempSync(join(TEST_TMP_ROOT, prefix));
-process.on("exit", () => {
+// node:test's `after` runs under both node and bun, unlike process.on("exit"),
+// which bun's test runner never fires — that leak left a pi-bgrun-tests-*
+// dir behind on every bun run.
+after(() => {
   try {
     rmSync(TEST_TMP_ROOT, { recursive: true, force: true });
   } catch {
@@ -1542,6 +1546,152 @@ test("auto-clean: untrusted project at session start writes nothing into the rep
       "no project-local jobs dir created in an untrusted repo",
     );
   } finally {
+    delete process.env.PI_BGRUN_DIR;
+    delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+    rmSync(proj, { recursive: true, force: true });
+    resetGlobalJobsDir();
+  }
+});
+
+test("auto-clean: untrusted project keeps stale usage/digest markers (J1)", async () => {
+  const proj = mkTmp("pi-bgrun-proj-");
+  delete process.env.PI_BGRUN_DIR;
+  delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    const jobsDir = join(proj, ".pi-bgrun", "jobs");
+    mkdirSync(jobsDir, { recursive: true });
+    const marker = join(jobsDir, ".bgrun-used-deadbeef");
+    writeFileSync(marker, "used");
+    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    utimesSync(marker, oldTime, oldTime);
+
+    const { pi, fireSessionStart } = makeFakePi({
+      ctxFields: { cwd: proj, isProjectTrusted: () => false },
+    });
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.ok(
+      existsSync(marker),
+      "a stale marker is not deleted in an untrusted repo",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+    rmSync(proj, { recursive: true, force: true });
+    resetGlobalJobsDir();
+  }
+});
+
+test("auto-clean: untrusted project keeps an existing old finished log (J5.1)", async () => {
+  const proj = mkTmp("pi-bgrun-proj-");
+  delete process.env.PI_BGRUN_DIR;
+  delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    const jobsDir = join(proj, ".pi-bgrun", "jobs");
+    mkdirSync(jobsDir, { recursive: true });
+    const oldLog = join(jobsDir, "old-done-1000000000-99999.log");
+    writeFileSync(oldLog, "done\n__BGRUN_EXIT__=0\n");
+    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    utimesSync(oldLog, oldTime, oldTime);
+
+    const { pi, fireSessionStart } = makeFakePi({
+      ctxFields: { cwd: proj, isProjectTrusted: () => false },
+    });
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.ok(
+      existsSync(oldLog),
+      "an existing old finished log is not swept in an untrusted repo",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+    rmSync(proj, { recursive: true, force: true });
+    resetGlobalJobsDir();
+  }
+});
+
+test("auto-clean: .last-clean throttles per dir under the project-local default (J5.2)", async () => {
+  const proj = mkTmp("pi-bgrun-proj-");
+  delete process.env.PI_BGRUN_DIR;
+  delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const projJobs = join(proj, ".pi-bgrun", "jobs");
+    mkdirSync(projJobs, { recursive: true });
+    const projOld = join(projJobs, "old-proj-1000000000-99999.log");
+    writeFileSync(projOld, "done\n__BGRUN_EXIT__=0\n");
+    utimesSync(projOld, oldTime, oldTime);
+    // Fresh throttle marker in the machine-global dir, plus an old log there.
+    mkdirSync(TEST_GLOBAL_JOBS_DIR, { recursive: true });
+    writeFileSync(
+      join(TEST_GLOBAL_JOBS_DIR, ".last-clean"),
+      String(Date.now()),
+    );
+    const globalOld = join(
+      TEST_GLOBAL_JOBS_DIR,
+      "old-global-1000000000-99998.log",
+    );
+    writeFileSync(globalOld, "done\n__BGRUN_EXIT__=0\n");
+    utimesSync(globalOld, oldTime, oldTime);
+
+    const { pi, fireSessionStart } = makeFakePi({
+      ctxFields: { cwd: proj, isProjectTrusted: () => true },
+    });
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.ok(
+      !existsSync(projOld),
+      "project dir lacks a marker so its old log is swept",
+    );
+    assert.ok(
+      existsSync(globalOld),
+      "global dir's fresh marker throttles its own sweep",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+    rmSync(proj, { recursive: true, force: true });
+    resetGlobalJobsDir();
+  }
+});
+
+test("auto-clean: untrusted project aliased by a global symlink writes nothing (J6)", async () => {
+  const proj = mkTmp("pi-bgrun-proj-");
+  const savedGlobal = process.env.PI_BGRUN_GLOBAL_DIR;
+  delete process.env.PI_BGRUN_DIR;
+  delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    const projJobs = join(proj, ".pi-bgrun", "jobs");
+    mkdirSync(projJobs, { recursive: true });
+    const alias = join(TEST_TMP_ROOT, "global-alias");
+    symlinkSync(projJobs, alias);
+    process.env.PI_BGRUN_GLOBAL_DIR = alias;
+
+    const { pi, fireSessionStart } = makeFakePi({
+      ctxFields: { cwd: proj, isProjectTrusted: () => false },
+    });
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.ok(
+      !existsSync(join(proj, ".git", "info", "exclude")),
+      "no .git/info/exclude write in an untrusted repo",
+    );
+    assert.ok(
+      !existsSync(join(projJobs, ".last-clean")),
+      "no .last-clean written via the aliased global path",
+    );
+  } finally {
+    if (savedGlobal === undefined) delete process.env.PI_BGRUN_GLOBAL_DIR;
+    else process.env.PI_BGRUN_GLOBAL_DIR = savedGlobal;
     delete process.env.PI_BGRUN_DIR;
     delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
     rmSync(proj, { recursive: true, force: true });

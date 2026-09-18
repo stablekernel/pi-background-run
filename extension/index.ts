@@ -962,8 +962,13 @@ export default function (pi: ExtensionAPI) {
       }
     }
     // Markers aren't session data, so a session-scoped sweep may still drop
-    // stale ones from this jobs dir.
-    sweepStaleMarkers(resolveConfig(ctx).jobsDir, cutoff);
+    // stale ones from this jobs dir — except in an untrusted project-local dir,
+    // where deletion would mutate a repo the user has not trusted (the same
+    // boundary autoCleanJobs enforces below).
+    const cfg = resolveConfig(ctx);
+    if (!(cfg.jobsDirProjectLocal && ctx?.isProjectTrusted?.() !== true)) {
+      sweepStaleMarkers(cfg.jobsDir, cutoff);
+    }
     if (result.removed > 0 && ctx?.hasUI) {
       ctx.ui.notify(`bgrun: cleaned ${result.removed} old job log(s)`, "info");
     }
@@ -2266,7 +2271,10 @@ export default function (pi: ExtensionAPI) {
         // Only the project-local dir may be git-excluded. The shared global
         // dir must NOT be excluded in whatever repo happens to contain it
         // (e.g. $HOME being a dotfiles repo).
-        if (cfg.jobsDirProjectLocal && dir === cfg.jobsDir)
+        if (
+          cfg.jobsDirProjectLocal &&
+          safeRealpath(dir) === safeRealpath(cfg.jobsDir)
+        )
           ensureGitExcluded(dir);
         try {
           writeFileSync(join(dir, ".last-clean"), String(Date.now()));
