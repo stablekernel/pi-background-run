@@ -259,10 +259,13 @@ configured*.
 #### Guarantees
 
 - **Exit code always leads.** The digest is appended after the universal
-  stats, labeled `digest (project-config):`. It never overrides or reorders
-  the exit code, duration, or line count.
-- **Capped and timed.** Digest output is capped at ~500 chars; the digest
-  command gets a 5s hard timeout.
+  stats, labeled `digest (<label>):` — `label` follows the precedence above
+  (entry `label` → type string → `match.name` → `project-config`). It never
+  overrides or reorders the exit code, duration, or line count.
+- **Capped and timed.** Digest output is capped at ~500 chars, and buffering
+  stops once that cap is reached — a command that prints unbounded output
+  cannot balloon the wake. The digest command gets a 5s timeout plus a 250ms
+  SIGTERM→SIGKILL grace (≈5.25s worst case), during which the wake waits.
 - **Silent-fail.** A digest command that errors, times out, or prints nothing
   simply contributes nothing — it never breaks a wake.
 - **No config, no behavior.** Absent or invalid config contributes nothing;

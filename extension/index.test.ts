@@ -27,6 +27,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   DIGEST_PRESETS,
   DIGEST_PRESET_IDS,
@@ -2100,8 +2101,7 @@ test("entryMatchesJob: absent/empty match, name, command, and AND semantics", ()
     true,
   );
   assert.equal(
-    entryMatchesJob({ match: { name: "^e2e-" }, preset: "go-test" },
-      target),
+    entryMatchesJob({ match: { name: "^e2e-" }, preset: "go-test" }, target),
     false,
   );
   // A name matcher never matches a job that has no name.
@@ -2114,8 +2114,10 @@ test("entryMatchesJob: absent/empty match, name, command, and AND semantics", ()
   );
   // Command regex.
   assert.equal(
-    entryMatchesJob({ match: { command: "cargo build" }, preset: "go-test" },
-      target),
+    entryMatchesJob(
+      { match: { command: "cargo build" }, preset: "go-test" },
+      target,
+    ),
     false,
   );
   assert.equal(
@@ -2223,7 +2225,11 @@ test("selectDigestEntry: label precedence (label → match.name → project-conf
 
 test("selectDigestEntry: type-first selection (exact, case-insensitive) + fallback", () => {
   const entries = [
-    { match: { name: "unit" }, label: "regex-unit", command: "echo regex-unit" },
+    {
+      match: { name: "unit" },
+      label: "regex-unit",
+      command: "echo regex-unit",
+    },
     { type: "test", command: "echo type-test" },
     { label: "default", command: "echo default" },
   ];
@@ -2350,11 +2356,10 @@ function runPreset(presetId: string, log: string): string {
     const logPath = join(dir, "job.log");
     writeFileSync(logPath, log);
     const preset = DIGEST_PRESETS.find((p) => p.id === presetId)!;
-    const res = spawnSync(
-      "sh",
-      ["-c", preset.command, "digest", logPath],
-      { encoding: "utf8", timeout: 5000 },
-    );
+    const res = spawnSync("sh", ["-c", preset.command, "digest", logPath], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
     assert.equal(
       res.status,
       0,
@@ -2492,11 +2497,19 @@ test("preset junit-xml: green and red scorecards", () => {
   assert.match(red, /failures: 1  errors: 1/);
   assert.match(red, /^test_boom$/m, "failing testcase name listed");
   assert.match(red, /^test_err$/m, "errored testcase name listed");
-  assert.ok(!red.includes("test_ok\n") && !/^test_ok$/m.test(red), "passing testcase not listed");
+  assert.ok(
+    !red.includes("test_ok\n") && !/^test_ok$/m.test(red),
+    "passing testcase not listed",
+  );
 });
 
 test("shipped presets: ids are stable and every command ends in head (bounded output)", () => {
-  assert.deepEqual(DIGEST_PRESET_IDS, ["go-test", "jest", "pytest", "junit-xml"]);
+  assert.deepEqual(DIGEST_PRESET_IDS, [
+    "go-test",
+    "jest",
+    "pytest",
+    "junit-xml",
+  ]);
   for (const preset of DIGEST_PRESETS) {
     assert.match(
       preset.command,
@@ -2514,7 +2527,10 @@ test("shipped presets: suggestedType is advisory metadata, not selection behavio
       "string",
       `${preset.id} carries a suggestedType`,
     );
-    assert.ok(preset.suggestedType.length > 0, `${preset.id} suggestion is non-empty`);
+    assert.ok(
+      preset.suggestedType.length > 0,
+      `${preset.id} suggestion is non-empty`,
+    );
   }
   // ... but a preset entry with no `type` still selects every job (a job with
   // no declared type included), so the suggestion never changes matching.
@@ -2556,10 +2572,11 @@ function trustCtx(ctx: any, proj: string, trusted: boolean): any {
 }
 
 function digestBlockOf(wake: string): string | null {
-  const m = wake.match(/digest \(project-config\): ([\s\S]*?)\nReview the result/);
+  const m = wake.match(
+    /digest \(project-config\): ([\s\S]*?)\nReview the result/,
+  );
   return m ? m[1] : null;
 }
-
 
 test("wake digest: preset scorecard appears on a green log", async () => {
   const { dir, proj, home } = setupDigestEnv();
@@ -2690,7 +2707,9 @@ test("wake digest: output capped at ~500 chars, first lines win", async () => {
   }
 });
 
-test("wake digest: hanging command times out silently, wake still arrives (~5s bound)", { timeout: 20000 }, async () => {
+test("wake digest: hanging command times out silently, wake still arrives (~5s bound)", {
+  timeout: 20000,
+}, async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
@@ -2712,10 +2731,16 @@ test("wake digest: hanging command times out silently, wake still arrives (~5s b
     await waitForWakes(wakes, 1, 8000);
     const elapsed = Date.now() - t0;
     const wake = wakes[0].text;
-    assert.ok(!wake.includes("digest (project-config)"), "timed-out digest contributes nothing");
+    assert.ok(
+      !wake.includes("digest (project-config)"),
+      "timed-out digest contributes nothing",
+    );
     assert.match(wake, /✅/);
     assert.match(wake, /exit 0/);
-    assert.ok(elapsed < 7000, `wake arrived in ${elapsed}ms, within the ~5s digest bound + overhead`);
+    assert.ok(
+      elapsed < 7000,
+      `wake arrived in ${elapsed}ms, within the ~5s digest bound + overhead`,
+    );
   } finally {
     teardownDigestEnv(dir, proj, home);
   }
@@ -2741,7 +2766,10 @@ test("wake digest: failing digest command → no digest block, wake otherwise un
     );
     await waitForWakes(wakes, 1);
     const wake = wakes[0].text;
-    assert.ok(!wake.includes("digest (project-config)"), "failing digest contributes nothing");
+    assert.ok(
+      !wake.includes("digest (project-config)"),
+      "failing digest contributes nothing",
+    );
     assert.match(wake, /✅/);
     assert.match(wake, /exit 0/);
     assert.match(wake, /Last output: hello world/);
@@ -2807,7 +2835,10 @@ test("wake digest: untrusted project → digest absent even when configured", as
         ctx,
       );
       await waitForWakes(wakes, 1);
-      assert.ok(!wakes[0].text.includes("digest (project-config)"), "untrusted → no digest");
+      assert.ok(
+        !wakes[0].text.includes("digest (project-config)"),
+        "untrusted → no digest",
+      );
     }
     // ...and a ctx with no isProjectTrusted at all.
     {
@@ -2823,7 +2854,10 @@ test("wake digest: untrusted project → digest absent even when configured", as
         ctx,
       );
       await waitForWakes(wakes, 1);
-      assert.ok(!wakes[0].text.includes("digest (project-config)"), "no trust check → no digest");
+      assert.ok(
+        !wakes[0].text.includes("digest (project-config)"),
+        "no trust check → no digest",
+      );
     }
   } finally {
     teardownDigestEnv(dir, proj, home);
@@ -2868,7 +2902,11 @@ test("wake digest: match by job name chooses the matching entry", async () => {
     });
     const line = digestLineOf(wake);
     assert.ok(line, "wake carries a digest line");
-    assert.match(line!, /^digest \(unit-tests\):/, "label falls back to match.name");
+    assert.match(
+      line!,
+      /^digest \(unit-tests\):/,
+      "label falls back to match.name",
+    );
     assert.match(line!, /pass: 1  fail: 0/);
   } finally {
     teardownDigestEnv(dir, proj, home);
@@ -2994,7 +3032,11 @@ test("wake digest: job type selects the matching type entry (digest (test))", as
     });
     const line = digestLineOf(wake);
     assert.ok(line, "wake carries a digest line");
-    assert.match(line!, /^digest \(test\):/, "label falls back to the type string");
+    assert.match(
+      line!,
+      /^digest \(test\):/,
+      "label falls back to the type string",
+    );
     assert.match(line!, /pass: 1  fail: 0/);
   } finally {
     teardownDigestEnv(dir, proj, home);
@@ -3033,7 +3075,11 @@ test("wake digest: type entry beats an earlier regex entry (type-first order)", 
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: [
-        { match: { command: "go test" }, label: "regex", command: "echo regex" },
+        {
+          match: { command: "go test" },
+          label: "regex",
+          command: "echo regex",
+        },
         { type: "test", label: "typed", command: "echo typed" },
       ],
     });
@@ -3108,7 +3154,11 @@ test("bgrun: type flows into the started result, entries, and resume reconstruct
       ctx2,
     );
     const text = status.content[0].text as string;
-    assert.match(text, /^  type: test$/m, "reconstructed record carries the type");
+    assert.match(
+      text,
+      /^  type: test$/m,
+      "reconstructed record carries the type",
+    );
     assert.equal((status.details as any).type, "test");
   } finally {
     delete process.env.PI_BGRUN_DIR;
@@ -3150,6 +3200,17 @@ function writeDoneLog(jobsDir: string, name: string, exit = 0): void {
   writeFileSync(join(jobsDir, name), `output\n__BGRUN_EXIT__=${exit}\n`);
 }
 
+// Mirror of the exported digestNudgeMarkerPath(): the nudge marker is keyed by
+// project dir so one project's nudge does not silence every other project that
+// shares the jobs dir.
+function nudgeMarker(jobsDir: string, projectDir: string): string {
+  const key = createHash("sha256")
+    .update(projectDir)
+    .digest("hex")
+    .slice(0, 16);
+  return join(jobsDir, `.digest-nudge-${key}`);
+}
+
 function captureNotify(ctx: any): string[] {
   const messages: string[] = [];
   ctx.hasUI = true;
@@ -3170,7 +3231,7 @@ test("digest nudge: fires on session_start (trusted, no digest, ≥1 done job) a
     await fireSessionStart();
 
     assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
-    assert.ok(existsSync(join(dir, ".digest-nudge-done")), "marker file created");
+    assert.ok(existsSync(nudgeMarker(dir, proj)), "marker file created");
   } finally {
     teardownDigestEnv(dir, proj, home);
   }
@@ -3190,7 +3251,7 @@ test("digest nudge: silent when a digest IS configured (marker untouched)", asyn
     await fireSessionStart();
 
     assert.deepEqual(messages, [], "no toast when a digest is configured");
-    assert.ok(!existsSync(join(dir, ".digest-nudge-done")), "no marker written");
+    assert.ok(!existsSync(nudgeMarker(dir, proj)), "no marker written");
   } finally {
     teardownDigestEnv(dir, proj, home);
   }
@@ -3207,7 +3268,7 @@ test("digest nudge: silent when the project is untrusted", async () => {
     await fireSessionStart();
 
     assert.deepEqual(messages, [], "untrusted project → no toast");
-    assert.ok(!existsSync(join(dir, ".digest-nudge-done")), "no marker written");
+    assert.ok(!existsSync(nudgeMarker(dir, proj)), "no marker written");
   } finally {
     teardownDigestEnv(dir, proj, home);
   }
@@ -3228,7 +3289,7 @@ test("digest nudge: silent when no done jobs (no evidence of use)", async () => 
     await fireSessionStart();
 
     assert.deepEqual(messages, [], "no done jobs → no toast");
-    assert.ok(!existsSync(join(dir, ".digest-nudge-done")), "no marker written");
+    assert.ok(!existsSync(nudgeMarker(dir, proj)), "no marker written");
   } finally {
     teardownDigestEnv(dir, proj, home);
   }
@@ -3238,7 +3299,7 @@ test("digest nudge: silent when the marker file already exists", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
     writeDoneLog(dir, "myproj-1-12345.log");
-    writeFileSync(join(dir, ".digest-nudge-done"), "1717000000000");
+    writeFileSync(nudgeMarker(dir, proj), "1717000000000");
     const { pi, ctx, fireSessionStart } = makeFakePi();
     trustCtx(ctx, proj, true);
     const messages = captureNotify(ctx);
@@ -3266,8 +3327,48 @@ test("digest nudge: a throwing ui.notify does not break session_start", async ()
 
     // The failed toast counts as "not nudged" — the marker is intentionally
     // not written, so the next session can try again. Session_start is intact.
-    assert.ok(!existsSync(join(dir, ".digest-nudge-done")));
+    assert.ok(!existsSync(nudgeMarker(dir, proj)));
   } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: marker is per-project — a second project sharing the jobs dir still gets nudged", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  const proj2 = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  try {
+    writeDoneLog(dir, "myproj-1-12345.log");
+
+    // First project: nudged, writes its own marker.
+    {
+      const { pi, ctx, fireSessionStart } = makeFakePi();
+      trustCtx(ctx, proj, true);
+      const messages = captureNotify(ctx);
+      await loadExtension(pi);
+      await fireSessionStart();
+      assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
+      assert.ok(existsSync(nudgeMarker(dir, proj)), "project 1 marker written");
+    }
+
+    // Second project on the same shared jobs dir is not silenced by project 1.
+    {
+      const { pi, ctx, fireSessionStart } = makeFakePi();
+      trustCtx(ctx, proj2, true);
+      const messages = captureNotify(ctx);
+      await loadExtension(pi);
+      await fireSessionStart();
+      assert.deepEqual(
+        messages,
+        [DIGEST_NUDGE_TEXT],
+        "each project gets its own one-shot nudge",
+      );
+      assert.ok(
+        existsSync(nudgeMarker(dir, proj2)),
+        "project 2 marker written",
+      );
+    }
+  } finally {
+    rmSync(proj2, { recursive: true, force: true });
     teardownDigestEnv(dir, proj, home);
   }
 });

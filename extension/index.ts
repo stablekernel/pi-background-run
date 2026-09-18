@@ -48,6 +48,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
 import {
   DIGEST_PRESET_IDS,
   selectDigestEntry,
@@ -153,6 +154,23 @@ function warnDigestInvalid(field: string, value: unknown): void {
   );
 }
 
+/**
+ * Per-project marker path for the one-shot digest nudge. The jobs dir is
+ * shared machine-wide, so a bare `.digest-nudge-done` marker would silence the
+ * nudge for every other project after the first to earn it. Key the marker by
+ * the project directory so each project gets its own one-shot.
+ */
+export function digestNudgeMarkerPath(
+  jobsDir: string,
+  projectDir: string,
+): string {
+  const key = createHash("sha256")
+    .update(projectDir)
+    .digest("hex")
+    .slice(0, 16);
+  return join(jobsDir, `.digest-nudge-${key}`);
+}
+
 function isValidRegexSource(src: string): boolean {
   try {
     new RegExp(src);
@@ -203,7 +221,10 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
     const rawMatch = entry.match as { name?: unknown; command?: unknown };
     const normalized: DigestMatch = {};
     if (rawMatch.name !== undefined) {
-      if (typeof rawMatch.name !== "string" || !isValidRegexSource(rawMatch.name)) {
+      if (
+        typeof rawMatch.name !== "string" ||
+        !isValidRegexSource(rawMatch.name)
+      ) {
         warnDigestInvalid("match.name", rawMatch.name);
         return undefined;
       }
@@ -1088,7 +1109,8 @@ export default function (pi: ExtensionAPI) {
         // job ran are picked up, and trust is evaluated against the same
         // session that spawned the job. No spawn-time capture needed. When a
         // digest is configured, the wake is sent only after this bounded
-        // attempt (≤ ~5s) completes; a digest that fails, times out, or prints
+        // attempt (≤ ~5.25s: 5s timeout + 250ms kill grace) completes; a digest
+        // that fails, times out, or prints
         // nothing appends nothing, and the exit code / universal part above are
         // never affected.
         let digestBlock: { label: string; text: string } | undefined;
@@ -1208,6 +1230,10 @@ export default function (pi: ExtensionAPI) {
       const finish = (out: string | undefined) => {
         if (settled) return;
         settled = true;
+        // Stop accepting output. A grandchild can keep the pipe's write end
+        // open after `sh` exits (pipelines, `cmd &`), and a live `data`
+        // listener would otherwise grow this buffer forever.
+        child?.stdout?.removeAllListeners("data");
         resolve(out);
       };
       let child: ReturnType<typeof spawn>;
@@ -1221,6 +1247,10 @@ export default function (pi: ExtensionAPI) {
       }
       let stdout = "";
       child.stdout?.on("data", (chunk: Buffer) => {
+        // Bounded collection: once past the wake cap, stop buffering (but keep
+        // draining so the child is never blocked on a full pipe). The final
+        // capDigestOutput() trims the overshoot to DIGEST_TOTAL_CAP.
+        if (stdout.length > DIGEST_TOTAL_CAP) return;
         stdout += chunk.toString();
       });
       // Hard timeout: SIGTERM first, SIGKILL after a short grace.
@@ -1258,7 +1288,9 @@ export default function (pi: ExtensionAPI) {
     const lines = raw
       .replace(ANSI_RE, "")
       .split("\n")
-      .map((l) => (l.length > DIGEST_LINE_CAP ? l.slice(0, DIGEST_LINE_CAP) : l))
+      .map((l) =>
+        l.length > DIGEST_LINE_CAP ? l.slice(0, DIGEST_LINE_CAP) : l,
+      )
       .filter((l) => l.trim().length > 0);
     if (lines.length === 0) return undefined;
     const joined = lines.join("\n");
@@ -1273,9 +1305,8 @@ export default function (pi: ExtensionAPI) {
   // When a trusted project has actually used bgrun (≥1 finished job log in the
   // jobs dir) but never configured a digest, point the human at the
   // digest-config skill once. Toast only — never sendUserMessage, so it costs
-  // zero LLM context. Dismissal is a marker file in the jobs dir; the user's
-  // config files are never written.
-  const DIGEST_NUDGE_MARKER = ".digest-nudge-done";
+  // zero LLM context. Dismissal is a per-project marker file in the jobs dir;
+  // the user's config files are never written.
   const DIGEST_NUDGE_TEXT =
     "pi-bgrun: no digest configured for this project — use the digest-config skill to set one up.";
 
@@ -1302,7 +1333,10 @@ export default function (pi: ExtensionAPI) {
       if (cfg.digest) return; // already configured — nothing to nudge
       if (!ctx.hasUI) return; // toast-only feature; no UI → nothing to do
       if (!hasDoneJobLog(cfg.jobsDir)) return;
-      const markerPath = join(cfg.jobsDir, DIGEST_NUDGE_MARKER);
+      const markerPath = digestNudgeMarkerPath(
+        cfg.jobsDir,
+        ctx.cwd ?? process.cwd(),
+      );
       if (existsSync(markerPath)) return; // already nudged once — stay silent
       ctx.ui.notify(DIGEST_NUDGE_TEXT, "info");
       try {
@@ -1311,10 +1345,7 @@ export default function (pi: ExtensionAPI) {
         // best-effort — a marker write failure must never break session_start
       }
     } catch (err) {
-      console.error(
-        "[pi-bgrun] digest nudge failed:",
-        (err as Error).message,
-      );
+      console.error("[pi-bgrun] digest nudge failed:", (err as Error).message);
     }
   }
 
