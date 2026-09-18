@@ -180,6 +180,23 @@ Wake messages always lead with universal facts — exit code, duration, log line
 count. A project can additionally opt into a **digest scorecard**: a one-line
 pass/fail summary extracted from the log and appended to the wake.
 
+#### Job identity: name, type, command
+
+Every `bgrun` job carries three identifiers, and the digest selector reads all
+three:
+
+| Field | Required | Normalized | Drives |
+| --- | --- | --- | --- |
+| `command` | yes | used as-is (`sh -c`) | what runs; the `match.command` target |
+| `name` | no | trimmed, blank → none, ≤80 chars | display label + job-id/log slug; the `match.name` target |
+| `type` | no | trimmed, lowercased, blank → none, ≤40 chars | digest routing only; the first-class selector |
+
+`name` names the job (and its log file); `type` never affects the id or the
+display — its only job is selecting the scorecard. Selection tries `type`
+entries first (exact, case-insensitive), then falls back to `match.name` /
+`match.command` regexes. The config `type` is capped to the same 40 characters
+as the job `type`, so an over-long type still matches.
+
 #### Setting it up
 
 Three ways, easiest first — pick the first one you're comfortable with:

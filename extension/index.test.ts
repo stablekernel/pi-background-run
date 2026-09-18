@@ -2838,6 +2838,7 @@ test("resolveConfig: digest type normalized; invalid type drops entry; match kep
       digest: [
         { type: "TEST", label: "t", command: "echo t" },
         { type: "test", match: { name: "x" }, command: "echo both" },
+        { type: "z".repeat(45), command: "echo long" },
         { type: 42, command: "echo bad" },
         { type: "   ", command: "echo blank" },
         { command: "echo default" },
@@ -2852,6 +2853,8 @@ test("resolveConfig: digest type normalized; invalid type drops entry; match kep
       { type: "test", label: "t", command: "echo t" },
       // match kept — type and match compose (AND).
       { type: "test", match: { name: "x" }, command: "echo both" },
+      // over-long type capped to 40 (same cap the job side applies).
+      { type: "z".repeat(40), command: "echo long" },
       // invalid + blank type entries dropped.
       { command: "echo default" },
     ]);
@@ -3879,6 +3882,23 @@ test("wake digest: type + match compose end-to-end (normalization keeps match)",
       command: "go test",
     });
     assert.match(digestLineOf(wake)!, /^digest \(any-test\): any$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: over-long config type matches an over-long job type (shared 40-char cap)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    const longType = "t".repeat(45);
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ type: longType, label: "long", command: "echo long" }],
+    });
+    const wake = await runDigestJob(proj, {
+      type: longType,
+      command: "echo hi",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(long\): long$/);
   } finally {
     teardownDigestEnv(dir, proj, home);
   }

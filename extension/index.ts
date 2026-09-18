@@ -302,6 +302,11 @@ function isValidRegexSource(src: string): boolean {
   }
 }
 
+// Job and config `type` values are short routing tokens. Both sides cap at the
+// same length; if only the job side truncated, a >MAX_TYPE_LEN config type
+// would silently never match the job's truncated type.
+const MAX_TYPE_LEN = 40;
+
 // Normalize one digest entry from the object-or-array config. Best-effort:
 // anything unusable is dropped (never throws). An entry without a usable
 // preset or command contributes nothing; a `match` regex that does not compile
@@ -319,14 +324,16 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   // `type` and `match` compose (AND): both are kept and both must match at
   // selection time. An invalid `type` (present but not a non-empty string)
   // drops the whole entry — same best-effort policy as an uncompilable regex.
-  // Types are lowercase-normalized so selection is a cheap exact comparison.
+  // Types are lowercase-normalized and capped to MAX_TYPE_LEN — the same cap
+  // the job side applies — so selection is an exact compare and a long config
+  // type still matches the (truncated) long job type.
   let type: string | undefined;
   if (entry.type !== undefined) {
     if (typeof entry.type !== "string" || !entry.type.trim()) {
       warnDigestInvalid("type", entry.type);
       return undefined;
     }
-    type = entry.type.trim().toLowerCase();
+    type = entry.type.trim().toLowerCase().slice(0, MAX_TYPE_LEN);
   }
 
   let match: DigestMatch | undefined;
@@ -604,11 +611,12 @@ export default function (pi: ExtensionAPI) {
 
   // Normalize an optional job type: short token, lowercase (so digest
   // selection is a cheap exact compare against lowercase config types), blank
-  // → undefined, capped defensively.
+  // → undefined, capped to MAX_TYPE_LEN. The config side applies the same cap
+  // (normalizeDigestEntry), so both sides truncate identically.
   function sanitizeType(type: string | undefined): string | undefined {
     const trimmed = (type ?? "").trim().toLowerCase();
     if (!trimmed) return undefined;
-    return trimmed.slice(0, 40);
+    return trimmed.slice(0, MAX_TYPE_LEN);
   }
 
   function readLastLogLine(logPath: string, maxLen = 200): string | null {
