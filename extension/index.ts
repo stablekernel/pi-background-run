@@ -835,7 +835,10 @@ export default function (pi: ExtensionAPI) {
     // Sweep the ones whose project has been quiet past the retention window;
     // a project that runs bgrun again re-writes its usage marker at spawn.
     for (const name of entries) {
-      if (!name.startsWith(".bgrun-used-") && !name.startsWith(".digest-nudge-"))
+      if (
+        !name.startsWith(".bgrun-used-") &&
+        !name.startsWith(".digest-nudge-")
+      )
         continue;
       const markerPath = join(jobsDir, name);
       try {
