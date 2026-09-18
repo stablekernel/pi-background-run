@@ -15,12 +15,12 @@ export interface DigestPreset {
   description: string;
   command: string;
   /**
-    * Advisory only — the conventional job `type` this preset is meant for,
-    * used by docs and the digest-config skill when scaffolding a config
-    * (e.g. `{ "type": "test", "preset": "go-test" }`). It carries NO runtime
-    * semantics: a preset entry never selects itself by type; the project's
-    * config still declares the `type` on each entry.
-    */
+   * Advisory only — the conventional job `type` this preset is meant for,
+   * used by docs and the digest-config skill when scaffolding a config
+   * (e.g. `{ "type": "test", "preset": "go-test" }`). It carries NO runtime
+   * semantics: a preset entry never selects itself by type; the project's
+   * config still declares the `type` on each entry.
+   */
   suggestedType: string;
 }
 
