@@ -230,7 +230,7 @@ Three ways, easiest first — pick the first one you're comfortable with:
    plus the command `grep -E '^(PASS|FAIL|Tests:)' "$1" | head -5`, wakes with:
 
    ```text
-   digest (project-config): FAIL src/api.test.ts
+   digest (command): FAIL src/api.test.ts
    Tests: 12 passed, 1 failed, 13 total
    ```
 
@@ -268,14 +268,18 @@ bgrun(command: "go test ./...", name: "unit-tests", type: "test")
 
 `type` is an optional `bgrun` parameter. The vocabulary is defined by the
 `type` fields of the project's digest config in `.pi/pi-bgrun.json`; when the
-project's digest config defines types, prefer passing the matching one.
+project's digest config defines types, prefer passing the matching one. If a
+job's `type` (or name/command) selects no entry, pi-bgrun logs a one-line
+diagnostic naming the job and the configured types — so a mismatched type is
+visible instead of silently scorecard-less.
 
 Selection order (exactly one entry, or none):
 
 1. **Type entries first.** An entry declaring a `type` matches ONLY a job that
 declared that same type — exact and case-insensitive (`"test"` matches
-`"Test"`). All type entries are checked first, in config order, regardless of
-where they sit relative to regex entries. First type match wins.
+`"Test"`) — and must ALSO satisfy the entry's `match` if it has one. All type
+entries are checked first, in config order, regardless of where they sit
+relative to regex entries. First type match wins.
 2. **Regex/default fallback.** If no type entry matched — including when the
 job has no type — the entries *without* a `type` are scanned in config order:
 `match.name` / `match.command` regexes and no-`match` defaults, first match
@@ -283,15 +287,17 @@ wins. Put a no-`match` default **last** so jobs you didn't anticipate still get
 a scorecard.
 3. No match → no digest.
 
-- `type` and `match` are mutually exclusive on one entry: when `type` is
-  present it is the only selector, and any `match` is ignored.
+- `type` and `match` compose (AND): with both present the entry matches only a
+  job of that type that also satisfies the regex. Use `match` alone for jobs
+  that won't pass a `type`.
 - `match.name` and `match.command` are **regexes** tested against the job's
   `name` and command line. Both present → both must match. Matching is
   **case-insensitive and unanchored (substring)** — so `"unit-tests"` matches
   `"unit-tests-run3"`.
 - `label` sets the wake tag: `digest (<label>): …`. Precedence: `label` →
-  (type entry) the type string → (matched regex entry) `match.name` →
-  `project-config`.
+  (type entry) the type string → (matched regex entry) `match.name` → the
+  entry's preset id (else `command`). So a bare `{ "preset": "go-test" }`
+  wakes as `digest (go-test):`.
 - First match wins; exactly one digest block is appended per wake.
 
 The legacy single-object form still works unchanged — `{ "digest": { "preset":
@@ -306,8 +312,8 @@ configured*.
 
 - **Exit code always leads.** The digest is appended after the universal
   stats, labeled `digest (<label>):` — `label` follows the precedence above
-  (entry `label` → type string → `match.name` → `project-config`). It never
-  overrides or reorders the exit code, duration, or line count.
+  (entry `label` → type string → `match.name` → preset id / `command`). It
+  never overrides or reorders the exit code, duration, or line count.
 - **Capped and timed.** Digest output is capped at ~500 chars, and buffering
   stops once that cap is reached — a command that prints unbounded output
   cannot balloon the wake. The digest command gets a 5s timeout plus a 250ms
@@ -324,7 +330,7 @@ A configured wake reads like this:
 Command: go test ./...
 Stats: 42.3s, 1204 lines
 Last output: FAIL example.com/api/handlers
-digest (project-config): 7 ok / 1 FAIL: TestResolveNotFound
+digest (go-test): 7 ok / 1 FAIL: TestResolveNotFound
 Review the result now: call `bgtail` ...
 ```
 

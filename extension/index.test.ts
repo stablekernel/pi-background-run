@@ -32,6 +32,7 @@ import { createHash } from "node:crypto";
 import {
   DIGEST_PRESETS,
   DIGEST_PRESET_IDS,
+  digestNoMatchWarning,
   entryMatchesJob,
   resolveDigest,
   selectDigestEntry,
@@ -2824,7 +2825,7 @@ test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort
   }
 });
 
-test("resolveConfig: digest type normalized; invalid type drops entry; match dropped when type present", async () => {
+test("resolveConfig: digest type normalized; invalid type drops entry; match kept on a type entry", async () => {
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod: any = await import(url);
   const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
@@ -2849,8 +2850,8 @@ test("resolveConfig: digest type normalized; invalid type drops entry; match dro
     assert.deepEqual(cfg.digest, [
       // type lowercased, kept.
       { type: "test", label: "t", command: "echo t" },
-      // match dropped because type is the only selector.
-      { type: "test", command: "echo both" },
+      // match kept — type and match compose (AND).
+      { type: "test", match: { name: "x" }, command: "echo both" },
       // invalid + blank type entries dropped.
       { command: "echo default" },
     ]);
@@ -2960,16 +2961,17 @@ test("selectDigestEntry: first match wins, default fallback, no match → undefi
     selectDigestEntry(entries, { name: "unit-tests", command: "go test" }),
     { command: goTest.command, label: "unit-tests" },
   );
-  // Second entry matches by command; no match.name → label falls back to the
-  // legacy "project-config" label.
+  // Second entry matches by command; no match.name and no preset → label
+  // falls back to "command".
   assert.deepEqual(
     selectDigestEntry(entries, { command: "cargo build --release" }),
-    { command: "echo build", label: "project-config" },
+    { command: "echo build", label: "command" },
   );
-  // Nothing matches the first two → the default entry (no match) wins.
+  // Nothing matches the first two → the default entry (no match) wins and
+  // labels itself with its preset id.
   assert.deepEqual(selectDigestEntry(entries, { command: "ls" }), {
     command: DIGEST_PRESETS.find((p) => p.id === "jest")!.command,
-    label: "project-config",
+    label: "jest",
   });
   // No default entry → undefined.
   assert.equal(
@@ -2982,7 +2984,7 @@ test("selectDigestEntry: first match wins, default fallback, no match → undefi
   assert.equal(selectDigestEntry(undefined, { command: "ls" }), undefined);
 });
 
-test("selectDigestEntry: label precedence (label → match.name → project-config)", () => {
+test("selectDigestEntry: label precedence (label → match.name → preset id/command)", () => {
   // Explicit label wins.
   assert.deepEqual(
     selectDigestEntry(
@@ -2999,10 +3001,10 @@ test("selectDigestEntry: label precedence (label → match.name → project-conf
     }),
     { command: "echo hi", label: "unit" },
   );
-  // No label / no name matcher → project-config (legacy label).
+  // No label / no name matcher / no preset → "command".
   assert.deepEqual(
     selectDigestEntry([{ command: "echo hi" }], { command: "go test" }),
-    { command: "echo hi", label: "project-config" },
+    { command: "echo hi", label: "command" },
   );
   // First-match-wins ordering: a later entry that also matches is ignored.
   assert.deepEqual(
@@ -3080,14 +3082,36 @@ test("selectDigestEntry: type beats regex entries regardless of config order", (
   );
 });
 
-test("selectDigestEntry: type + match on one entry → type wins (match ignored)", () => {
-  // Config normalization drops `match` on a type entry, but the selector is
-  // defensive: a direct caller passing both still gets type-first semantics.
+test("selectDigestEntry: type + match compose (AND) on one entry", () => {
+  const entries = [
+    { type: "test", match: { name: "unit" }, command: "echo typed" },
+  ];
+  // Both selectors must match: type "test" AND name "unit".
   assert.deepEqual(
-    selectDigestEntry(
-      [{ type: "test", match: { name: "never" }, command: "echo typed" }],
-      { type: "test", name: "unit", command: "go test" },
-    ),
+    selectDigestEntry(entries, {
+      type: "test",
+      name: "unit",
+      command: "go test",
+    }),
+    { command: "echo typed", label: "test" },
+  );
+  // Type matches but the `match` does not → no selection (match is NOT
+  // silently ignored).
+  assert.equal(
+    selectDigestEntry(entries, {
+      type: "test",
+      name: "e2e",
+      command: "go test",
+    }),
+    undefined,
+  );
+  // A type entry with no match still selects on type alone.
+  assert.deepEqual(
+    selectDigestEntry([{ type: "test", command: "echo typed" }], {
+      type: "test",
+      name: "anything",
+      command: "go test",
+    }),
     { command: "echo typed", label: "test" },
   );
 });
@@ -3102,8 +3126,8 @@ test("selectDigestEntry: label precedence for type entries (label → type)", ()
     { command: "echo hi", label: "unit" },
   );
   // No label → the type string. (A valid type entry always has a non-empty
-  // type, so "project-config" is the documented terminal default but is
-  // unreachable here; normalization guarantees that.)
+  // type, so the preset-id/"command" terminal default is unreachable here;
+  // normalization guarantees that.)
   assert.deepEqual(
     selectDigestEntry([{ type: "test", command: "echo hi" }], {
       type: "test",
@@ -3139,6 +3163,29 @@ test("entryMatchesJob: name/command regexes are case-insensitive and unanchored"
   assert.equal(
     entryMatchesJob({ match: { name: "e2e" }, preset: "go-test" }, target),
     false,
+  );
+});
+
+test("digestNoMatchWarning: names the job and the configured types", () => {
+  const entries = [
+    { type: "test", preset: "go-test" },
+    { type: "build", command: "echo b" },
+    { match: { name: "e2e" }, command: "echo e" },
+  ];
+  // Type mismatch — the common case, and the whole point of the diagnostic.
+  assert.equal(
+    digestNoMatchWarning({ type: "tests", command: "go test" }, entries),
+    '[pi-bgrun] digest configured but selected no entry for job type "tests" — configured types: test, build',
+  );
+  // No type → fall back to the job name.
+  assert.equal(
+    digestNoMatchWarning({ name: "lint", command: "npm run lint" }, entries),
+    '[pi-bgrun] digest configured but selected no entry for job name "lint" — configured types: test, build',
+  );
+  // No type or name → still a usable message (and no dangling types suffix).
+  assert.equal(
+    digestNoMatchWarning({ command: "ls" }, []),
+    "[pi-bgrun] digest configured but selected no entry for a job with no type or name",
   );
 });
 
@@ -3334,7 +3381,7 @@ test("shipped presets: suggestedType is advisory metadata, not selection behavio
     command: "anything at all",
   });
   assert.ok(selected, "bare preset entry still matches a typeless job");
-  assert.equal(selected.label, "project-config");
+  assert.equal(selected.label, "go-test");
 });
 
 // ── wake wiring: digest appended to the wake message (Phase 3) ─────────────
@@ -3368,9 +3415,7 @@ function trustCtx(ctx: any, proj: string, trusted: boolean): any {
 }
 
 function digestBlockOf(wake: string): string | null {
-  const m = wake.match(
-    /digest \(project-config\): ([\s\S]*?)\nReview the result/,
-  );
+  const m = wake.match(/digest \([^)]*\): ([\s\S]*?)\nReview the result/);
   return m ? m[1] : null;
 }
 
@@ -3398,7 +3443,7 @@ test("wake digest: preset scorecard appears on a green log", async () => {
     await waitForWakes(wakes, 1);
     const wake = wakes[0].text;
     const digest = digestBlockOf(wake);
-    assert.ok(digest, "wake carries a digest (project-config) block");
+    assert.ok(digest, "wake carries a digest block");
     assert.match(digest!, /pass: 2 {2}fail: 0/);
     assert.match(wake, /✅/);
     assert.match(wake, /exit 0/);
@@ -3433,7 +3478,7 @@ test("wake digest: preset scorecard appears on a red log", async () => {
     await waitForWakes(wakes, 1);
     const wake = wakes[0].text;
     const digest = digestBlockOf(wake);
-    assert.ok(digest, "wake carries a digest (project-config) block");
+    assert.ok(digest, "wake carries a digest block");
     assert.match(digest!, /pass: 0 {2}fail: 1/);
     assert.match(digest!, /^TestBeta$/m);
     assert.match(wake, /❌/);
@@ -3463,7 +3508,7 @@ test("wake digest: custom command output appears (first lines)", async () => {
     );
     await waitForWakes(wakes, 1);
     const digest = digestBlockOf(wakes[0].text);
-    assert.ok(digest, "wake carries a digest (project-config) block");
+    assert.ok(digest, "wake carries a digest block");
     assert.equal(digest, "alpha\nbeta");
   } finally {
     teardownDigestEnv(dir, proj, home);
@@ -3491,7 +3536,7 @@ test("wake digest: output capped at ~500 chars, first lines win", async () => {
     );
     await waitForWakes(wakes, 1);
     const digest = digestBlockOf(wakes[0].text);
-    assert.ok(digest, "wake carries a digest (project-config) block");
+    assert.ok(digest, "wake carries a digest block");
     assert.ok(
       digest!.length <= 500,
       `digest capped at 500 chars, got ${digest!.length}`,
@@ -3528,7 +3573,7 @@ test("wake digest: hanging command times out silently, wake still arrives (~5s b
     const elapsed = Date.now() - t0;
     const wake = wakes[0].text;
     assert.ok(
-      !wake.includes("digest (project-config)"),
+      !wake.includes("digest ("),
       "timed-out digest contributes nothing",
     );
     assert.match(wake, /✅/);
@@ -3562,10 +3607,7 @@ test("wake digest: failing digest command → no digest block, wake otherwise un
     );
     await waitForWakes(wakes, 1);
     const wake = wakes[0].text;
-    assert.ok(
-      !wake.includes("digest (project-config)"),
-      "failing digest contributes nothing",
-    );
+    assert.ok(!wake.includes("digest ("), "failing digest contributes nothing");
     assert.match(wake, /✅/);
     assert.match(wake, /exit 0/);
     assert.match(wake, /Last output: hello world/);
@@ -3605,7 +3647,7 @@ test("wake digest: no digest configured → wake shape unchanged (regression gua
       lines[4],
       "Review the result now: call `bgtail` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.",
     );
-    assert.ok(!wake.includes("digest (project-config)"));
+    assert.ok(!wake.includes("digest ("));
   } finally {
     teardownDigestEnv(dir, proj, home);
   }
@@ -3631,10 +3673,7 @@ test("wake digest: untrusted project → digest absent even when configured", as
         ctx,
       );
       await waitForWakes(wakes, 1);
-      assert.ok(
-        !wakes[0].text.includes("digest (project-config)"),
-        "untrusted → no digest",
-      );
+      assert.ok(!wakes[0].text.includes("digest ("), "untrusted → no digest");
     }
     // ...and a ctx with no isProjectTrusted at all.
     {
@@ -3651,7 +3690,7 @@ test("wake digest: untrusted project → digest absent even when configured", as
       );
       await waitForWakes(wakes, 1);
       assert.ok(
-        !wakes[0].text.includes("digest (project-config)"),
+        !wakes[0].text.includes("digest ("),
         "no trust check → no digest",
       );
     }
@@ -3806,6 +3845,40 @@ test("wake digest: empty array config produces no digest block", async () => {
     const wake = await runDigestJob(proj, { command: "echo hi" });
     assert.equal(digestLineOf(wake), null);
     assert.match(wake, /✅/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: type + match compose end-to-end (normalization keeps match)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        {
+          type: "test",
+          match: { name: "unit" },
+          label: "unit",
+          command: "echo unit",
+        },
+        { type: "test", label: "any-test", command: "echo any" },
+      ],
+    });
+    // type "test" AND name matches "unit" → first entry.
+    let wake = await runDigestJob(proj, {
+      type: "test",
+      name: "unit-tests",
+      command: "go test",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(unit\): unit$/);
+    // type "test" but name does not match → second entry proves `match` is
+    // kept (not dropped) on a type entry.
+    wake = await runDigestJob(proj, {
+      type: "test",
+      name: "other",
+      command: "go test",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(any-test\): any$/);
   } finally {
     teardownDigestEnv(dir, proj, home);
   }

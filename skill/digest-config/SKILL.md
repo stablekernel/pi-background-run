@@ -38,17 +38,21 @@ both `preset` and `command` are set within one entry, the preset wins:
 Prefer a `type` on each entry: it is matched exactly (case-insensitive) against
 the `type:` the agent passes to `bgrun`, so it does not depend on job names or
 command lines staying stable. When you configure a `type`, tell the agent to
-pass it: `bgrun(command: …, name: …, type: "test")`.
+pass it: `bgrun(command: …, name: …, type: "test")`. If a job's `type`/name
+selects no entry, pi-bgrun logs a one-line diagnostic naming the job and the
+configured types — check it when a scorecard is expected but absent.
 
 Selection (exactly one entry, or none):
+
 1. Entries with a `type` are checked **first**, in config order, and match only
-   a job declaring that exact type. First type match wins.
+   a job declaring that exact type that also satisfies the entry's `match` if
+   it has one. First type match wins.
 2. Otherwise the entries **without** a `type` are scanned in config order:
    `match.name` / `match.command` regexes and no-`match` defaults.
 3. No match → no digest.
 
-- `type` and `match` are mutually exclusive on one entry; `type` wins and any
-  `match` is ignored.
+- `type` and `match` compose (AND): with both present, only a job of that type
+  that also satisfies the regex matches.
 - `match.name` / `match.command` are **regexes** tested against the job's
   `name` and command line; both present → both must match. They are
   **case-insensitive and unanchored (substring)**.
@@ -56,7 +60,7 @@ Selection (exactly one entry, or none):
   **last** as the default. Include one so jobs you did not anticipate still
   get a scorecard.
 - `label` sets the wake tag; without it a type entry uses its `type` string, a
-  regex entry uses the matched `match.name`, else `project-config`.
+  regex entry uses the matched `match.name`, else the preset id (or `command`).
 - An invalid regex, an invalid `type`, or an entry with no valid
   `preset`/`command` is dropped silently; an empty/all-invalid list counts as
   unconfigured.

@@ -52,8 +52,10 @@ import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import {
   DIGEST_PRESET_IDS,
+  digestNoMatchWarning,
   selectDigestEntry,
   type DigestEntry,
+  type DigestJobTarget,
   type DigestMatch,
 } from "./digestPresets.ts";
 
@@ -253,12 +255,14 @@ function appendExcludePattern(
 
 // Digest config validation: invalid values are dropped from the resolved
 // config (best-effort — a malformed digest section must never break a wake or
-// the whole config), but the human gets exactly one console.error per process
-// so a typo is discoverable.
-let digestWarned = false;
+// the whole config), but the human gets one console.error per distinct invalid
+// field (capped) so typos are discoverable without flooding the log.
+const digestWarned = new Set<string>();
+const DIGEST_WARN_CAP = 5;
 function warnDigestInvalid(field: string, value: unknown): void {
-  if (digestWarned) return;
-  digestWarned = true;
+  if (digestWarned.has(field)) return;
+  if (digestWarned.size >= DIGEST_WARN_CAP) return;
+  digestWarned.add(field);
   const hint =
     field === "preset"
       ? ` — valid presets: ${DIGEST_PRESET_IDS.join(", ")}`
@@ -312,11 +316,10 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
     command?: unknown;
   };
 
-  // `type` and `match` are mutually exclusive selectors: when `type` is present
-  // it is the ONLY selector for the entry, so any `match` is ignored (dropped
-  // below). An invalid `type` (present but not a non-empty string) drops the
-  // whole entry — same best-effort policy as an uncompilable regex. Types are
-  // lowercase-normalized so selection is a cheap exact comparison.
+  // `type` and `match` compose (AND): both are kept and both must match at
+  // selection time. An invalid `type` (present but not a non-empty string)
+  // drops the whole entry — same best-effort policy as an uncompilable regex.
+  // Types are lowercase-normalized so selection is a cheap exact comparison.
   let type: string | undefined;
   if (entry.type !== undefined) {
     if (typeof entry.type !== "string" || !entry.type.trim()) {
@@ -327,7 +330,7 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   }
 
   let match: DigestMatch | undefined;
-  if (type === undefined && entry.match !== undefined) {
+  if (entry.match !== undefined) {
     if (
       !entry.match ||
       typeof entry.match !== "object" ||
@@ -1238,17 +1241,31 @@ export default function (pi: ExtensionAPI) {
         let digestBlock: { label: string; text: string } | undefined;
         try {
           // First matching entry wins, in config order. The label defaults to
-          // the entry's label, then a matched `match.name`, then the historical
-          // "project-config" for the legacy single-object config.
-          const selected = selectDigestEntry(resolveConfig(rec.ctx).digest, {
+          // the entry's label, the entry's type, a matched `match.name`, then
+          // the entry's preset id (or "command").
+          const digestEntries = resolveConfig(rec.ctx).digest;
+          const digestTarget: DigestJobTarget = {
             name: rec.name,
             type: rec.type,
             command: rec.cmd,
-          });
+          };
+          const selected = selectDigestEntry(digestEntries, digestTarget);
           if (selected) {
             const raw = await runDigestCommand(selected.command, logPath);
             const text = raw === undefined ? undefined : capDigestOutput(raw);
             if (text) digestBlock = { label: selected.label, text };
+          } else if (digestEntries?.length) {
+            // Configured but nothing selected — otherwise silent. Surface the
+            // job's type/name plus the configured types, once per distinct
+            // diagnostic (capped), so a type mismatch or dead regex is visible.
+            const warning = digestNoMatchWarning(digestTarget, digestEntries);
+            if (
+              !digestNoMatchWarned.has(warning) &&
+              digestNoMatchWarned.size < DIGEST_NO_MATCH_WARN_CAP
+            ) {
+              digestNoMatchWarned.add(warning);
+              console.error(warning);
+            }
           }
         } catch (e) {
           // Silent-fail: a broken digest never breaks a wake (ground rule 3).
@@ -1422,6 +1439,11 @@ export default function (pi: ExtensionAPI) {
         : joined;
     return capped.trim() || undefined;
   }
+
+  // No-match diagnostics seen this process (capped) — keyed by the full
+  // warning string so a type mismatch and a dead regex each surface once.
+  const digestNoMatchWarned = new Set<string>();
+  const DIGEST_NO_MATCH_WARN_CAP = 3;
 
   // ── Digest nudge: one-shot session_start toast for digest-less projects ────
   // When a trusted project has actually used bgrun (≥1 finished job log in the

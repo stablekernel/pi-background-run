@@ -55,7 +55,8 @@ no polling.
 ### Reading results without flooding context
 
 If the wake message carries a `digest (<label>):` block (the label is the
-entry's `label`, its type, or `project-config`), read that
+entry's `label`, its type, a matched `match.name`, or the preset id /
+`command`), read that
 first — it is a short pass/fail scorecard configured for this project and
 usually answers "what failed" without any follow-up read. `bgtail` stays the
 positional-peek tool for everything else.
