@@ -23,9 +23,23 @@ import {
   appendFileSync,
   readdirSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
+import {
+  DIGEST_PRESETS,
+  DIGEST_PRESET_IDS,
+  digestNoMatchWarning,
+  entryMatchesJob,
+  resolveDigest,
+  selectDigestEntry,
+} from "./digestPresets.ts";
+import {
+  DIGEST_NUDGE_TEXT,
+  digestNudgeMarkerPath,
+  jobUsageMarkerPath,
+} from "./index.ts";
 
 interface CapturedWake {
   text: string;
@@ -1610,6 +1624,56 @@ test("bgclean: default scope is this session's logs; all: true sweeps everything
   }
 });
 
+test("bgclean all: sweeps stale per-project digest markers, keeps fresh ones", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const fs = await import("node:fs");
+    const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const staleMarkers = [".bgrun-used-abc123", ".digest-nudge-def456"];
+    const freshMarker = ".bgrun-used-fresh0";
+    for (const name of [...staleMarkers, freshMarker]) {
+      const p = join(dir, name);
+      fs.writeFileSync(p, "1");
+      if (staleMarkers.includes(name)) fs.utimesSync(p, old, old);
+    }
+    // A backdated finished log so the sweep also has a normal job to remove.
+    const logPath = join(dir, "job-1-1.log");
+    fs.writeFileSync(logPath, "out\n__BGRUN_EXIT__=0\n");
+    fs.utimesSync(logPath, old, old);
+
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgclean = tools.get("bgclean")!;
+    await bgclean.execute(
+      "call-mk",
+      { days: 1, all: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    for (const name of staleMarkers) {
+      assert.ok(!existsSync(join(dir, name)), `stale marker swept: ${name}`);
+    }
+    assert.ok(existsSync(join(dir, freshMarker)), "fresh marker kept");
+
+    // A session-scoped sweep (no `all`) also drops stale markers: they are not
+    // session data, so the default bgclean still cleans them.
+    const stale2 = join(dir, ".digest-nudge-stale2");
+    fs.writeFileSync(stale2, "1");
+    fs.utimesSync(stale2, old, old);
+    await bgclean.execute("call-mk2", { days: 1 }, undefined, undefined, ctx);
+    assert.ok(
+      !existsSync(stale2),
+      "session-scoped sweep also drops stale markers",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("bgclean: rejects negative days", async () => {
   const { pi, tools, ctx } = makeFakePi();
   await loadExtension(pi);
@@ -2565,5 +2629,1829 @@ test("bgtail and bggrep clamp nonsensical numeric params", async () => {
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── universal stats in the wake message (digest foundation) ──────────────
+
+test("formatDuration: one decimal in seconds under a minute, m:ss above", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  assert.equal(typeof mod.formatDuration, "function");
+  assert.equal(mod.formatDuration(0), "0.0s");
+  assert.equal(mod.formatDuration(42_300), "42.3s");
+  assert.equal(mod.formatDuration(59_000), "59.0s");
+  assert.equal(mod.formatDuration(60_000), "1:00");
+  assert.equal(mod.formatDuration(307_000), "5:07");
+  assert.equal(mod.formatDuration(3_600_000), "60:00");
+});
+
+test("wake message: Stats line (duration + line count) sits between Command: and Last output: on a green run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-stats1",
+      { command: "echo hello world" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    // Duration (0.0s for an instant job) + the command's OWN line count — the
+    // appended exit marker and its blank separator are excluded.
+    assert.match(wake, /Stats: 0\.0s, 1 lines/);
+    const cmdIdx = wake.indexOf("Command: ");
+    const statsIdx = wake.indexOf("Stats: ");
+    const lastIdx = wake.indexOf("Last output: ");
+    assert.ok(
+      cmdIdx !== -1 && cmdIdx < statsIdx && statsIdx < lastIdx,
+      "Stats line sits between Command: and Last output:",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wake message: Stats line also present on a red (non-zero exit) run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-stats2",
+      { command: "echo failing; exit 7" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    assert.match(wakes[0].text, /Stats: \d+\.\ds, \d+ lines/);
+    assert.match(wakes[0].text, /exit 7/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wake message: missing log file — Stats shows duration only, wake still sent", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    // Unlink the log while the job runs; at exit the file is gone.
+    const res = await bgrun.execute(
+      "call-stats3",
+      { command: "sleep 0.3; echo late" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    rmSync(join(dir, `${id}.log`), { force: true });
+
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    assert.match(wake, /✅/);
+    assert.match(wake, /Stats: \d+\.\ds$/m, "duration only, no lines");
+    assert.ok(!wake.includes(" lines"), "unreadable log contributes nothing");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── digest config + shipped presets (opt-in) ─────────────────────────────
+
+function writeJson(filePath: string, obj: unknown): void {
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify(obj));
+}
+
+test("resolveConfig: digest resolves from a trusted project config", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  ); // does not exist
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    const cfg = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => true,
+    });
+    // The legacy object form normalizes to a single entry with no matchers.
+    assert.deepEqual(cfg.digest, [{ preset: "go-test" }]);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: digest absent everywhere → undefined", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    const cfg = mod.resolveConfig({});
+    assert.equal(cfg.digest, undefined);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+  }
+});
+
+test("resolveConfig: untrusted project → no digest even when the project config has one", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    // No isProjectTrusted on ctx at all.
+    assert.equal(mod.resolveConfig({ cwd: proj }).digest, undefined);
+    // Explicitly untrusted.
+    assert.equal(
+      mod.resolveConfig({ cwd: proj, isProjectTrusted: () => false }).digest,
+      undefined,
+    );
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: layering — project digest replaces user digest wholesale; user used when project has none", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const home = mkdtempSync(join(tmpdir(), "pi-bgrun-home-"));
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(home, "user.json");
+  try {
+    writeJson(join(home, "user.json"), {
+      digest: { command: 'grep . "$1" | head -5' },
+    });
+    // No project digest → user digest stands.
+    let cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.deepEqual(cfg.digest, [{ command: 'grep . "$1" | head -5' }]);
+    // Project digest → replaces the user's digest object entirely (per-key
+    // merge on the digest object is a later question; keep it simple now).
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "jest" },
+    });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.deepEqual(cfg.digest, [{ preset: "jest" }]);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort)", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    // Both invalid → no digest at all.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "nonsense", command: 42 },
+    });
+    let cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+    // Invalid preset dropped, valid command kept.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "nonsense", command: 'grep x "$1" | head -3' },
+    });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.deepEqual(cfg.digest, [{ command: 'grep x "$1" | head -3' }]);
+    // Whitespace-only command is not a command.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: "   " },
+    });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+    // An array of non-entry scalars has no usable entries → undefined.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: ["go-test"] });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+    // A present-but-unusable section (wrong type) is unconfigured, not a crash.
+    for (const bad of ["go-test", 42, true]) {
+      writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: bad });
+      cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+      assert.equal(
+        cfg.digest,
+        undefined,
+        `digest ${JSON.stringify(bad)} is ignored`,
+      );
+    }
+    // Empty array and all-invalid arrays normalize to undefined (the nudge
+    // checks `cfg.digest` truthiness).
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: [] });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ preset: "nonsense" }, { command: 42 }, { match: {} }],
+    });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: digest label is trimmed and capped at 60", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { label: "  spaced  ", command: "echo a" },
+        { label: "x".repeat(100), command: "echo b" },
+        { label: "   ", command: "echo c" },
+      ],
+    });
+    const cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.deepEqual(cfg.digest, [
+      // leading/trailing whitespace trimmed.
+      { label: "spaced", command: "echo a" },
+      // over-long label capped at 60.
+      { label: "x".repeat(60), command: "echo b" },
+      // blank label dropped, entry kept.
+      { command: "echo c" },
+    ]);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: digest type normalized; invalid type drops entry; match kept on a type entry", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: "TEST", label: "t", command: "echo t" },
+        { type: "test", match: { name: "x" }, command: "echo both" },
+        { type: "z".repeat(45), command: "echo long" },
+        { type: 42, command: "echo bad" },
+        { type: "   ", command: "echo blank" },
+        { command: "echo default" },
+      ],
+    });
+    const cfg = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => true,
+    });
+    assert.deepEqual(cfg.digest, [
+      // type lowercased, kept.
+      { type: "test", label: "t", command: "echo t" },
+      // match kept — type and match compose (AND).
+      { type: "test", match: { name: "x" }, command: "echo both" },
+      // over-long type capped to 40 (same cap the job side applies).
+      { type: "z".repeat(40), command: "echo long" },
+      // invalid + blank type entries dropped.
+      { command: "echo default" },
+    ]);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveDigest: preset wins over command; normalization shapes", () => {
+  const goTest = DIGEST_PRESETS.find((p) => p.id === "go-test")!;
+  // Both configured → preset wins (curated beats hand-rolled).
+  assert.equal(
+    resolveDigest({ preset: "go-test", command: 'grep x "$1" | head -3' }),
+    goTest.command,
+  );
+  // Command only.
+  assert.equal(
+    resolveDigest({ command: 'grep x "$1" | head -3' }),
+    'grep x "$1" | head -3',
+  );
+  // Unknown preset (bypassing config validation) falls back to command,
+  // else undefined.
+  assert.equal(resolveDigest({ preset: "bogus", command: "x" }), "x");
+  assert.equal(resolveDigest({ preset: "bogus" }), undefined);
+  assert.equal(resolveDigest(undefined), undefined);
+  assert.equal(resolveDigest({}), undefined);
+});
+
+// ── digest entry matching + selection (pure, multi-scorecard) ──────────────
+
+test("entryMatchesJob: absent/empty match, name, command, and AND semantics", () => {
+  const target = { name: "unit-tests", command: "go test ./..." };
+  // No matcher / empty matcher → matches every job.
+  assert.equal(entryMatchesJob({ preset: "go-test" }, target), true);
+  assert.equal(entryMatchesJob({ match: {}, preset: "go-test" }, target), true);
+  // Name glob: `*` is any run; a bare pattern is a whole-string match.
+  assert.equal(
+    entryMatchesJob({ match: { name: "unit-*" }, preset: "go-test" }, target),
+    true,
+  );
+  assert.equal(
+    entryMatchesJob({ match: { name: "e2e-*" }, preset: "go-test" }, target),
+    false,
+  );
+  // A name matcher never matches a job that has no name.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit" }, preset: "go-test" },
+      { command: "go test" },
+    ),
+    false,
+  );
+  // Command glob: substring needs explicit `*` on both sides.
+  assert.equal(
+    entryMatchesJob(
+      { match: { command: "*cargo build*" }, preset: "go-test" },
+      target,
+    ),
+    false,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { command: "*go test*" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  // Both present → AND.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "*unit*", command: "*go test*" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "*unit*", command: "*cargo*" }, preset: "go-test" },
+      target,
+    ),
+    false,
+  );
+  // Glob, not regex: `[` is a literal character, so it matches only a literal
+  // `[` — never throws, never a regex class.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "[" }, preset: "go-test" },
+      { name: "unit-tests", command: "go test" },
+    ),
+    false,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "[" }, preset: "go-test" },
+      { name: "[", command: "go test" },
+    ),
+    true,
+  );
+});
+
+test("selectDigestEntry: first match wins, default fallback, no match → undefined", () => {
+  const goTest = DIGEST_PRESETS.find((p) => p.id === "go-test")!;
+  const entries = [
+    { match: { name: "unit-tests" }, preset: "go-test" },
+    { match: { command: "*cargo build*" }, command: "echo build" },
+    { preset: "jest" },
+  ];
+  // First entry matches by name.
+  assert.deepEqual(
+    selectDigestEntry(entries, { name: "unit-tests", command: "go test" }),
+    { command: goTest.command, label: "unit-tests" },
+  );
+  // Second entry matches by command; no match.name and no preset → label
+  // falls back to "command".
+  assert.deepEqual(
+    selectDigestEntry(entries, { command: "cargo build --release" }),
+    { command: "echo build", label: "command" },
+  );
+  // Nothing matches the first two → the default entry (no match) wins and
+  // labels itself with its preset id.
+  assert.deepEqual(selectDigestEntry(entries, { command: "ls" }), {
+    command: DIGEST_PRESETS.find((p) => p.id === "jest")!.command,
+    label: "jest",
+  });
+  // No default entry → undefined.
+  assert.equal(
+    selectDigestEntry([{ match: { name: "x" }, preset: "go-test" }], {
+      command: "ls",
+    }),
+    undefined,
+  );
+  // Unconfigured → undefined.
+  assert.equal(selectDigestEntry(undefined, { command: "ls" }), undefined);
+});
+
+test("selectDigestEntry: label precedence (label → match.name → preset id/command)", () => {
+  // Explicit label wins.
+  assert.deepEqual(
+    selectDigestEntry(
+      [{ match: { name: "unit" }, label: "unit", command: "echo hi" }],
+      { name: "unit", command: "go test" },
+    ),
+    { command: "echo hi", label: "unit" },
+  );
+  // No label → matched name.
+  assert.deepEqual(
+    selectDigestEntry([{ match: { name: "unit" }, command: "echo hi" }], {
+      name: "unit",
+      command: "go test",
+    }),
+    { command: "echo hi", label: "unit" },
+  );
+  // No label / no name matcher / no preset → "command".
+  assert.deepEqual(
+    selectDigestEntry([{ command: "echo hi" }], { command: "go test" }),
+    { command: "echo hi", label: "command" },
+  );
+  // First-match-wins ordering: a later entry that also matches is ignored.
+  assert.deepEqual(
+    selectDigestEntry(
+      [
+        { match: { name: "unit" }, label: "first", command: "echo first" },
+        { match: { name: "unit" }, label: "second", command: "echo second" },
+      ],
+      { name: "unit", command: "go test" },
+    ),
+    { command: "echo first", label: "first" },
+  );
+});
+
+test("selectDigestEntry: a glob match.name labels the wake with wildcards stripped", () => {
+  assert.deepEqual(
+    selectDigestEntry([{ match: { name: "*cargo*" }, command: "echo hi" }], {
+      name: "cargo-build",
+      command: "cargo build --release",
+    }),
+    { command: "echo hi", label: "cargo" },
+  );
+  // A pattern that strips to nothing falls back to the preset id / "command".
+  assert.deepEqual(
+    selectDigestEntry([{ match: { name: "*" }, command: "echo hi" }], {
+      name: "anything",
+      command: "anything",
+    }),
+    { command: "echo hi", label: "command" },
+  );
+  // Escapes are unwrapped; the now-literal `*` is kept.
+  assert.deepEqual(
+    selectDigestEntry([{ match: { name: "e2e-\\*" }, command: "echo hi" }], {
+      name: "e2e-*",
+      command: "go test",
+    }),
+    { command: "echo hi", label: "e2e-*" },
+  );
+});
+
+// ── type-first digest selection (job type declared at spawn) ──────────────
+
+test("selectDigestEntry: type-first selection (exact, case-insensitive) + fallback", () => {
+  const entries = [
+    {
+      match: { name: "unit" },
+      label: "match-unit",
+      command: "echo match-unit",
+    },
+    { type: "test", command: "echo type-test" },
+    { label: "default", command: "echo default" },
+  ];
+  // A job declaring the type selects the type entry first, even though an
+  // earlier match entry also matches.
+  assert.deepEqual(
+    selectDigestEntry(entries, {
+      type: "test",
+      name: "unit",
+      command: "go test",
+    }),
+    { command: "echo type-test", label: "test" },
+  );
+  // Case-insensitive exact match.
+  assert.deepEqual(
+    selectDigestEntry(entries, { type: "TEST", command: "go test" }),
+    { command: "echo type-test", label: "test" },
+  );
+  // A job type with no entry falls through to the match/default scan.
+  assert.deepEqual(
+    selectDigestEntry(entries, {
+      type: "lint",
+      name: "unit",
+      command: "go test",
+    }),
+    { command: "echo match-unit", label: "match-unit" },
+  );
+  // No type at all: unchanged legacy behavior.
+  assert.deepEqual(selectDigestEntry(entries, { command: "ls" }), {
+    command: "echo default",
+    label: "default",
+  });
+});
+
+test("selectDigestEntry: type beats match entries regardless of config order", () => {
+  const want = { command: "echo typed", label: "typed" };
+  const matchFirst = [
+    { match: { command: "go test" }, label: "match", command: "echo match" },
+    { type: "test", label: "typed", command: "echo typed" },
+  ];
+  const typeFirst = [
+    { type: "test", label: "typed", command: "echo typed" },
+    { match: { command: "go test" }, label: "match", command: "echo match" },
+  ];
+  assert.deepEqual(
+    selectDigestEntry(matchFirst, { type: "test", command: "go test" }),
+    want,
+  );
+  assert.deepEqual(
+    selectDigestEntry(typeFirst, { type: "test", command: "go test" }),
+    want,
+  );
+});
+
+test("selectDigestEntry: type + match compose (AND) on one entry", () => {
+  const entries = [
+    { type: "test", match: { name: "unit" }, command: "echo typed" },
+  ];
+  // Both selectors must match: type "test" AND name "unit".
+  assert.deepEqual(
+    selectDigestEntry(entries, {
+      type: "test",
+      name: "unit",
+      command: "go test",
+    }),
+    { command: "echo typed", label: "test" },
+  );
+  // Type matches but the `match` does not → no selection (match is NOT
+  // silently ignored).
+  assert.equal(
+    selectDigestEntry(entries, {
+      type: "test",
+      name: "e2e",
+      command: "go test",
+    }),
+    undefined,
+  );
+  // A type entry with no match still selects on type alone.
+  assert.deepEqual(
+    selectDigestEntry([{ type: "test", command: "echo typed" }], {
+      type: "test",
+      name: "anything",
+      command: "go test",
+    }),
+    { command: "echo typed", label: "test" },
+  );
+});
+
+test("selectDigestEntry: label precedence for type entries (label → type)", () => {
+  // Explicit label wins.
+  assert.deepEqual(
+    selectDigestEntry([{ type: "test", label: "unit", command: "echo hi" }], {
+      type: "test",
+      command: "go test",
+    }),
+    { command: "echo hi", label: "unit" },
+  );
+  // No label → the type string. (A valid type entry always has a non-empty
+  // type, so the preset-id/"command" terminal default is unreachable here;
+  // normalization guarantees that.)
+  assert.deepEqual(
+    selectDigestEntry([{ type: "test", command: "echo hi" }], {
+      type: "test",
+      command: "go test",
+    }),
+    { command: "echo hi", label: "test" },
+  );
+});
+
+test("entryMatchesJob: glob is whole-string, case-insensitive, * and ? wildcards", () => {
+  const target = { name: "unit-tests-run3", command: "go test ./..." };
+  // A noisy name needs an explicit wildcard — a bare pattern is whole-string.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "*unit-tests*" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  // Case-insensitive.
+  assert.equal(
+    entryMatchesJob({ match: { name: "*UNIT*" }, preset: "go-test" }, target),
+    true,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { command: "*GO TEST*" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  // A bare pattern matches the whole string only (no implicit substring).
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit-tests" }, preset: "go-test" },
+      target,
+    ),
+    false,
+  );
+  // `?` is exactly one character.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit-test?-run3" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  // `\` escapes a wildcard so it matches literally.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit\\*tests" }, preset: "go-test" },
+      { name: "unit*tests", command: "go test" },
+    ),
+    true,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit\\*tests" }, preset: "go-test" },
+      { name: "unitXtests", command: "go test" },
+    ),
+    false,
+  );
+  // A non-matching pattern still fails.
+  assert.equal(
+    entryMatchesJob({ match: { name: "*e2e*" }, preset: "go-test" }, target),
+    false,
+  );
+});
+
+test("digestNoMatchWarning: names the job and the configured types", () => {
+  const entries = [
+    { type: "test", preset: "go-test" },
+    { type: "build", command: "echo b" },
+    { match: { name: "e2e" }, command: "echo e" },
+  ];
+  // Type mismatch — the common case, and the whole point of the diagnostic.
+  assert.equal(
+    digestNoMatchWarning({ type: "tests", command: "go test" }, entries),
+    '[pi-bgrun] digest configured but selected no entry for job type "tests" — configured types: test, build',
+  );
+  // No type → fall back to the job name.
+  assert.equal(
+    digestNoMatchWarning({ name: "lint", command: "npm run lint" }, entries),
+    '[pi-bgrun] digest configured but selected no entry for job name "lint" — configured types: test, build',
+  );
+  // No type or name → still a usable message (and no dangling types suffix).
+  assert.equal(
+    digestNoMatchWarning({ command: "ls" }, []),
+    "[pi-bgrun] digest configured but selected no entry for a job with no type or name",
+  );
+});
+
+// ── preset commands: scorecards against green and red fixture logs ─────────
+
+// Runs a preset command exactly the way the wake path will (Phase 3):
+// sh -c <command> digest <logPath>, so the log path arrives as $1.
+function runPreset(presetId: string, log: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-preset-"));
+  try {
+    const logPath = join(dir, "job.log");
+    writeFileSync(logPath, log);
+    const preset = DIGEST_PRESETS.find((p) => p.id === presetId)!;
+    const res = spawnSync("sh", ["-c", preset.command, "digest", logPath], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(
+      res.status,
+      0,
+      `${presetId} command should exit 0 (${res.stderr})`,
+    );
+    return res.stdout;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("preset go-test: green and red scorecards", () => {
+  const green = runPreset(
+    "go-test",
+    [
+      "=== RUN TestAlpha",
+      "--- PASS: TestAlpha (0.00s)",
+      "=== RUN TestBeta",
+      "--- PASS: TestBeta (0.00s)",
+      "PASS",
+      "ok  \texample.com/a\t0.01s",
+      "ok  \texample.com/b\t0.02s",
+    ].join("\n"),
+  );
+  assert.match(green, /pass: 2 {2}fail: 0/);
+  assert.ok(!green.includes("Beta"), "no failing names on green");
+
+  const red = runPreset(
+    "go-test",
+    [
+      "=== RUN TestAlpha",
+      "--- PASS: TestAlpha (0.00s)",
+      "=== RUN TestBeta",
+      "--- FAIL: TestBeta (0.00s)",
+      "    a_test.go:12: boom",
+      "FAIL",
+      "ok  \texample.com/a\t0.01s",
+      "FAIL\texample.com/b\t0.02s",
+    ].join("\n"),
+  );
+  assert.match(red, /pass: 1 {2}fail: 1/);
+  assert.match(red, /^TestBeta$/m, "failing test name listed");
+  assert.ok(!red.includes("Alpha"), "passing tests not listed");
+});
+
+test("preset jest: green and red scorecards", () => {
+  const green = runPreset(
+    "jest",
+    [
+      "PASS src/a.test.js",
+      "Test Suites: 1 passed, 1 total",
+      "Tests:       3 passed, 3 total",
+    ].join("\n"),
+  );
+  assert.match(green, /Tests:\s+3 passed, 3 total/);
+  assert.ok(!green.includes("failed"), "no failure mention on green");
+
+  const red = runPreset(
+    "jest",
+    [
+      "FAIL src/b.test.js",
+      "  ● b does the thing",
+      "",
+      "  ✕ b other thing",
+      "",
+      "Test Suites: 1 failed, 1 passed, 2 total",
+      "Tests:       1 failed, 2 passed, 3 total",
+    ].join("\n"),
+  );
+  assert.match(red, /Tests:\s+1 failed, 2 passed, 3 total/);
+  assert.match(red, /b does the thing/m, "failed test name listed");
+  assert.match(red, /b other thing/m, "verbose-style failure listed");
+});
+
+test("preset pytest: green and red scorecards", () => {
+  const green = runPreset(
+    "pytest",
+    [
+      "tests/test_a.py ....                                              [100%]",
+      "============================== 4 passed in 0.02s ==============================",
+    ].join("\n"),
+  );
+  assert.match(green, /4 passed in 0\.02s/);
+  assert.ok(!green.includes("failed"), "no failure mention on green");
+
+  const red = runPreset(
+    "pytest",
+    [
+      "tests/test_a.py F..                                               [ 75%]",
+      "tests/test_b.py .E                                               [100%]",
+      "=================================== FAILURES ===================================",
+      "_________________________________ test_boom __________________________________",
+      "E   assert False",
+      "========================= 1 failed, 1 error, 3 passed in 0.05s =========================",
+      "FAILED tests/test_a.py::test_boom - assert False",
+      "ERROR tests/test_b.py::test_err - RuntimeError: boom",
+    ].join("\n"),
+  );
+  assert.match(red, /1 failed, 1 error, 3 passed in 0\.05s/);
+  assert.match(red, /tests\/test_a\.py::test_boom/m, "FAILED id listed");
+});
+
+test("preset junit-xml: green and red scorecards (real single-line pytest output)", () => {
+  // pytest --junitxml emits the whole document on ONE line — the fixture
+  // matches that, so the record-based awk is genuinely exercised.
+  const green = runPreset(
+    "junit-xml",
+    '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="3" time="0.01" timestamp="2024-01-01T00:00:00"><testcase classname="tests.test_a" name="test_ok" time="0.001" /><testcase classname="tests.test_a" name="test_ok2" time="0.002" /></testsuite></testsuites>',
+  );
+  assert.match(green, /failures: 0 {2}errors: 0/);
+  assert.ok(!green.includes("test_ok"), "no testcase names on green");
+  assert.ok(!green.includes("pytest"), "testsuite name is not reported");
+
+  const red = runPreset(
+    "junit-xml",
+    '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" errors="1" failures="1" skipped="0" tests="3" time="0.01" timestamp="2024-01-01T00:00:00"><testcase classname="tests.test_a" name="test_boom" time="0.001"><failure message="assert False">E   assert False</failure></testcase><testcase classname="tests.test_a" name="test_err" time="0.001"><error message="boom">RuntimeError: boom</error></testcase><testcase classname="tests.test_a" name="test_ok" time="0.001" /></testsuite></testsuites>',
+  );
+  assert.match(red, /failures: 1 {2}errors: 1/);
+  assert.match(red, /^test_boom$/m, "failing testcase name listed");
+  assert.match(red, /^test_err$/m, "errored testcase name listed");
+  // Regression (carper): with one-line XML the old line-based scan reported the
+  // testsuite's own name, "pytest", instead of the failing test.
+  assert.ok(!red.includes("pytest"), "testsuite name is not reported");
+  assert.ok(!/^test_ok$/m.test(red), "passing testcase not listed");
+
+  // Pretty-printed XML (attributes on their own line) must work too.
+  const pretty = runPreset(
+    "junit-xml",
+    [
+      '<?xml version="1.0" encoding="utf-8"?>',
+      '<testsuites name="pytest tests">',
+      '  <testsuite name="pytest" tests="1" failures="1" errors="0">',
+      "    <testcase",
+      '      classname="tests.test_a"',
+      '      name="test_boom"',
+      '      time="0.001">',
+      '      <failure message="assert False">E   assert False</failure>',
+      "    </testcase>",
+      "  </testsuite>",
+      "</testsuites>",
+    ].join("\n"),
+  );
+  assert.match(pretty, /failures: 1 {2}errors: 0/);
+  assert.match(
+    pretty,
+    /^test_boom$/m,
+    "pretty-printed XML also names the failure",
+  );
+  assert.ok(!pretty.includes("pytest"), "no testsuite name leak");
+});
+
+test("shipped presets: ids are stable and every command ends in head (bounded output)", () => {
+  assert.deepEqual(DIGEST_PRESET_IDS, [
+    "go-test",
+    "jest",
+    "pytest",
+    "junit-xml",
+  ]);
+  for (const preset of DIGEST_PRESETS) {
+    assert.match(
+      preset.command,
+      /\|\s*head -\d+$/,
+      `${preset.id} command ends in head -N`,
+    );
+  }
+});
+
+test("shipped presets: README and digest-config skill document every preset id", () => {
+  const readme = readFileSync(join(process.cwd(), "README.md"), "utf8");
+  const skill = readFileSync(
+    join(process.cwd(), "skill", "digest-config", "SKILL.md"),
+    "utf8",
+  );
+  for (const id of DIGEST_PRESET_IDS) {
+    assert.ok(readme.includes(id), `README documents ${id}`);
+    assert.ok(skill.includes(id), `digest-config skill documents ${id}`);
+  }
+});
+
+test("shipped presets: suggestedType is advisory metadata, not selection behavior", () => {
+  // Every preset suggests a type (all are test runners today) ...
+  for (const preset of DIGEST_PRESETS) {
+    assert.equal(
+      typeof preset.suggestedType,
+      "string",
+      `${preset.id} carries a suggestedType`,
+    );
+    assert.ok(
+      preset.suggestedType.length > 0,
+      `${preset.id} suggestion is non-empty`,
+    );
+  }
+  // ... but a preset entry with no `type` still selects every job (a job with
+  // no declared type included), so the suggestion never changes matching.
+  const selected = selectDigestEntry([{ preset: "go-test" }], {
+    command: "anything at all",
+  });
+  assert.ok(selected, "bare preset entry still matches a typeless job");
+  assert.equal(selected.label, "go-test");
+});
+
+// ── wake wiring: digest appended to the wake message (Phase 3) ─────────────
+
+// Isolated env for wake-wiring tests: temp jobsDir + a project dir with a
+// `.pi/pi-bgrun.json` + a user config path that does not exist (so only the
+// project layer can contribute a digest).
+function setupDigestEnv(): { dir: string; proj: string; home: string } {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-bgrun-home-"));
+  process.env.PI_BGRUN_DIR = dir;
+  process.env.PI_BGRUN_USER_CONFIG = join(home, "user.json"); // does not exist
+  return { dir, proj, home };
+}
+
+function teardownDigestEnv(dir: string, proj: string, home: string): void {
+  delete process.env.PI_BGRUN_DIR;
+  delete process.env.PI_BGRUN_USER_CONFIG;
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(proj, { recursive: true, force: true });
+  rmSync(home, { recursive: true, force: true });
+}
+
+// The fake ctx from makeFakePi has no cwd/isProjectTrusted; point it at the
+// project so resolveConfig reads its config, with controllable trust.
+function trustCtx(ctx: any, proj: string, trusted: boolean): any {
+  ctx.cwd = proj;
+  ctx.isProjectTrusted = () => trusted;
+  return ctx;
+}
+
+function digestBlockOf(wake: string): string | null {
+  const m = wake.match(/digest \([^)]*\): ([\s\S]*?)\nReview the result/);
+  return m ? m[1] : null;
+}
+
+test("wake digest: preset scorecard appears on a green log", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg1",
+      {
+        command:
+          "printf 'ok  \\texample.com/a\\t0.01s\\nok  \\texample.com/b\\t0.02s\\n'",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    const digest = digestBlockOf(wake);
+    assert.ok(digest, "wake carries a digest block");
+    assert.match(digest!, /pass: 2 {2}fail: 0/);
+    assert.match(wake, /✅/);
+    assert.match(wake, /exit 0/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: preset scorecard appears on a red log", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg2",
+      {
+        command:
+          // printf's format can't start with `--` (parsed as an option), so
+          // use %s args; the tab is a literal character in the shell arg.
+          "printf '%s\\n' '--- FAIL: TestBeta (0.00s)' 'FAIL\texample.com/b\t0.02s'; exit 1",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    const digest = digestBlockOf(wake);
+    assert.ok(digest, "wake carries a digest block");
+    assert.match(digest!, /pass: 0 {2}fail: 1/);
+    assert.match(digest!, /^TestBeta$/m);
+    assert.match(wake, /❌/);
+    assert.match(wake, /exit 1/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: custom command output appears (first lines)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: "sed -n '1,2p' \"$1\"" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg3",
+      { command: "printf 'alpha\\nbeta\\ngamma\\n'" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const digest = digestBlockOf(wakes[0].text);
+    assert.ok(digest, "wake carries a digest block");
+    assert.equal(digest, "alpha\nbeta");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: output capped at ~500 chars, first lines win", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: 'cat "$1"' },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    // 100 lines ≈ 780 chars of log — well past the 500-char digest budget.
+    await bgrun.execute(
+      "call-dg4",
+      { command: "seq 1 100 | sed 's/^/line /'" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const digest = digestBlockOf(wakes[0].text);
+    assert.ok(digest, "wake carries a digest block");
+    assert.ok(
+      digest!.length <= 500,
+      `digest capped at 500 chars, got ${digest!.length}`,
+    );
+    assert.match(digest!, /^line 1$/m, "first line survives the cap");
+    assert.ok(!digest!.includes("line 100"), "tail lines are cut");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: hanging command times out silently, wake still arrives (~5s bound)", {
+  timeout: 20000,
+}, async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: "sleep 30" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    const t0 = Date.now();
+    await bgrun.execute(
+      "call-dg5",
+      { command: "echo quick" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1, 8000);
+    const elapsed = Date.now() - t0;
+    const wake = wakes[0].text;
+    assert.ok(
+      !wake.includes("digest ("),
+      "timed-out digest contributes nothing",
+    );
+    assert.match(wake, /✅/);
+    assert.match(wake, /exit 0/);
+    assert.ok(
+      elapsed < 7000,
+      `wake arrived in ${elapsed}ms, within the ~5s digest bound + overhead`,
+    );
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: failing digest command → no digest block, wake otherwise unchanged", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: 'grep "NO-SUCH-STRING" "$1"' },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg6",
+      { command: "echo hello world" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    assert.ok(!wake.includes("digest ("), "failing digest contributes nothing");
+    assert.match(wake, /✅/);
+    assert.match(wake, /exit 0/);
+    assert.match(wake, /Last output: hello world/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: a digest that prints then exits non-zero contributes nothing", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: "echo PARTIAL-OUTPUT; exit 1" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg-fail",
+      { command: "echo hello world" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    // Contract: an erroring digest appends nothing — even if it printed.
+    assert.ok(!wake.includes("digest ("), "failed digest contributes nothing");
+    assert.ok(!wake.includes("PARTIAL-OUTPUT"), "no partial digest output");
+    assert.match(wake, /✅/);
+    assert.match(wake, /Last output: hello world/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: no digest configured → wake shape unchanged (regression guard)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    // No digest section written for proj at all.
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg7",
+      { command: "echo hello world" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    const id = wake.match(/`([^`]+)`/)![1];
+    const lines = wake.split("\n");
+    // Pre-digest shape: exit line, Command, Stats (Phase 1), Last output,
+    // Review instruction — exactly five lines, nothing appended.
+    assert.equal(lines.length, 5);
+    assert.equal(lines[0], `✅ Background job \`${id}\` finished (exit 0).`);
+    assert.equal(lines[1], "Command: echo hello world");
+    assert.match(lines[2], /^Stats: /);
+    assert.equal(lines[3], "Last output: hello world");
+    assert.equal(
+      lines[4],
+      "Review the result now: call `bgtail` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.",
+    );
+    assert.ok(!wake.includes("digest ("));
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: untrusted project → digest absent even when configured", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    // Explicitly untrusted...
+    {
+      const { pi, wakes, tools, ctx } = makeFakePi();
+      trustCtx(ctx, proj, false);
+      await loadExtension(pi);
+      const bgrun = tools.get("bgrun")!;
+      await bgrun.execute(
+        "call-dg8",
+        { command: "echo hello world" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      await waitForWakes(wakes, 1);
+      assert.ok(!wakes[0].text.includes("digest ("), "untrusted → no digest");
+    }
+    // ...and a ctx with no isProjectTrusted at all.
+    {
+      const { pi, wakes, tools, ctx } = makeFakePi();
+      ctx.cwd = proj; // no isProjectTrusted — defaults to untrusted
+      await loadExtension(pi);
+      const bgrun = tools.get("bgrun")!;
+      await bgrun.execute(
+        "call-dg9",
+        { command: "echo hello world" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      await waitForWakes(wakes, 1);
+      assert.ok(
+        !wakes[0].text.includes("digest ("),
+        "no trust check → no digest",
+      );
+    }
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+// ── wake digest: multiple scorecards with per-job matching ────────────────
+
+// Run one bgrun job against the shared digest env and return its wake text.
+async function runDigestJob(
+  proj: string,
+  params: { command: string; name?: string; type?: string },
+  id = "call-multi",
+): Promise<string> {
+  const { pi, wakes, tools, ctx } = makeFakePi();
+  trustCtx(ctx, proj, true);
+  await loadExtension(pi);
+  const bgrun = tools.get("bgrun")!;
+  await bgrun.execute(id, params, undefined, undefined, ctx);
+  await waitForWakes(wakes, 1);
+  return wakes[0].text;
+}
+
+// First line of any `digest (<label>): <body>` block.
+function digestLineOf(wake: string): string | null {
+  const m = wake.match(/^digest \([^)]*\): .*$/m);
+  return m ? m[0] : null;
+}
+
+test("wake digest: match by job name chooses the matching entry", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { match: { name: "unit-tests" }, preset: "go-test" },
+        { label: "default", command: "echo default" },
+      ],
+    });
+    const wake = await runDigestJob(proj, {
+      name: "unit-tests",
+      command: "printf 'ok  \\texample.com/a\\t0.01s\\n'",
+    });
+    const line = digestLineOf(wake);
+    assert.ok(line, "wake carries a digest line");
+    assert.match(
+      line!,
+      /^digest \(unit-tests\):/,
+      "label falls back to match.name",
+    );
+    assert.match(line!, /pass: 1 {2}fail: 0/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: match by command line chooses the matching entry", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        {
+          match: { command: "*cargo build*" },
+          label: "build",
+          command: "echo build-ok",
+        },
+        { label: "default", command: "echo default" },
+      ],
+    });
+    const wake = await runDigestJob(proj, { command: "cargo build --release" });
+    const line = digestLineOf(wake);
+    assert.ok(line, "wake carries a digest line");
+    assert.match(line!, /^digest \(build\): build-ok$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: first match wins when two entries both match", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { label: "first", command: "echo first" },
+        { label: "second", command: "echo second" },
+      ],
+    });
+    const wake = await runDigestJob(proj, { command: "echo hi" });
+    assert.match(digestLineOf(wake)!, /^digest \(first\): first$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: default entry used when no matcher matches", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { match: { name: "e2e" }, command: "echo e2e" },
+        { label: "fallback", command: "echo fallback" },
+      ],
+    });
+    const wake = await runDigestJob(proj, {
+      name: "unit-tests",
+      command: "echo hi",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(fallback\): fallback$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: no entry matches and no default → no digest block", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ match: { name: "e2e" }, command: "echo e2e" }],
+    });
+    const wake = await runDigestJob(proj, {
+      name: "unit-tests",
+      command: "echo hi",
+    });
+    assert.equal(digestLineOf(wake), null);
+    assert.match(wake, /✅/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: non-matching literal entry skipped, later entry used", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        // `[` is a literal glob char, not a regex class — it just won't match.
+        { match: { name: "[" }, label: "broken", command: "echo broken" },
+        { label: "ok", command: "echo ok" },
+      ],
+    });
+    const wake = await runDigestJob(proj, {
+      name: "unit-tests",
+      command: "echo hi",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(ok\): ok$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: empty array config produces no digest block", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: [] });
+    const wake = await runDigestJob(proj, { command: "echo hi" });
+    assert.equal(digestLineOf(wake), null);
+    assert.match(wake, /✅/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: type + match compose end-to-end (normalization keeps match)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        {
+          type: "test",
+          match: { name: "*unit*" },
+          label: "unit",
+          command: "echo unit",
+        },
+        { type: "test", label: "any-test", command: "echo any" },
+      ],
+    });
+    // type "test" AND name matches "unit" → first entry.
+    let wake = await runDigestJob(proj, {
+      type: "test",
+      name: "unit-tests",
+      command: "go test",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(unit\): unit$/);
+    // type "test" but name does not match → second entry proves `match` is
+    // kept (not dropped) on a type entry.
+    wake = await runDigestJob(proj, {
+      type: "test",
+      name: "other",
+      command: "go test",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(any-test\): any$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: over-long config type matches an over-long job type (shared 40-char cap)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    const longType = "t".repeat(45);
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ type: longType, label: "long", command: "echo long" }],
+    });
+    const wake = await runDigestJob(proj, {
+      type: longType,
+      command: "echo hi",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(long\): long$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+// ── wake digest: type-first selection ──────────────────────────────────────
+
+test("wake digest: job type selects the matching type entry (digest (test))", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: "test", preset: "go-test" },
+        { type: "build", label: "build", command: "echo build-ok" },
+      ],
+    });
+    const wake = await runDigestJob(proj, {
+      type: "test",
+      command: "printf 'ok  \\texample.com/a\\t0.01s\\n'",
+    });
+    const line = digestLineOf(wake);
+    assert.ok(line, "wake carries a digest line");
+    assert.match(
+      line!,
+      /^digest \(test\):/,
+      "label falls back to the type string",
+    );
+    assert.match(line!, /pass: 1 {2}fail: 0/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: type is case-insensitive; unknown type falls through to match/default", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: "test", label: "typed-test", command: "echo typed" },
+        { match: { command: "*run*" }, label: "match", command: "echo match" },
+        { label: "default", command: "echo default" },
+      ],
+    });
+    // Case-insensitive exact type match.
+    let wake = await runDigestJob(proj, { type: "TEST", command: "echo hi" });
+    assert.match(digestLineOf(wake)!, /^digest \(typed-test\): typed$/);
+    // Unknown type → falls through to the match scan.
+    wake = await runDigestJob(proj, {
+      type: "lint",
+      command: "npm run lint",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(match\): match$/);
+    // Unknown type + no match → default entry.
+    wake = await runDigestJob(proj, { type: "lint", command: "ls" });
+    assert.match(digestLineOf(wake)!, /^digest \(default\): default$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: type entry beats an earlier match entry (type-first order)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        {
+          match: { command: "*go test*" },
+          label: "match",
+          command: "echo match",
+        },
+        { type: "test", label: "typed", command: "echo typed" },
+      ],
+    });
+    const wake = await runDigestJob(proj, {
+      type: "test",
+      command: "go test ./...",
+    });
+    assert.match(digestLineOf(wake)!, /^digest \(typed\): typed$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: invalid type entry dropped, other entries still work", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: 7, command: "echo broken" },
+        { type: "test", label: "typed", command: "echo typed" },
+      ],
+    });
+    const wake = await runDigestJob(proj, { type: "test", command: "echo hi" });
+    assert.match(digestLineOf(wake)!, /^digest \(typed\): typed$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("bgrun: type flows into the started result, entries, and resume reconstruction", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, entries, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const res = await bgrun.execute(
+      "call-ty1",
+      { command: "echo typed", name: "unit-tests", type: "Test" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const started = res.content[0].text as string;
+    const id = (started.match(/^started: ([^\n]+)/) || [])[1];
+    assert.ok(id, "got a job id");
+    assert.match(started, /^ {2}name: unit-tests$/m);
+    // Types are lowercase-normalized so selection is an exact compare.
+    assert.match(started, /^ {2}type: test$/m);
+    assert.equal((res.details as any).type, "test");
+    await waitForWakes(wakes, 1);
+
+    // The persisted done entry carries the type.
+    const done = entries.filter((e) => e.customType === "bgrun-job").at(-1);
+    assert.equal(done.data.type, "test");
+
+    // Resume: a fresh instance reconstructs the in-memory map from entries.
+    const {
+      pi: pi2,
+      tools: tools2,
+      ctx: ctx2,
+      fireSessionStart,
+    } = makeFakePi({ priorEntries: entries });
+    await loadExtension(pi2);
+    await fireSessionStart();
+    const bgstatus2 = tools2.get("bgstatus")!;
+    const status = await bgstatus2.execute(
+      "call-ty2",
+      { id },
+      undefined,
+      undefined,
+      ctx2,
+    );
+    const text = status.content[0].text as string;
+    assert.match(
+      text,
+      /^ {2}type: test$/m,
+      "reconstructed record carries the type",
+    );
+    assert.equal((status.details as any).type, "test");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: no type → no type line in the started result", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const res = await bgrun.execute(
+      "call-ty3",
+      { command: "echo plain" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!(res.content[0].text as string).includes("type:"));
+    assert.equal((res.details as any).type, undefined);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── digest nudge: one-shot session_start toast ────────────────────────────
+
+// Real exported paths — no local mirror to drift from the implementation.
+const usageMarker = jobUsageMarkerPath;
+const nudgeMarker = digestNudgeMarkerPath;
+
+function writeUsageMarker(jobsDir: string, projectDir: string): void {
+  mkdirSync(jobsDir, { recursive: true });
+  writeFileSync(usageMarker(jobsDir, projectDir), "1");
+}
+
+function captureNotify(ctx: any): string[] {
+  const messages: string[] = [];
+  ctx.hasUI = true;
+  ctx.ui.notify = (text: string) => {
+    messages.push(text);
+  };
+  return messages;
+}
+
+test("digest nudge: fires on session_start (trusted, no digest, usage marker set) and writes the marker", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeUsageMarker(dir, proj);
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
+    assert.ok(existsSync(nudgeMarker(dir, proj)), "marker file created");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: silent when a digest IS configured (marker untouched)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    writeUsageMarker(dir, proj);
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [], "no toast when a digest is configured");
+    assert.ok(!existsSync(nudgeMarker(dir, proj)), "no marker written");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: silent when the project is untrusted", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeUsageMarker(dir, proj);
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, false);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [], "untrusted project → no toast");
+    assert.ok(!existsSync(nudgeMarker(dir, proj)), "no marker written");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: silent when the project has no usage marker", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    // No `.bgrun-used-*` marker for this project → no evidence of use.
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [], "no done jobs → no toast");
+    assert.ok(!existsSync(nudgeMarker(dir, proj)), "no marker written");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: silent when the marker file already exists", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeUsageMarker(dir, proj);
+    writeFileSync(nudgeMarker(dir, proj), "1717000000000");
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    assert.deepEqual(messages, [], "marker present → stay silent");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: a throwing ui.notify does not break session_start", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeUsageMarker(dir, proj);
+    const { pi, ctx, fireSessionStart } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    ctx.hasUI = true;
+    ctx.ui.notify = () => {
+      throw new Error("toast exploded");
+    };
+    await loadExtension(pi);
+    await fireSessionStart(); // must not throw
+
+    // The failed toast counts as "not nudged" — the marker is intentionally
+    // not written, so the next session can try again. Session_start is intact.
+    assert.ok(!existsSync(nudgeMarker(dir, proj)));
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: marker is per-project — a second project sharing the jobs dir still gets nudged", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  const proj2 = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  try {
+    writeUsageMarker(dir, proj);
+    writeUsageMarker(dir, proj2);
+
+    // First project: nudged, writes its own marker.
+    {
+      const { pi, ctx, fireSessionStart } = makeFakePi();
+      trustCtx(ctx, proj, true);
+      const messages = captureNotify(ctx);
+      await loadExtension(pi);
+      await fireSessionStart();
+      assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
+      assert.ok(existsSync(nudgeMarker(dir, proj)), "project 1 marker written");
+    }
+
+    // Second project on the same shared jobs dir is not silenced by project 1.
+    {
+      const { pi, ctx, fireSessionStart } = makeFakePi();
+      trustCtx(ctx, proj2, true);
+      const messages = captureNotify(ctx);
+      await loadExtension(pi);
+      await fireSessionStart();
+      assert.deepEqual(
+        messages,
+        [DIGEST_NUDGE_TEXT],
+        "each project gets its own one-shot nudge",
+      );
+      assert.ok(
+        existsSync(nudgeMarker(dir, proj2)),
+        "project 2 marker written",
+      );
+    }
+  } finally {
+    rmSync(proj2, { recursive: true, force: true });
+    teardownDigestEnv(dir, proj, home);
   }
 });

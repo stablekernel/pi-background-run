@@ -37,6 +37,7 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  readSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -48,6 +49,15 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
+import {
+  DIGEST_PRESET_IDS,
+  digestNoMatchWarning,
+  selectDigestEntry,
+  type DigestEntry,
+  type DigestJobTarget,
+  type DigestMatch,
+} from "./digestPresets.ts";
 
 // Exit marker appended to every log so the file is self-describing: the exit
 // code survives pi restarting. `;` (not `&&`) ensures the printf runs even when
@@ -97,6 +107,17 @@ interface BgrunConfig {
   // keep every sweep session-scoped (then only `bgclean all` touches foreign
   // logs).
   globalAutoClean: boolean;
+  // Opt-in digest scorecards, normalized to an ordered list of entries (or
+  // undefined when unconfigured or fully invalid — an empty array is normalized
+  // to undefined so the session_start nudge still sees "not configured"). The
+  // object form is normalized to a single entry with no matchers. Each entry
+  // carries an optional `match` (globs against the job name / command line),
+  // an optional wake `label`, and a `preset` or custom `command`. At wake time
+  // the FIRST matching entry wins. Presets are shipped sh commands (see
+  // digestPresets.ts); command receives the job's log path as $1. Resolved from
+  // trusted project config only — never runs pattern matching unless the
+  // project opted in.
+  digest?: DigestEntry[];
 }
 
 interface BgrunConfigFile {
@@ -105,6 +126,7 @@ interface BgrunConfigFile {
   showCompletedJobs?: unknown;
   cleanupDays?: unknown;
   globalAutoClean?: unknown;
+  digest?: unknown;
 }
 
 function parseBoolEnv(v: string | undefined): boolean | undefined {
@@ -231,13 +253,197 @@ function appendExcludePattern(
   return true;
 }
 
+// Digest config validation: invalid values are dropped from the resolved
+// config (best-effort — a malformed digest section must never break a wake or
+// the whole config), but the human gets one console.error per distinct invalid
+// field so typos are discoverable without flooding the log. The field set is a
+// fixed, code-defined list (preset / command / match / type / ...), so the
+// dedupe set is naturally bounded.
+const digestWarned = new Set<string>();
+function warnDigestInvalid(field: string, value: unknown): void {
+  if (digestWarned.has(field)) return;
+  digestWarned.add(field);
+  const hint =
+    field === "preset"
+      ? ` — valid presets: ${DIGEST_PRESET_IDS.join(", ")}`
+      : "";
+  // Point at the array form too: the same `digest` key accepts an ordered
+  // list of { type, match, label, preset, command } entries.
+  const shapeHint =
+    " — digest takes an object or an array of { type, match, label, preset, command } entries";
+  // field "" means the whole `digest` section was unusable (wrong shape).
+  const where = field ? `digest.${field}` : "digest";
+  console.error(
+    `[pi-bgrun] ignoring invalid ${where} in pi-bgrun.json: ${JSON.stringify(value)}${hint}${shapeHint}`,
+  );
+}
+
+function projectHash(projectDir: string): string {
+  return createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
+}
+
+/**
+ * Per-project "this project has run a bgrun job" marker in the jobs dir,
+ * keyed by the session's project directory (cwd) — the same key
+ * resolveJobsDirPath uses. Written (best-effort) at spawn and read at
+ * session_start by the digest nudge, so evidence of use stays project-scoped
+ * even when the jobs dir is the shared machine-global one.
+ */
+export function jobUsageMarkerPath(
+  jobsDir: string,
+  projectDir: string,
+): string {
+  return join(jobsDir, `.bgrun-used-${projectHash(projectDir)}`);
+}
+
+/**
+ * Per-project marker path for the one-shot digest nudge. The jobs dir is
+ * shared machine-wide, so a bare `.digest-nudge-done` marker would silence the
+ * nudge for every other project after the first to earn it. Key the marker by
+ * the project directory so each project gets its own one-shot.
+ */
+export function digestNudgeMarkerPath(
+  jobsDir: string,
+  projectDir: string,
+): string {
+  return join(jobsDir, `.digest-nudge-${projectHash(projectDir)}`);
+}
+
+/**
+ * One-shot session_start toast for a trusted project with no digest
+ * configured (see maybeNudgeDigest). Exported so tests assert the real string.
+ */
+export const DIGEST_NUDGE_TEXT =
+  "pi-bgrun: no digest configured for this project — use the digest-config skill to set one up.";
+
+// Job and config `type` values are short routing tokens. Both sides cap at the
+// same length; if only the job side truncated, a >MAX_TYPE_LEN config type
+// would silently never match the job's truncated type.
+const MAX_TYPE_LEN = 40;
+const MAX_LABEL_LEN = 60;
+
+/**
+ * Trim, lowercase, and cap a job or config `type`. Non-string or blank →
+ * undefined. Both the bgrun param and the digest config go through here so
+ * their truncation can never drift apart.
+ */
+function normalizeType(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, MAX_TYPE_LEN);
+}
+
+// Normalize one digest entry from the object-or-array config. Best-effort:
+// anything unusable is dropped (never throws). An entry without a usable
+// preset or command contributes nothing; a non-string `match` field drops the
+// whole entry (the human gets the one-time warning).
+function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const entry = raw as {
+    type?: unknown;
+    match?: unknown;
+    label?: unknown;
+    preset?: unknown;
+    command?: unknown;
+  };
+
+  // `type` and `match` compose (AND): both are kept and both must match at
+  // selection time. An invalid `type` (present but not a non-empty string)
+  // drops the whole entry (same best-effort policy as an invalid `match`).
+  // normalizeType() applies the same trim/lowercase/cap the job side uses, so
+  // a long config type still matches the (truncated) long job type.
+  let type: string | undefined;
+  if (entry.type !== undefined) {
+    type = normalizeType(entry.type);
+    if (!type) {
+      warnDigestInvalid("type", entry.type);
+      return undefined;
+    }
+  }
+
+  let match: DigestMatch | undefined;
+  if (entry.match !== undefined) {
+    if (
+      !entry.match ||
+      typeof entry.match !== "object" ||
+      Array.isArray(entry.match)
+    ) {
+      warnDigestInvalid("match", entry.match);
+      return undefined;
+    }
+    const rawMatch = entry.match as { name?: unknown; command?: unknown };
+    const normalized: DigestMatch = {};
+    // A glob pattern is any string; a blank one is treated as absent so it
+    // doesn't constrain matching. A non-string is invalid → drop the entry.
+    if (rawMatch.name !== undefined) {
+      if (typeof rawMatch.name !== "string") {
+        warnDigestInvalid("match.name", rawMatch.name);
+        return undefined;
+      }
+      if (rawMatch.name.trim()) normalized.name = rawMatch.name;
+    }
+    if (rawMatch.command !== undefined) {
+      if (typeof rawMatch.command !== "string") {
+        warnDigestInvalid("match.command", rawMatch.command);
+        return undefined;
+      }
+      if (rawMatch.command.trim()) normalized.command = rawMatch.command;
+    }
+    if (normalized.name !== undefined || normalized.command !== undefined) {
+      match = normalized;
+    }
+  }
+
+  let preset: string | undefined;
+  if (entry.preset !== undefined) {
+    if (
+      typeof entry.preset === "string" &&
+      DIGEST_PRESET_IDS.includes(entry.preset)
+    ) {
+      preset = entry.preset;
+    } else {
+      warnDigestInvalid("preset", entry.preset);
+    }
+  }
+
+  let command: string | undefined;
+  if (entry.command !== undefined) {
+    if (typeof entry.command === "string" && entry.command.trim()) {
+      command = entry.command;
+    } else {
+      warnDigestInvalid("command", entry.command);
+    }
+  }
+
+  // Neither preset nor command → nothing this entry can score. Drop it.
+  if (!preset && !command) return undefined;
+
+  const out: DigestEntry = {};
+  if (type) out.type = type;
+  if (match) out.match = match;
+  if (typeof entry.label === "string" && entry.label.trim()) {
+    out.label = entry.label.trim().slice(0, MAX_LABEL_LEN);
+  }
+  if (preset) out.preset = preset;
+  if (command) out.command = command;
+  return out;
+}
+
 // Resolved per call (cheap: at most two small file reads) so env/config
 // changes are picked up without module reloads — and tests can isolate.
-function resolveConfig(ctx?: {
+// Exported for tests, like formatSince.
+export function resolveConfig(ctx?: {
   cwd?: string;
   isProjectTrusted?: () => boolean;
 }): BgrunConfig {
-  const user = readConfigFile(join(homedir(), ".pi", "agent", "pi-bgrun.json"));
+  // User config: $HOME/.pi/agent/pi-bgrun.json, overridable via
+  // PI_BGRUN_USER_CONFIG (mirrors the PI_BGRUN_DIR escape hatch — mainly for
+  // tests, which cannot swap the real home dir).
+  const user = readConfigFile(
+    process.env.PI_BGRUN_USER_CONFIG ||
+      join(homedir(), ".pi", "agent", "pi-bgrun.json"),
+  );
   let project: BgrunConfigFile = {};
   try {
     if (ctx?.isProjectTrusted?.()) {
@@ -275,6 +481,40 @@ function resolveConfig(ctx?: {
   const daysEnv = Number.isFinite(envDays) && envDays > 0 ? envDays : undefined;
   const { dir: jobsDir, projectLocal: jobsDirProjectLocal } =
     resolveJobsDirPath(process.env.PI_BGRUN_DIR || dirFile, ctx);
+  // Digest section: accept either the legacy single-object form (normalized to
+  // one entry with no matchers) or an ordered array of entries. Invalid inputs
+  // are dropped best-effort (warnDigestInvalid logs once per distinct field) —
+  // including a present-but-unusable section (a string/number, or a list that
+  // empties out). When both preset and command are valid within an entry, both
+  // are kept here — resolveDigest() gives the preset precedence. An empty or
+  // all-invalid section normalizes to undefined so `cfg.digest` truthiness
+  // still means "configured" (the session_start nudge relies on that).
+  let digest: BgrunConfig["digest"];
+  if (Array.isArray(merged.digest)) {
+    const entries = merged.digest
+      .map((raw) => normalizeDigestEntry(raw))
+      .filter((e): e is DigestEntry => e !== undefined);
+    if (entries.length) {
+      digest = entries;
+    } else if (merged.digest.length) {
+      // A non-empty list that normalized to nothing: every entry was invalid.
+      warnDigestInvalid("", merged.digest);
+    }
+  } else if (merged.digest !== undefined && merged.digest !== null) {
+    // A present non-null value that isn't a list. `null` is treated as absent.
+    if (typeof merged.digest === "object") {
+      const entry = normalizeDigestEntry(merged.digest);
+      if (entry) {
+        digest = [entry];
+      } else {
+        warnDigestInvalid("", merged.digest);
+      }
+    } else {
+      // Present but not an object/list — a likely mistake like
+      // `"digest": "go-test"`, which would otherwise be silently unconfigured.
+      warnDigestInvalid("", merged.digest);
+    }
+  }
   return {
     jobsDir,
     jobsDirProjectLocal,
@@ -289,6 +529,7 @@ function resolveConfig(ctx?: {
       parseBoolEnv(process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN) ??
       globalCleanFile ??
       true,
+    digest,
   };
 }
 
@@ -317,11 +558,23 @@ export function formatSince(started: number, now: number = Date.now()): string {
   return `${ymd} ${time}`;
 }
 
+// Universal-stats duration formatting for the wake message's Stats line: one
+// decimal in seconds under a minute ("42.3s"), m:ss above ("5:07").
+// Exported for tests, like formatSince.
+export function formatDuration(ms: number): string {
+  const s = Math.max(0, ms) / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60) + (Math.round(s % 60) === 60 ? 1 : 0);
+  const rem = Math.round(s % 60) % 60;
+  return `${m}:${String(rem).padStart(2, "0")}`;
+}
+
 interface JobRecord {
   id: string;
   pid: number;
   cmd: string;
   name?: string; // optional human-readable label
+  type?: string; // optional job type used for digest scorecard selection
   started: number;
   logPath: string;
   exitedAt?: number;
@@ -338,6 +591,7 @@ interface BgrunJobEntryData {
   pid: number;
   cmd: string;
   name?: string;
+  type?: string;
   started: number;
   logPath: string;
   state: "running" | "done";
@@ -351,6 +605,7 @@ interface BgStatusDetails {
   exitCode?: number;
   cmd?: string;
   name?: string;
+  type?: string;
   count?: number;
   recovered?: boolean;
 }
@@ -393,6 +648,12 @@ export default function (pi: ExtensionAPI) {
     return trimmed.slice(0, 80);
   }
 
+  // Normalize an optional job type via the shared normalizeType(), so the
+  // bgrun param and the config `type` truncate identically (see MAX_TYPE_LEN).
+  function sanitizeType(type: string | undefined): string | undefined {
+    return normalizeType(type);
+  }
+
   function readLastLogLine(logPath: string, maxLen = 200): string | null {
     try {
       const content = readFileSync(logPath, "utf8");
@@ -403,6 +664,58 @@ export default function (pi: ExtensionAPI) {
       return last.length > maxLen ? last.slice(0, maxLen) + "…" : last;
     } catch {
       return null;
+    }
+  }
+
+  // Count the log's total lines with a bounded-memory streaming scan (one
+  // fixed-size buffer, no full-file read). Missing/unreadable file → null:
+  // the Stats line then just omits the line count — best-effort, never
+  // breaks a wake.
+  function countLogLines(logPath: string): number | null {
+    let fd: number;
+    try {
+      fd = openSync(logPath, "r");
+    } catch {
+      return null;
+    }
+    try {
+      const buf = Buffer.alloc(64 * 1024);
+      let newlines = 0;
+      let size = 0;
+      let bytesRead = 0;
+      do {
+        bytesRead = readSync(fd, buf, 0, buf.length, null);
+        if (bytesRead <= 0) break;
+        size += bytesRead;
+        for (let i = 0; i < bytesRead; i++) {
+          if (buf[i] === 0x0a) newlines++;
+        }
+      } while (bytesRead === buf.length);
+      if (size === 0) return 0;
+      // One bounded pread of the tail for the final-byte + exit-marker check.
+      const tailLen = Math.min(size, 512);
+      const tail = Buffer.alloc(tailLen);
+      readSync(fd, tail, 0, tailLen, size - tailLen);
+      const tailText = tail.toString("latin1");
+      const endsWithNewline = tailText.charCodeAt(tailText.length - 1) === 0x0a;
+      let count = newlines + (endsWithNewline ? 0 : 1);
+      // The wrapper appends "\n<EXIT_MARKER><ec>\n" — those newlines are not
+      // command output. Drop the marker line, plus the blank separator when the
+      // output already ended in a newline.
+      const markerAt = tailText.lastIndexOf("\n" + EXIT_MARKER);
+      if (markerAt !== -1) {
+        let extra = 0;
+        for (let i = markerAt + 1; i < tailText.length; i++) {
+          if (tailText.charCodeAt(i) === 0x0a) extra++;
+        }
+        if (markerAt > 0 && tailText.charCodeAt(markerAt - 1) === 0x0a) extra++;
+        count = Math.max(0, count - extra);
+      }
+      return count;
+    } catch {
+      return null;
+    } finally {
+      closeSync(fd);
     }
   }
 
@@ -454,6 +767,33 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
+
+  // Sweep stale per-project digest markers (.bgrun-used-*, .digest-nudge-*).
+  // They aren't session-scoped, so they'd otherwise accumulate one per project
+  // forever; a project that runs bgrun again re-writes its usage marker at
+  // spawn, so removing a stale one can at most re-enable one future nudge.
+  function sweepStaleMarkers(jobsDir: string, cutoff: number): void {
+    let names: string[];
+    try {
+      names = readdirSync(jobsDir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (
+        !name.startsWith(".bgrun-used-") &&
+        !name.startsWith(".digest-nudge-")
+      )
+        continue;
+      try {
+        const markerPath = join(jobsDir, name);
+        if (statSync(markerPath).mtimeMs > cutoff) continue;
+        unlinkSync(markerPath);
+      } catch {
+        // ignore
+      }
+    }
+  }
 
   function cleanOldJobs(
     days: number,
@@ -507,6 +847,7 @@ export default function (pi: ExtensionAPI) {
         // ignore
       }
     }
+    sweepStaleMarkers(jobsDir, cutoff);
     if (result.removed > 0 && ctx?.hasUI) {
       ctx.ui.notify(`bgrun: cleaned ${result.removed} old job log(s)`, "info");
     }
@@ -546,6 +887,9 @@ export default function (pi: ExtensionAPI) {
         // ignore
       }
     }
+    // Markers aren't session data, so a session-scoped sweep may still drop
+    // stale ones from this jobs dir.
+    sweepStaleMarkers(resolveConfig(ctx).jobsDir, cutoff);
     if (result.removed > 0 && ctx?.hasUI) {
       ctx.ui.notify(`bgrun: cleaned ${result.removed} old job log(s)`, "info");
     }
@@ -618,6 +962,7 @@ export default function (pi: ExtensionAPI) {
           pid: rec.pid,
           cmd: rec.cmd,
           name: rec.name,
+          type: rec.type,
           started: rec.started,
           logPath: rec.logPath,
           state: "done",
@@ -737,6 +1082,7 @@ export default function (pi: ExtensionAPI) {
           pid: d.pid,
           cmd: d.cmd,
           name: d.name,
+          type: d.type,
           started: d.started,
           logPath: d.logPath,
           exitedAt: d.exitedAt,
@@ -791,6 +1137,10 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // One-shot digest nudge (toast only, never the LLM context). All of its
+    // failure modes are swallowed inside — it must never break session_start.
+    maybeNudgeDigest(ctx);
+
     // Show the widget if anything is now running. revalidateStaleJobs()
     // inside clears zombies — reconstructed jobs that finished while pi was
     // down — before they ever render. Then start the stale poller for
@@ -823,12 +1173,14 @@ export default function (pi: ExtensionAPI) {
       "Run a long shell command detached in the background. Returns 'started: <job-id>' immediately. " +
       "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
       "expected to run >30s or emit >100 lines (tests, builds, linters). Optionally pass `name` for a " +
-      "short human-readable label used in the job id, status output, and wake messages.",
+      "short human-readable label used in the job id, status output, and wake messages, and `type` to " +
+      "select the project's digest scorecard.",
     promptSnippet:
       "Run a long command detached in the background; get woken on completion",
     promptGuidelines: [
       "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
       "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
+      "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard; the vocabulary comes from the project's `.pi/pi-bgrun.json` digest entries.",
       "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
       "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search or ctx_execute_file on the log path for whole-log analysis.",
     ],
@@ -844,13 +1196,22 @@ export default function (pi: ExtensionAPI) {
             "Used in the job id, status output, the status widget, and wake messages.",
         }),
       ),
+      type: Type.Optional(
+        Type.String({
+          description:
+            "Optional job type used to select the project's digest scorecard (e.g. 'test', 'build', 'lint'). " +
+            "The vocabulary comes from the `type` fields in the project's `digest` config entries in " +
+            "`.pi/pi-bgrun.json`; when the project's digest config defines types, prefer passing the matching one.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { command, name: rawName } = params;
+      const { command, name: rawName, type: rawType } = params;
       if (!command || !command.trim()) {
         throw new Error("bgrun: command is required");
       }
       const name = sanitizeName(rawName);
+      const type = sanitizeType(rawType);
 
       const cfg = resolveConfig(ctx);
       // Project-local logs are auto-ignored in .git/info/exclude (best-effort)
@@ -858,6 +1219,16 @@ export default function (pi: ExtensionAPI) {
       if (cfg.jobsDirProjectLocal) ensureGitExcluded(cfg.jobsDir);
       const jobsDir = cfg.jobsDir;
       mkdirSync(jobsDir, { recursive: true });
+      // Evidence-of-use marker (best-effort): lets the digest nudge tell that
+      // THIS project has run bgrun, without scanning the shared jobs dir.
+      try {
+        writeFileSync(
+          jobUsageMarkerPath(jobsDir, ctx.cwd ?? process.cwd()),
+          String(Date.now()),
+        );
+      } catch {
+        // a marker write must never block a spawn
+      }
 
       const slug = makeSlug(name ?? command);
       const ts = Math.floor(Date.now() / 1000);
@@ -900,6 +1271,7 @@ export default function (pi: ExtensionAPI) {
         pid: childPid,
         cmd: command,
         name,
+        type,
         started: Date.now(),
         logPath,
         child,
@@ -913,6 +1285,7 @@ export default function (pi: ExtensionAPI) {
         pid: childPid,
         cmd: command,
         name,
+        type,
         started: Date.now(),
         logPath,
         state: "running",
@@ -923,7 +1296,7 @@ export default function (pi: ExtensionAPI) {
       updateWidget(ctx);
 
       // ── exit handler: record exit, persist done entry, wake, notify, widget ─
-      child.on("exit", (code, signal) => {
+      child.on("exit", async (code, signal) => {
         const rec = jobs.get(id);
         if (!rec) return;
         rec.exitedAt = Date.now();
@@ -936,12 +1309,21 @@ export default function (pi: ExtensionAPI) {
         const exitEmoji = exitCode === 0 ? "✅" : "❌";
         const lastLine = readLastLogLine(logPath);
 
+        // Universal stats — duration + log line count. Non-heuristic, always
+        // present, never pattern-based. A missing log contributes no line
+        // count (duration is always known).
+        const logLines = countLogLines(logPath);
+        const statsParts = [formatDuration(rec.exitedAt - rec.started)];
+        if (logLines !== null)
+          statsParts.push(`${logLines.toLocaleString("en-US")} lines`);
+
         // Persist the done-state entry.
         pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
           id,
           pid: rec.pid,
           cmd: rec.cmd,
           name: rec.name,
+          type: rec.type,
           started: rec.started,
           logPath,
           state: "done",
@@ -949,11 +1331,68 @@ export default function (pi: ExtensionAPI) {
           exitedAt: rec.exitedAt,
         });
 
+        // Opt-in project-config digest (best-effort, silent-fail). rec.ctx is
+        // the ExtensionContext captured at tool-call time and retains
+        // everything resolveConfig needs (cwd + isProjectTrusted), so the
+        // digest config is resolved here at exit — config edits made while the
+        // job ran are picked up, and trust is evaluated against the same
+        // session that spawned the job. No spawn-time capture needed. When a
+        // digest is configured, the wake is sent only after this bounded
+        // attempt (≤ ~5.25s: 5s timeout + 250ms kill grace) completes; a digest
+        // that fails, times out, or prints
+        // nothing appends nothing, and the exit code / universal part above are
+        // never affected.
+        let digestBlock: { label: string; text: string } | undefined;
+        try {
+          // First matching entry wins, in config order. The label defaults to
+          // the entry's label, the entry's type, a matched `match.name`, then
+          // the entry's preset id (or "command").
+          const digestEntries = resolveConfig(rec.ctx).digest;
+          const digestTarget: DigestJobTarget = {
+            name: rec.name,
+            type: rec.type,
+            command: rec.cmd,
+          };
+          const selected = selectDigestEntry(digestEntries, digestTarget);
+          if (selected) {
+            const raw = await runDigestCommand(selected.command, logPath);
+            const text = raw === undefined ? undefined : capDigestOutput(raw);
+            if (text) digestBlock = { label: selected.label, text };
+          } else if (digestEntries?.length) {
+            // Configured but nothing selected — otherwise silent. Surface the
+            // job's type/name plus the configured types, once per distinct
+            // diagnostic (capped), so a type mismatch or dead glob is visible.
+            const warning = digestNoMatchWarning(digestTarget, digestEntries);
+            if (!digestNoMatchWarned.has(warning)) {
+              if (digestNoMatchWarned.size < DIGEST_NO_MATCH_WARN_CAP) {
+                digestNoMatchWarned.add(warning);
+                console.error(warning);
+              } else if (!digestNoMatchSuppressed) {
+                // Don't silently drop further distinct mismatches.
+                digestNoMatchSuppressed = true;
+                console.error(
+                  `[pi-bgrun] further digest no-match diagnostics suppressed (cap ${DIGEST_NO_MATCH_WARN_CAP})`,
+                );
+              }
+            }
+          }
+        } catch (e) {
+          // Silent-fail: a broken digest never breaks a wake (ground rule 3).
+          console.error(
+            `[pi-bgrun] digest failed for job ${id}:`,
+            (e as Error).message,
+          );
+        }
+
         // Wake the agent.
         const namePrefix = rec.name ? `"${rec.name}" ` : "";
         let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
         wake += `Command: ${command}\n`;
+        wake += `Stats: ${statsParts.join(", ")}\n`;
         if (lastLine) wake += `Last output: ${lastLine}\n`;
+        if (digestBlock) {
+          wake += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
+        }
         wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
         try {
           if (rec.ctx.isIdle()) {
@@ -993,13 +1432,14 @@ export default function (pi: ExtensionAPI) {
 
       const startedLines = [`started: ${id}`];
       if (name) startedLines.push(`  name: ${name}`);
+      if (type) startedLines.push(`  type: ${type}`);
       startedLines.push(
         `  log: ${logPath}`,
         `  You'll be woken automatically when it finishes.`,
       );
       return {
         content: [{ type: "text", text: startedLines.join("\n") }],
-        details: { id, name, logPath, pid: childPid },
+        details: { id, name, type, logPath, pid: childPid },
       };
     },
   });
@@ -1012,6 +1452,162 @@ export default function (pi: ExtensionAPI) {
     /[\u001B\u009B][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><]/g;
   const LINE_CAP = 2000; // chars per line after stripping
   const TOTAL_CAP = 8000; // chars for the whole bgtail result
+
+  // ── Digest: opt-in project-config scorecard appended to the wake ──────────
+  // Runs only when a trusted project (or the user file) configures a `digest`
+  // section. Best-effort, silent-fail: errors, timeouts, and empty output all
+  // contribute nothing, and the digest never affects the exit code, ordering,
+  // or the wake's universal part (ground rules 2-3).
+  const DIGEST_TIMEOUT_MS = 5000; // hard bound on added wake latency
+  const DIGEST_KILL_GRACE_MS = 250; // SIGTERM → SIGKILL grace
+  const DIGEST_TOTAL_CAP = 500; // chars appended to the wake, first lines win
+  const DIGEST_LINE_CAP = 200; // per-line cap, consistent with the condenser
+
+  // Run a digest command (log path arrives as $1) and collect stdout.
+  // Resolves undefined on spawn error, non-timeout failure semantics are the
+  // caller's concern (empty output is dropped when capping). A timed-out
+  // command contributes NOTHING — after SIGKILL we resolve immediately with
+  // undefined so the wake is never delayed past DIGEST_TIMEOUT_MS + grace.
+  function runDigestCommand(
+    cmd: string,
+    logPath: string,
+  ): Promise<string | undefined> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let timedOut = false;
+      const finish = (out: string | undefined) => {
+        if (settled) return;
+        settled = true;
+        // Stop accepting output. A grandchild can keep the pipe's write end
+        // open after `sh` exits (pipelines, `cmd &`), and a live `data`
+        // listener would otherwise grow this buffer forever.
+        child?.stdout?.removeAllListeners("data");
+        resolve(out);
+      };
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn("sh", ["-c", cmd, "--", logPath], {
+          stdio: ["ignore", "pipe", "ignore"],
+          // Own process group so a timeout can kill the whole pipeline (sh AND
+          // its children), not just `sh`. Without this, grandchildren survive
+          // and keep the pipe open.
+          detached: true,
+        });
+      } catch {
+        finish(undefined);
+        return;
+      }
+      let stdout = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        // Bounded collection: once past the wake cap, stop buffering but keep
+        // the listener attached so the child is never blocked on a full pipe.
+        // capDigestOutput() trims the overshoot to DIGEST_TOTAL_CAP.
+        if (stdout.length > DIGEST_TOTAL_CAP) return;
+        stdout += chunk.toString();
+      });
+      // Kill the whole process group (see `detached` above). Process groups
+      // are POSIX-only; the `child.kill` fallback covers platforms where the
+      // negative-pid kill fails. `childExited` guards against signalling a
+      // group whose pid may already have been recycled after the child exits.
+      let childExited = false;
+      const killGroup = (signal: NodeJS.Signals) => {
+        if (childExited) return;
+        const pid = child.pid;
+        try {
+          if (pid === undefined) throw new Error("no pid");
+          process.kill(-pid, signal);
+        } catch {
+          try {
+            child.kill(signal);
+          } catch {
+            // already gone
+          }
+        }
+      };
+      // Hard timeout: SIGTERM first, SIGKILL after a short grace.
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const killTimer = setTimeout(() => {
+        timedOut = true;
+        killGroup("SIGTERM");
+        graceTimer = setTimeout(() => {
+          killGroup("SIGKILL");
+          finish(undefined);
+        }, DIGEST_KILL_GRACE_MS);
+      }, DIGEST_TIMEOUT_MS);
+      const stopTimers = () => {
+        clearTimeout(killTimer);
+        if (graceTimer) clearTimeout(graceTimer);
+      };
+      child.on("error", () => {
+        childExited = true;
+        stopTimers();
+        finish(undefined);
+      });
+      child.on("exit", (code) => {
+        childExited = true;
+        stopTimers();
+        // Contract: a digest that ERRORS contributes nothing. Gate on the exit
+        // code so partial output from a failed command never reaches the wake.
+        // Shipped presets all end in `head`, which exits 0.
+        finish(timedOut || code !== 0 ? undefined : stdout);
+      });
+    });
+  }
+
+  // Cap digest output for the wake: first lines win. ANSI stripped (reusing
+  // the condenser's regex), per-line cap for consistency, blank lines
+  // dropped, ~500 chars total. Nothing usable → undefined (nothing appended).
+  function capDigestOutput(raw: string): string | undefined {
+    const lines = raw
+      .replace(ANSI_RE, "")
+      .split("\n")
+      .map((l) =>
+        l.length > DIGEST_LINE_CAP ? l.slice(0, DIGEST_LINE_CAP) : l,
+      )
+      .filter((l) => l.trim().length > 0);
+    if (lines.length === 0) return undefined;
+    const joined = lines.join("\n");
+    const capped =
+      joined.length > DIGEST_TOTAL_CAP
+        ? joined.slice(0, DIGEST_TOTAL_CAP)
+        : joined;
+    return capped.trim() || undefined;
+  }
+
+  // No-match diagnostics seen this process (capped) — keyed by the full
+  // warning string so a type mismatch and a dead regex each surface once.
+  const digestNoMatchWarned = new Set<string>();
+  let digestNoMatchSuppressed = false;
+  const DIGEST_NO_MATCH_WARN_CAP = 3;
+
+  // ── Digest nudge: one-shot session_start toast for digest-less projects ────
+  // When a trusted project has actually used bgrun (≥1 finished job log in the
+  // jobs dir) but never configured a digest, point the human at the
+  // digest-config skill once. Toast only — never sendUserMessage, so it costs
+  // zero LLM context. Dismissal is a per-project marker file in the jobs dir;
+  // the user's config files are never written.
+  function maybeNudgeDigest(ctx: ExtensionContext): void {
+    try {
+      if (!ctx.isProjectTrusted?.()) return;
+      const cfg = resolveConfig(ctx);
+      if (cfg.digest) return; // already configured — nothing to nudge
+      if (!ctx.hasUI) return; // toast-only feature; no UI → nothing to do
+      const projectDir = ctx.cwd ?? process.cwd();
+      // Project-scoped evidence of use (written at spawn) — never the shared
+      // jobs dir as a whole, which would toast every project on the machine.
+      if (!existsSync(jobUsageMarkerPath(cfg.jobsDir, projectDir))) return;
+      const markerPath = digestNudgeMarkerPath(cfg.jobsDir, projectDir);
+      if (existsSync(markerPath)) return; // already nudged once — stay silent
+      ctx.ui.notify(DIGEST_NUDGE_TEXT, "info");
+      try {
+        writeFileSync(markerPath, String(Date.now()));
+      } catch {
+        // best-effort — a marker write failure must never break session_start
+      }
+    } catch (err) {
+      console.error("[pi-bgrun] digest nudge failed:", (err as Error).message);
+    }
+  }
 
   function condenseLogLines(
     lines: string[],
@@ -1403,6 +1999,7 @@ export default function (pi: ExtensionAPI) {
         const exit = rec.exitCode === undefined ? "" : ` exit=${rec.exitCode}`;
         const lines = [`${id}: ${state}${exit}`];
         if (rec.name) lines.push(`  name: ${rec.name}`);
+        if (rec.type) lines.push(`  type: ${rec.type}`);
         lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -1412,6 +2009,7 @@ export default function (pi: ExtensionAPI) {
             exitCode: rec.exitCode ?? undefined,
             cmd: rec.cmd,
             name: rec.name,
+            type: rec.type,
             recovered: false,
           },
         };

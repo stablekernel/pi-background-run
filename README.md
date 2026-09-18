@@ -35,7 +35,7 @@ Restart pi after install so the extension loads.
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Jobs from other sessions are only listed when `adoptForeignJobs` is enabled. |
 | `bgtail` | Read the newest lines of a job's log (default 40), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
 | `bggrep` | Regex search over a job's log: line-numbered matches, optional `context` lines, capped (~50 matches, ~2KB/line, ~8KB) and condensed. Runs inside the extension, so it reaches **any** jobs dir — including global logs that project-sandboxed tools (`ctx_execute_file`) cannot. With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
-| `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Pass `all: true` to sweep the whole shared jobs dir. Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
+| `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Cleanup also sweeps stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`). Pass `all: true` to sweep the whole shared jobs dir. Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
 
 ## Slash commands
 
@@ -174,6 +174,194 @@ Environment variables (same knobs, handy for one-off overrides):
 | `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |
 | `PI_BGRUN_GLOBAL_AUTO_CLEAN` | `true` | Set `0`/`false` to disable the automatic global orphan sweep (see below). |
 
+### Digest scorecard (opt-in)
+
+Wake messages always lead with universal facts — exit code, duration, and the
+command's own log line count (the internal exit marker is excluded). A project
+can additionally opt into a **digest scorecard**: a one-line pass/fail summary
+extracted from the log and appended to the wake.
+
+#### Job identity: name, type, command
+
+Every `bgrun` job carries three identifiers, and the digest selector reads all
+three:
+
+| Field | Required | Normalized | Drives |
+| --- | --- | --- | --- |
+| `command` | yes | used as-is (`sh -c`) | what runs; the `match.command` target |
+| `name` | no | trimmed, blank → none, ≤80 chars | display label + job-id/log slug; the `match.name` target |
+| `type` | no | trimmed, lowercased, blank → none, ≤40 chars | digest routing only; the first-class selector |
+
+`name` names the job (and its log file); `type` never affects the id or the
+display — its only job is selecting the scorecard. Selection tries `type`
+entries first (exact, case-insensitive), then falls back to `match.name` /
+`match.command` globs. The config `type` is capped to the same 40 characters
+as the job `type`, so an over-long type still matches.
+
+#### Setting it up
+
+Three ways, easiest first — pick the first one you're comfortable with:
+
+1. **Ask your agent (recommended).** Say: *"Set up the pi-bgrun digest for
+   this project."* The `digest-config` skill ships with this package and does
+   the whole job: it samples your project's real job logs, tries the shipped
+   presets against them, drafts a custom command if none fits, validates the
+   result on both a green and a red log, and writes the config. It sees your
+   actual output format, which is exactly what a good digest depends on —
+   and you never have to read a log yourself. The one-shot toast some
+   projects see on session start ("no digest configured") — once per project
+   that has run a bgrun job — is pointing at this same skill.
+2. **One-line preset if you know your stack.** Create
+   `<project>/.pi/pi-bgrun.json` (or merge into an existing one):
+
+   ```json
+   { "digest": { "preset": "go-test" } }
+   ```
+
+   | Preset | What it summarizes | Suggested `type` |
+   | --- | --- | --- |
+   | `go-test` | Go test output: package ok/FAIL counts + failing test names | `test` |
+   | `jest` | Jest output: Tests/Test Suites summary + failed test names | `test` |
+   | `pytest` | pytest output: final passed/failed/error summary line + FAILED test ids | `test` |
+   | `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names | `test` |
+
+   All shipped presets are test runners, so they all suggest the conventional
+   type `test`. The suggestion is documentation, not behavior: you still write
+   the `type` on the entry yourself, and a preset entry with no `type` applies
+   to every job as before.
+
+3. **Custom command.** For formats the presets don't cover:
+
+   ```json
+   { "digest": { "command": "grep -E 'FAIL|ok  ' \"$1\" | head -5" } }
+   ```
+
+   The command receives the job's log path as `$1` and its stdout is appended
+   to the wake. Worked example — a log containing:
+
+   ```text
+   PASS src/auth.test.ts (2.1s)
+   FAIL src/api.test.ts
+   Tests: 12 passed, 1 failed, 13 total
+   ```
+
+   plus the command `grep -E '^(PASS|FAIL|Tests:)' "$1" | head -5`, wakes with:
+
+   ```text
+   digest (command): FAIL src/api.test.ts
+   Tests: 12 passed, 1 failed, 13 total
+   ```
+
+   Rules of thumb: quote `"$1"`, end the pipeline in `head -N` so output is
+   bounded, and — this is the important one — **check the command against a
+   green and a red log before committing to it**. A scorecard that says "all
+   passing" on a failing log is worse than no scorecard. The `digest-config`
+   skill does this validation for you; if you'd rather hand-tune a command
+   yourself, you can also ask your agent to validate a specific command
+   against specific job logs.
+
+#### Multiple scorecards (one per job type)
+
+`digest` can also be an ordered **list** of scorecards. Give each a `type` and
+pass the matching `type:` when you start the job — the most reliable selector,
+because it does not depend on the agent naming every job consistently:
+
+```json
+{
+  "digest": [
+    { "type": "test",  "preset": "go-test" },
+    { "type": "build", "label": "build",
+      "command": "grep -E '^error' \"$1\" | head -5" },
+    { "match": { "command": "*cargo*" }, "label": "cargo", "preset": "go-test" },
+    { "preset": "go-test" }
+  ]
+}
+```
+
+Start jobs with the matching type:
+
+```text
+bgrun(command: "go test ./...", name: "unit-tests", type: "test")
+```
+
+`type` is an optional `bgrun` parameter. The vocabulary is defined by the
+`type` fields of the project's digest config in `.pi/pi-bgrun.json`; when the
+project's digest config defines types, prefer passing the matching one. If a
+job's `type` (or name/command) selects no entry, pi-bgrun logs a one-line
+diagnostic naming the job and the configured types — so a mismatched type is
+visible instead of silently scorecard-less.
+
+Selection order (exactly one entry, or none):
+
+1. **Type entries first.** An entry declaring a `type` matches ONLY a job that
+declared that same type — exact and case-insensitive (`"test"` matches
+`"Test"`) — and must ALSO satisfy the entry's `match` if it has one. All type
+entries are checked first, in config order, regardless of where they sit
+relative to match entries. First type match wins.
+2. **Match/default fallback.** If no type entry matched — including when the
+job has no type — the entries *without* a `type` are scanned in config order:
+`match.name` / `match.command` globs and no-`match` defaults, first match
+wins. Put a no-`match` default **last** so jobs you didn't anticipate still get
+a scorecard.
+3. No match → no digest.
+
+- `type` and `match` compose (AND): with both present the entry matches only a
+  job of that type that also satisfies the glob. Use `match` alone for jobs
+  that won't pass a `type`.
+- `match.name` and `match.command` are **globs** tested against the job's
+  `name` and command line. Both present → both must match. Matching is
+  **case-insensitive and whole-string** — `*` matches any run, `?` exactly one
+  character, everything else is literal, and `\` escapes the next character
+  (`\*` is a literal star) — so `"*unit*"` matches `"unit-tests-run3"` while a
+  bare `"unit-tests"` matches only exactly that.
+- `label` sets the wake tag: `digest (<label>): …`. Precedence: `label` →
+  (type entry) the type string → (matched glob entry) `match.name` → the
+  entry's preset id (else `command`). So a bare `{ "preset": "go-test" }`
+  wakes as `digest (go-test):`.
+- First match wins; exactly one digest block is appended per wake.
+
+The legacy single-object form still works unchanged — `{ "digest": { "preset":
+"go-test" } }` is a one-entry list with no matchers.
+
+Opt in per project via `<project>/.pi/pi-bgrun.json` (read only for trusted
+projects). If both `preset` and `command` are set within one entry, the preset
+wins. An empty list (or one where every entry is invalid) counts as *not
+configured*.
+
+#### Guarantees
+
+- **Exit code always leads.** The digest is appended after the universal
+  stats, labeled `digest (<label>):` — `label` follows the precedence above
+  (entry `label` → type string → `match.name` → preset id / `command`). It
+  never overrides or reorders the exit code, duration, or line count.
+- **Capped and timed.** Digest output is capped at ~500 chars, and buffering
+  stops once that cap is reached — a command that prints unbounded output
+  cannot balloon the wake. The digest command gets a 5s timeout plus a 250ms
+  SIGTERM→SIGKILL grace (≈5.25s worst case), during which the wake waits.
+- **Silent-fail.** A digest command that errors, times out, or prints nothing
+  simply contributes nothing — it never breaks a wake.
+- **No config, no behavior.** Absent or invalid config contributes nothing;
+  without a `digest` section the wake is unchanged.
+
+A configured wake reads like this:
+
+```text
+✅ Background job "tests" `abc123` finished (exit 1).
+Command: go test ./...
+Stats: 42.3s, 1204 lines
+Last output: FAIL example.com/api/handlers
+digest (go-test): 7 ok / 1 FAIL: TestResolveNotFound
+Review the result now: call `bgtail` ...
+```
+
+Shell safety: the command comes from trust-gated config and runs with your
+own privileges — the same trust boundary as the `jobsDir` setting.
+
+A user-level default digest works too: set `digest` in
+`~/.pi/agent/pi-bgrun.json` (path overridable via `PI_BGRUN_USER_CONFIG`), and
+any project without its own digest inherits it. The project `digest` section
+overrides the user-level one **wholesale** (no per-key merge).
+
 ### Log cleanup
 
 Cleanup follows the same principle as everything else: **one session should
@@ -198,4 +386,4 @@ not delete another session's artifacts.**
 
 ## Status
 
-Early / pre-release. See `.pi/wip/pi-port-plan.md` in the source tree for the design.
+Early / pre-release.
