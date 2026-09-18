@@ -22,7 +22,6 @@ import {
   mkdirSync,
   appendFileSync,
   readdirSync,
-  renameSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -118,11 +117,16 @@ function makeFakePi(
   };
 }
 
+// Captured so tests can assert the extension's exported values (e.g.
+// DIGEST_NUDGE_TEXT) instead of re-declaring copies.
+let indexModule: any;
+
 async function loadExtension(
   fakePi: any,
 ): Promise<Map<string, { execute: (...args: any[]) => Promise<any> }>> {
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod = await import(url);
+  indexModule = mod;
   mod.default(fakePi);
   return fakePi.tools as Map<
     string,
@@ -2610,9 +2614,9 @@ test("wake message: Stats line (duration + line count) sits between Command: and
     );
     await waitForWakes(wakes, 1);
     const wake = wakes[0].text;
-    // Duration (0.0s for an instant job) + line count (output, blank line,
-    // and exit marker).
-    assert.match(wake, /Stats: 0\.0s, 3 lines/);
+    // Duration (0.0s for an instant job) + the command's OWN line count — the
+    // appended exit marker and its blank separator are excluded.
+    assert.match(wake, /Stats: 0\.0s, 1 lines/);
     const cmdIdx = wake.indexOf("Command: ");
     const statsIdx = wake.indexOf("Stats: ");
     const lastIdx = wake.indexOf("Last output: ");
@@ -2908,22 +2912,18 @@ test("resolveConfig: digest type normalized; invalid type drops entry; match kep
 test("resolveDigest: preset wins over command; normalization shapes", () => {
   const goTest = DIGEST_PRESETS.find((p) => p.id === "go-test")!;
   // Both configured → preset wins (curated beats hand-rolled).
-  const both = resolveDigest({
-    preset: "go-test",
-    command: 'grep x "$1" | head -3',
-  });
-  assert.deepEqual(both, { kind: "preset", command: goTest.command });
+  assert.equal(
+    resolveDigest({ preset: "go-test", command: 'grep x "$1" | head -3' }),
+    goTest.command,
+  );
   // Command only.
-  assert.deepEqual(resolveDigest({ command: 'grep x "$1" | head -3' }), {
-    kind: "command",
-    command: 'grep x "$1" | head -3',
-  });
+  assert.equal(
+    resolveDigest({ command: 'grep x "$1" | head -3' }),
+    'grep x "$1" | head -3',
+  );
   // Unknown preset (bypassing config validation) falls back to command,
   // else undefined.
-  assert.deepEqual(resolveDigest({ preset: "bogus", command: "x" }), {
-    kind: "command",
-    command: "x",
-  });
+  assert.equal(resolveDigest({ preset: "bogus", command: "x" }), "x");
   assert.equal(resolveDigest({ preset: "bogus" }), undefined);
   assert.equal(resolveDigest(undefined), undefined);
   assert.equal(resolveDigest({}), undefined);
@@ -3391,45 +3391,28 @@ test("preset pytest: green and red scorecards", () => {
   assert.match(red, /tests\/test_a\.py::test_boom/m, "FAILED id listed");
 });
 
-test("preset junit-xml: green and red scorecards", () => {
+test("preset junit-xml: green and red scorecards (real single-line pytest output)", () => {
+  // pytest --junitxml emits the whole document on ONE line — the fixture
+  // matches that, so the record-based awk is genuinely exercised.
   const green = runPreset(
     "junit-xml",
-    [
-      '<?xml version="1.0" encoding="utf-8"?>',
-      "<testsuites>",
-      '  <testsuite name="pytest" tests="3" failures="0" errors="0">',
-      '    <testcase classname="tests.test_a" name="test_ok" time="0.001"/>',
-      '    <testcase classname="tests.test_a" name="test_ok2" time="0.002"/>',
-      "  </testsuite>",
-      "</testsuites>",
-    ].join("\n"),
+    '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="3" time="0.01" timestamp="2024-01-01T00:00:00"><testcase classname="tests.test_a" name="test_ok" time="0.001" /><testcase classname="tests.test_a" name="test_ok2" time="0.002" /></testsuite></testsuites>',
   );
   assert.match(green, /failures: 0 {2}errors: 0/);
   assert.ok(!green.includes("test_ok"), "no testcase names on green");
+  assert.ok(!green.includes("pytest"), "testsuite name is not reported");
 
   const red = runPreset(
     "junit-xml",
-    [
-      "<testsuites>",
-      '  <testsuite name="pytest" tests="3" failures="1" errors="1">',
-      '    <testcase classname="tests.test_a" name="test_boom" time="0.001">',
-      '      <failure message="assert False">traceback...</failure>',
-      "    </testcase>",
-      '    <testcase classname="tests.test_a" name="test_err" time="0.001">',
-      '      <error message="boom">RuntimeError</error>',
-      "    </testcase>",
-      '    <testcase classname="tests.test_a" name="test_ok" time="0.001"/>',
-      "  </testsuite>",
-      "</testsuites>",
-    ].join("\n"),
+    '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" errors="1" failures="1" skipped="0" tests="3" time="0.01" timestamp="2024-01-01T00:00:00"><testcase classname="tests.test_a" name="test_boom" time="0.001"><failure message="assert False">E   assert False</failure></testcase><testcase classname="tests.test_a" name="test_err" time="0.001"><error message="boom">RuntimeError: boom</error></testcase><testcase classname="tests.test_a" name="test_ok" time="0.001" /></testsuite></testsuites>',
   );
   assert.match(red, /failures: 1 {2}errors: 1/);
   assert.match(red, /^test_boom$/m, "failing testcase name listed");
   assert.match(red, /^test_err$/m, "errored testcase name listed");
-  assert.ok(
-    !red.includes("test_ok\n") && !/^test_ok$/m.test(red),
-    "passing testcase not listed",
-  );
+  // Regression (carper): with one-line XML the old line-based scan reported the
+  // testsuite's own name, "pytest", instead of the failing test.
+  assert.ok(!red.includes("pytest"), "testsuite name is not reported");
+  assert.ok(!/^test_ok$/m.test(red), "passing testcase not listed");
 });
 
 test("shipped presets: ids are stable and every command ends in head (bounded output)", () => {
@@ -3445,6 +3428,18 @@ test("shipped presets: ids are stable and every command ends in head (bounded ou
       /\|\s*head -\d+$/,
       `${preset.id} command ends in head -N`,
     );
+  }
+});
+
+test("shipped presets: README and digest-config skill document every preset id", () => {
+  const readme = readFileSync(join(process.cwd(), "README.md"), "utf8");
+  const skill = readFileSync(
+    join(process.cwd(), "skill", "digest-config", "SKILL.md"),
+    "utf8",
+  );
+  for (const id of DIGEST_PRESET_IDS) {
+    assert.ok(readme.includes(id), `README documents ${id}`);
+    assert.ok(skill.includes(id), `digest-config skill documents ${id}`);
   }
 });
 
@@ -3696,6 +3691,36 @@ test("wake digest: failing digest command → no digest block, wake otherwise un
     assert.ok(!wake.includes("digest ("), "failing digest contributes nothing");
     assert.match(wake, /✅/);
     assert.match(wake, /exit 0/);
+    assert.match(wake, /Last output: hello world/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: a digest that prints then exits non-zero contributes nothing", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { command: "echo PARTIAL-OUTPUT; exit 1" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-dg-fail",
+      { command: "echo hello world" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    // Contract: an erroring digest appends nothing — even if it printed.
+    assert.ok(!wake.includes("digest ("), "failed digest contributes nothing");
+    assert.ok(!wake.includes("PARTIAL-OUTPUT"), "no partial digest output");
+    assert.match(wake, /✅/);
     assert.match(wake, /Last output: hello world/);
   } finally {
     teardownDigestEnv(dir, proj, home);
@@ -4166,14 +4191,19 @@ test("bgrun: no type → no type line in the started result", async () => {
 
 // ── digest nudge: one-shot session_start toast ────────────────────────────
 
-const DIGEST_NUDGE_TEXT =
-  "pi-bgrun: no digest configured for this project — use the digest-config skill to set one up.";
-
-// Drop a finished job log into the jobs dir — a log carrying the
-// self-describing exit marker is exactly what the nudge scans for.
-function writeDoneLog(jobsDir: string, name: string, exit = 0): void {
+// Mirror of the exported jobUsageMarkerPath(): evidence-of-use is a per-project
+// marker written at spawn, not a scan of the shared jobs dir.
+function writeUsageMarker(jobsDir: string, projectDir: string): void {
   mkdirSync(jobsDir, { recursive: true });
-  writeFileSync(join(jobsDir, name), `output\n__BGRUN_EXIT__=${exit}\n`);
+  writeFileSync(usageMarker(jobsDir, projectDir), "1");
+}
+
+function usageMarker(jobsDir: string, projectDir: string): string {
+  const key = createHash("sha256")
+    .update(projectDir)
+    .digest("hex")
+    .slice(0, 16);
+  return join(jobsDir, `.bgrun-used-${key}`);
 }
 
 // Mirror of the exported digestNudgeMarkerPath(): the nudge marker is keyed by
@@ -4196,17 +4226,17 @@ function captureNotify(ctx: any): string[] {
   return messages;
 }
 
-test("digest nudge: fires on session_start (trusted, no digest, ≥1 done job) and writes the marker", async () => {
+test("digest nudge: fires on session_start (trusted, no digest, usage marker set) and writes the marker", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
-    writeDoneLog(dir, "myproj-1-12345.log");
+    writeUsageMarker(dir, proj);
     const { pi, ctx, fireSessionStart } = makeFakePi();
     trustCtx(ctx, proj, true);
     const messages = captureNotify(ctx);
     await loadExtension(pi);
     await fireSessionStart();
 
-    assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
+    assert.deepEqual(messages, [indexModule.DIGEST_NUDGE_TEXT]);
     assert.ok(existsSync(nudgeMarker(dir, proj)), "marker file created");
   } finally {
     teardownDigestEnv(dir, proj, home);
@@ -4219,7 +4249,7 @@ test("digest nudge: silent when a digest IS configured (marker untouched)", asyn
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: { preset: "go-test" },
     });
-    writeDoneLog(dir, "myproj-1-12345.log");
+    writeUsageMarker(dir, proj);
     const { pi, ctx, fireSessionStart } = makeFakePi();
     trustCtx(ctx, proj, true);
     const messages = captureNotify(ctx);
@@ -4236,7 +4266,7 @@ test("digest nudge: silent when a digest IS configured (marker untouched)", asyn
 test("digest nudge: silent when the project is untrusted", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
-    writeDoneLog(dir, "myproj-1-12345.log");
+    writeUsageMarker(dir, proj);
     const { pi, ctx, fireSessionStart } = makeFakePi();
     trustCtx(ctx, proj, false);
     const messages = captureNotify(ctx);
@@ -4250,14 +4280,10 @@ test("digest nudge: silent when the project is untrusted", async () => {
   }
 });
 
-test("digest nudge: silent when no done jobs (no evidence of use)", async () => {
+test("digest nudge: silent when the project has no usage marker", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
-    // A running job log (no exit marker yet) doesn't count as evidence either.
-    writeDoneLog(dir, "myproj-1-12345.log");
-    renameSync(join(dir, "myproj-1-12345.log"), join(dir, "running.log"));
-    writeFileSync(join(dir, "running.log"), "still going...\n");
-
+    // No `.bgrun-used-*` marker for this project → no evidence of use.
     const { pi, ctx, fireSessionStart } = makeFakePi();
     trustCtx(ctx, proj, true);
     const messages = captureNotify(ctx);
@@ -4274,7 +4300,7 @@ test("digest nudge: silent when no done jobs (no evidence of use)", async () => 
 test("digest nudge: silent when the marker file already exists", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
-    writeDoneLog(dir, "myproj-1-12345.log");
+    writeUsageMarker(dir, proj);
     writeFileSync(nudgeMarker(dir, proj), "1717000000000");
     const { pi, ctx, fireSessionStart } = makeFakePi();
     trustCtx(ctx, proj, true);
@@ -4291,7 +4317,7 @@ test("digest nudge: silent when the marker file already exists", async () => {
 test("digest nudge: a throwing ui.notify does not break session_start", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
-    writeDoneLog(dir, "myproj-1-12345.log");
+    writeUsageMarker(dir, proj);
     const { pi, ctx, fireSessionStart } = makeFakePi();
     trustCtx(ctx, proj, true);
     ctx.hasUI = true;
@@ -4313,7 +4339,8 @@ test("digest nudge: marker is per-project — a second project sharing the jobs 
   const { dir, proj, home } = setupDigestEnv();
   const proj2 = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
   try {
-    writeDoneLog(dir, "myproj-1-12345.log");
+    writeUsageMarker(dir, proj);
+    writeUsageMarker(dir, proj2);
 
     // First project: nudged, writes its own marker.
     {
@@ -4322,7 +4349,7 @@ test("digest nudge: marker is per-project — a second project sharing the jobs 
       const messages = captureNotify(ctx);
       await loadExtension(pi);
       await fireSessionStart();
-      assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
+      assert.deepEqual(messages, [indexModule.DIGEST_NUDGE_TEXT]);
       assert.ok(existsSync(nudgeMarker(dir, proj)), "project 1 marker written");
     }
 
@@ -4335,7 +4362,7 @@ test("digest nudge: marker is per-project — a second project sharing the jobs 
       await fireSessionStart();
       assert.deepEqual(
         messages,
-        [DIGEST_NUDGE_TEXT],
+        [indexModule.DIGEST_NUDGE_TEXT],
         "each project gets its own one-shot nudge",
       );
       assert.ok(

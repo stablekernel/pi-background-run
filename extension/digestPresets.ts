@@ -59,19 +59,16 @@ export const DIGEST_PRESETS: DigestPreset[] = [
   description: "JUnit XML: <failure>/<error> counts + failing testcase names",
   suggestedType: "test",
   // Count failure/error elements (attributes like failures="0" don't match —
-  // they lack the `<`), then pull the enclosing testcase's name attribute
-  // (leading space in the regex avoids matching `classname="..."`).
+  // they lack the `<`), then pull the enclosing testcase's name attribute.
+  // Real pytest --junitxml emits the whole document on ONE line, so the scan
+  // is record-based (`RS='<testcase'`, not line-based) and matches ` name="`
+  // with a leading space so it never picks up `classname="..."`.
   command:
-   'printf \'failures: %s  errors: %s\\n\' "$(grep -o \'<failure\' "$1" | wc -l | tr -d \' \')" "$(grep -o \'<error\' "$1" | wc -l | tr -d \' \')"; awk \'/<testcase/{if (match($0, / name="[^"]*"/)) {name = substr($0, RSTART + 7, RLENGTH - 8)}} /<failure|<error/{if (name != "") print name}\' "$1" | sort -u | head -10',
+   'printf \'failures: %s  errors: %s\\n\' "$(grep -o \'<failure\' "$1" | wc -l | tr -d \' \')" "$(grep -o \'<error\' "$1" | wc -l | tr -d \' \')"; awk -v RS=\'<testcase\' \'NR>1 { if (match($0, / name="[^"]*"/)) { name=substr($0, RSTART+7, RLENGTH-8); if ($0 ~ /<failure|<error/) print name } }\' "$1" | sort -u | head -10',
  },
 ];
 
 export const DIGEST_PRESET_IDS = DIGEST_PRESETS.map((p) => p.id);
-
-/** A digest resolved to a concrete sh command (log path arrives as $1). */
-export type ResolvedDigest =
- | { kind: "preset"; command: string }
- | { kind: "command"; command: string };
 
 /**
  * Matchers selecting which jobs a digest entry applies to. Both are glob
@@ -124,20 +121,21 @@ export interface SelectedDigest {
 }
 
 /**
- * Resolve a normalized digest config (from resolveConfig) into the command to
- * run. When both preset and command are configured, the preset wins — a
- * curated, shipped preset is preferred over a hand-rolled command pointing at
- * the same format. Returns undefined when nothing usable is configured.
+ * Resolve a normalized digest entry into the concrete sh command to run (the
+ * job's log path arrives as `$1`). When both `preset` and `command` are
+ * configured, the preset wins — a curated, shipped preset is preferred over a
+ * hand-rolled command pointing at the same format. Returns undefined when
+ * nothing usable is configured.
  */
 export function resolveDigest(
  digest: { preset?: string; command?: string } | undefined,
-): ResolvedDigest | undefined {
+): string | undefined {
  if (!digest) return undefined;
  if (digest.preset) {
   const preset = DIGEST_PRESETS.find((p) => p.id === digest.preset);
-  if (preset) return { kind: "preset", command: preset.command };
+  if (preset) return preset.command;
  }
- if (digest.command) return { kind: "command", command: digest.command };
+ if (digest.command) return digest.command;
  return undefined;
 }
 
@@ -251,32 +249,45 @@ export function selectDigestEntry(
 ): SelectedDigest | undefined {
  if (!entries) return undefined;
 
+ // First entry (in the given order) whose `match` passes and which resolves to
+ // a command. Shared by the type-first pass and the fallback pass so the
+ // matching/resolution rules can never drift between them.
+ const pick = (
+  candidates: DigestEntry[],
+ ): { entry: DigestEntry; command: string } | undefined => {
+  for (const entry of candidates) {
+   if (!entryMatchesJob(entry, target)) continue;
+   const command = resolveDigest(entry);
+   if (command) return { entry, command };
+  }
+  return undefined;
+ };
+
  // 1. Type-first selection. Only entries declaring a type are eligible here,
  // and only when the job declared one. A `match` on the entry, if any, must
  // also pass. Config order decides ties.
  if (target.type !== undefined) {
   const want = target.type.toLowerCase();
-  for (const entry of entries) {
-   if (!entry.type) continue;
-   if (entry.type.toLowerCase() !== want) continue;
-   if (!entryMatchesJob(entry, target)) continue;
-   const resolved = resolveDigest(entry);
-   if (!resolved) continue;
-   const label = entry.label || entry.type || defaultDigestLabel(entry);
-   return { command: resolved.command, label };
+  const hit = pick(
+   entries.filter((e) => e.type?.toLowerCase() === want),
+  );
+  // A type-matching entry always carries a non-empty type, so `entry.type` is
+  // the label fallback — no need for the preset-id default here.
+  if (hit?.entry.type) {
+   return { command: hit.command, label: hit.entry.label || hit.entry.type };
   }
  }
 
  // 2. Glob/default fallback over entries without a type.
- for (const entry of entries) {
-  if (entry.type) continue;
-  if (!entryMatchesJob(entry, target)) continue;
-  const resolved = resolveDigest(entry);
-  if (!resolved) continue;
+ const hit = pick(entries.filter((e) => !e.type));
+ if (hit) {
+  const entry = hit.entry;
   const matchLabel =
    entry.match?.name === undefined ? "" : labelFromMatchName(entry.match.name);
-  const label = entry.label || matchLabel || defaultDigestLabel(entry);
-  return { command: resolved.command, label };
+  return {
+   command: hit.command,
+   label: entry.label || matchLabel || defaultDigestLabel(entry),
+  };
  }
  return undefined;
 }

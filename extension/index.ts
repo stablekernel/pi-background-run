@@ -278,6 +278,23 @@ function warnDigestInvalid(field: string, value: unknown): void {
   );
 }
 
+function projectHash(projectDir: string): string {
+  return createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
+}
+
+/**
+ * Per-project "this project has run a bgrun job" marker in the jobs dir.
+ * Written (best-effort) at spawn and read at session_start by the digest nudge
+ * — so evidence of use stays project-scoped even when the jobs dir is the
+ * shared machine-global one.
+ */
+export function jobUsageMarkerPath(
+  jobsDir: string,
+  projectDir: string,
+): string {
+  return join(jobsDir, `.bgrun-used-${projectHash(projectDir)}`);
+}
+
 /**
  * Per-project marker path for the one-shot digest nudge. The jobs dir is
  * shared machine-wide, so a bare `.digest-nudge-done` marker would silence the
@@ -288,18 +305,33 @@ export function digestNudgeMarkerPath(
   jobsDir: string,
   projectDir: string,
 ): string {
-  const key = createHash("sha256")
-    .update(projectDir)
-    .digest("hex")
-    .slice(0, 16);
-  return join(jobsDir, `.digest-nudge-${key}`);
+  return join(jobsDir, `.digest-nudge-${projectHash(projectDir)}`);
 }
+
+/**
+ * One-shot session_start toast for a trusted project with no digest
+ * configured (see maybeNudgeDigest). Exported so tests assert the real string.
+ */
+export const DIGEST_NUDGE_TEXT =
+  "pi-bgrun: no digest configured for this project — use the digest-config skill to set one up.";
 
 // Job and config `type` values are short routing tokens. Both sides cap at the
 // same length; if only the job side truncated, a >MAX_TYPE_LEN config type
 // would silently never match the job's truncated type.
 const MAX_TYPE_LEN = 40;
 const MAX_LABEL_LEN = 60;
+
+/**
+ * Trim, lowercase, and cap a job or config `type`. Non-string or blank →
+ * undefined. Both the bgrun param and the digest config go through here so
+ * their truncation can never drift apart.
+ */
+function normalizeType(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, MAX_TYPE_LEN);
+}
 
 // Normalize one digest entry from the object-or-array config. Best-effort:
 // anything unusable is dropped (never throws). An entry without a usable
@@ -318,16 +350,15 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   // `type` and `match` compose (AND): both are kept and both must match at
   // selection time. An invalid `type` (present but not a non-empty string)
   // drops the whole entry (same best-effort policy as an invalid `match`).
-  // Types are lowercase-normalized and capped to MAX_TYPE_LEN — the same cap
-  // the job side applies — so selection is an exact compare and a long config
-  // type still matches the (truncated) long job type.
+  // normalizeType() applies the same trim/lowercase/cap the job side uses, so
+  // a long config type still matches the (truncated) long job type.
   let type: string | undefined;
   if (entry.type !== undefined) {
-    if (typeof entry.type !== "string" || !entry.type.trim()) {
+    type = normalizeType(entry.type);
+    if (!type) {
       warnDigestInvalid("type", entry.type);
       return undefined;
     }
-    type = entry.type.trim().toLowerCase().slice(0, MAX_TYPE_LEN);
   }
 
   let match: DigestMatch | undefined;
@@ -616,14 +647,10 @@ export default function (pi: ExtensionAPI) {
     return trimmed.slice(0, 80);
   }
 
-  // Normalize an optional job type: short token, lowercase (so digest
-  // selection is a cheap exact compare against lowercase config types), blank
-  // → undefined, capped to MAX_TYPE_LEN. The config side applies the same cap
-  // (normalizeDigestEntry), so both sides truncate identically.
+  // Normalize an optional job type via the shared normalizeType(), so the
+  // bgrun param and the config `type` truncate identically (see MAX_TYPE_LEN).
   function sanitizeType(type: string | undefined): string | undefined {
-    const trimmed = (type ?? "").trim().toLowerCase();
-    if (!trimmed) return undefined;
-    return trimmed.slice(0, MAX_TYPE_LEN);
+    return normalizeType(type);
   }
 
   function readLastLogLine(logPath: string, maxLen = 200): string | null {
@@ -652,6 +679,10 @@ export default function (pi: ExtensionAPI) {
     }
     try {
       const buf = Buffer.alloc(64 * 1024);
+      // Keep the last ≤256 bytes so the wrapper's appended exit marker (and any
+      // blank separator it introduces) can be excluded from the count.
+      const tail = Buffer.alloc(256);
+      let tailLen = 0;
       let count = 0;
       let lastByte = -1;
       let bytesRead = 0;
@@ -660,9 +691,36 @@ export default function (pi: ExtensionAPI) {
         for (let i = 0; i < bytesRead; i++) {
           if (buf[i] === 0x0a) count++;
         }
-        if (bytesRead > 0) lastByte = buf[bytesRead - 1];
+        if (bytesRead > 0) {
+          if (bytesRead >= tail.length) {
+            buf.copy(tail, 0, bytesRead - tail.length, bytesRead);
+            tailLen = tail.length;
+          } else {
+            const combined = tailLen + bytesRead;
+            if (combined > tail.length) {
+              tail.copy(tail, 0, combined - tail.length, tailLen);
+              tailLen = tail.length - bytesRead;
+            }
+            buf.copy(tail, tailLen, 0, bytesRead);
+            tailLen += bytesRead;
+          }
+          lastByte = buf[bytesRead - 1];
+        }
       } while (bytesRead === buf.length);
       if (lastByte !== -1 && lastByte !== 0x0a) count++; // final unterminated line
+      // The wrapper appends "\n<EXIT_MARKER><ec>\n" — those newlines are not
+      // command output. Drop the marker line, plus the blank separator when the
+      // output already ended in a newline.
+      const tailText = tail.subarray(0, tailLen).toString("latin1");
+      const markerAt = tailText.lastIndexOf("\n" + EXIT_MARKER);
+      if (markerAt !== -1) {
+        let extra = 0;
+        for (let i = markerAt + 1; i < tailText.length; i++) {
+          if (tailText.charCodeAt(i) === 0x0a) extra++;
+        }
+        if (markerAt > 0 && tailText.charCodeAt(markerAt - 1) === 0x0a) extra++;
+        count = Math.max(0, count - extra);
+      }
       return count;
     } catch {
       return null;
@@ -1140,6 +1198,16 @@ export default function (pi: ExtensionAPI) {
       if (cfg.jobsDirProjectLocal) ensureGitExcluded(cfg.jobsDir);
       const jobsDir = cfg.jobsDir;
       mkdirSync(jobsDir, { recursive: true });
+      // Evidence-of-use marker (best-effort): lets the digest nudge tell that
+      // THIS project has run bgrun, without scanning the shared jobs dir.
+      try {
+        writeFileSync(
+          jobUsageMarkerPath(jobsDir, ctx.cwd ?? process.cwd()),
+          String(Date.now()),
+        );
+      } catch {
+        // a marker write must never block a spawn
+      }
 
       const slug = makeSlug(name ?? command);
       const ts = Math.floor(Date.now() / 1000);
@@ -1394,6 +1462,10 @@ export default function (pi: ExtensionAPI) {
       try {
         child = spawn("sh", ["-c", cmd, "--", logPath], {
           stdio: ["ignore", "pipe", "ignore"],
+          // Own process group so a timeout can kill the whole pipeline (sh AND
+          // its children), not just `sh`. Without this, grandchildren survive
+          // and keep the pipe open.
+          detached: true,
         });
       } catch {
         finish(undefined);
@@ -1401,36 +1473,51 @@ export default function (pi: ExtensionAPI) {
       }
       let stdout = "";
       child.stdout?.on("data", (chunk: Buffer) => {
-        // Bounded collection: once past the wake cap, stop buffering (but keep
-        // draining so the child is never blocked on a full pipe). The final
+        // Bounded collection: once past the wake cap, stop buffering but keep
+        // the listener attached so the child is never blocked on a full pipe.
         // capDigestOutput() trims the overshoot to DIGEST_TOTAL_CAP.
         if (stdout.length > DIGEST_TOTAL_CAP) return;
         stdout += chunk.toString();
       });
-      // Hard timeout: SIGTERM first, SIGKILL after a short grace.
-      const killTimer = setTimeout(() => {
-        timedOut = true;
+      // Kill the whole process group (see `detached` above), falling back to
+      // the child handle if the group is already gone.
+      const killGroup = (signal: NodeJS.Signals) => {
+        const pid = child.pid;
         try {
-          child.kill("SIGTERM");
+          if (pid === undefined) throw new Error("no pid");
+          process.kill(-pid, signal);
         } catch {
-          // already gone
-        }
-        setTimeout(() => {
           try {
-            child.kill("SIGKILL");
+            child.kill(signal);
           } catch {
             // already gone
           }
+        }
+      };
+      // Hard timeout: SIGTERM first, SIGKILL after a short grace.
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const killTimer = setTimeout(() => {
+        timedOut = true;
+        killGroup("SIGTERM");
+        graceTimer = setTimeout(() => {
+          killGroup("SIGKILL");
           finish(undefined);
         }, DIGEST_KILL_GRACE_MS);
       }, DIGEST_TIMEOUT_MS);
-      child.on("error", () => {
+      const stopTimers = () => {
         clearTimeout(killTimer);
+        if (graceTimer) clearTimeout(graceTimer);
+      };
+      child.on("error", () => {
+        stopTimers();
         finish(undefined);
       });
-      child.on("exit", () => {
-        clearTimeout(killTimer);
-        finish(timedOut ? undefined : stdout);
+      child.on("exit", (code) => {
+        stopTimers();
+        // Contract: a digest that ERRORS contributes nothing. Gate on the exit
+        // code so partial output from a failed command never reaches the wake.
+        // Shipped presets all end in `head`, which exits 0.
+        finish(timedOut || code !== 0 ? undefined : stdout);
       });
     });
   }
@@ -1466,36 +1553,17 @@ export default function (pi: ExtensionAPI) {
   // digest-config skill once. Toast only — never sendUserMessage, so it costs
   // zero LLM context. Dismissal is a per-project marker file in the jobs dir;
   // the user's config files are never written.
-  const DIGEST_NUDGE_TEXT =
-    "pi-bgrun: no digest configured for this project — use the digest-config skill to set one up.";
-
-  // Evidence of use: at least one finished job log — the self-describing exit
-  // marker is the same done signal the cleanup scan relies on.
-  function hasDoneJobLog(jobsDir: string): boolean {
-    let entries: string[];
-    try {
-      entries = readdirSync(jobsDir);
-    } catch {
-      return false; // jobs dir doesn't exist — no usage yet
-    }
-    for (const name of entries) {
-      if (!name.endsWith(".log")) continue;
-      if (parseExitFromLog(join(jobsDir, name)) !== null) return true;
-    }
-    return false;
-  }
-
   function maybeNudgeDigest(ctx: ExtensionContext): void {
     try {
       if (!ctx.isProjectTrusted?.()) return;
       const cfg = resolveConfig(ctx);
       if (cfg.digest) return; // already configured — nothing to nudge
       if (!ctx.hasUI) return; // toast-only feature; no UI → nothing to do
-      if (!hasDoneJobLog(cfg.jobsDir)) return;
-      const markerPath = digestNudgeMarkerPath(
-        cfg.jobsDir,
-        ctx.cwd ?? process.cwd(),
-      );
+      const projectDir = ctx.cwd ?? process.cwd();
+      // Project-scoped evidence of use (written at spawn) — never the shared
+      // jobs dir as a whole, which would toast every project on the machine.
+      if (!existsSync(jobUsageMarkerPath(cfg.jobsDir, projectDir))) return;
+      const markerPath = digestNudgeMarkerPath(cfg.jobsDir, projectDir);
       if (existsSync(markerPath)) return; // already nudged once — stay silent
       ctx.ui.notify(DIGEST_NUDGE_TEXT, "info");
       try {
