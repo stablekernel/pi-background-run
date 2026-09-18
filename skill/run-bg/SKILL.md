@@ -116,10 +116,11 @@ Plain `grep` via bash is fine only for a one-off search you know is tiny.
   project-sandboxed analysis tools like `ctx_execute_file`.
 - Cleanup: `bgclean` removes only THIS session's old logs; `bgclean all`
   sweeps every session's. Auto-sweeps at session start/shutdown are
-  session-scoped plus an orphan pass over the machine-global `~/.pi-bgrun/jobs`
-  and the current project's jobs dir (default on — removes finished week-old
-  logs from crashed/abandoned sessions; disable with
-  `globalAutoClean: false` / `PI_BGRUN_GLOBAL_AUTO_CLEAN=0`). Retention is
-  `cleanupDays` (default 7, configurable).
+  session-scoped plus an orphan pass (default on — removes finished week-old
+  logs from crashed/abandoned sessions; disable with `globalAutoClean: false`
+  / `PI_BGRUN_GLOBAL_AUTO_CLEAN=0`). Under the project-local default the orphan
+  pass covers the current project's jobs dir AND the machine-global
+  `~/.pi-bgrun/jobs`; an explicit absolute `jobsDir` is swept alone. Retention
+  is `cleanupDays` (default 7, configurable).
 - To stop a running job, use `bash` with `kill <pid>` (the pid is in the `bgstatus`
   output). There is no `bgkill` tool.

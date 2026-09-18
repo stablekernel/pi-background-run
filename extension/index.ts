@@ -42,6 +42,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -73,8 +74,8 @@ const PROJECT_LOCAL_JOBS_REL = ".pi-bgrun/jobs";
 // PI_BGRUN_GLOBAL_DIR can redirect it — used by tests to stay off the real
 // ~/.pi-bgrun, and available for setups with a custom home or shared scratch.
 function globalJobsDir(): string {
-  return (
-    process.env.PI_BGRUN_GLOBAL_DIR || join(homedir(), ".pi-bgrun", "jobs")
+  return expandTilde(
+    process.env.PI_BGRUN_GLOBAL_DIR || join(homedir(), ".pi-bgrun", "jobs"),
   );
 }
 
@@ -180,17 +181,30 @@ function isProjectRootLike(dir: string): boolean {
   );
 }
 
+// realpath that never throws: a non-existent or unreadable path falls back to
+// the literal path so callers can compare paths without guarding every step.
+function safeRealpath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
 // Nearest ancestor of `start` (inclusive) that looks like a project root.
 // The user's home directory is never treated as a project root: pi's global
 // agent dir (~/.pi/agent) would otherwise make every cwd under $HOME resolve
-// to $HOME.
-function findProjectRoot(start: string): string | undefined {
-  const home = homedir();
+// to $HOME. Paths are canonicalized so a symlinked $HOME is still recognized.
+function findProjectRoot(
+  start: string,
+  home: string = homedir(),
+): string | undefined {
+  const homeReal = safeRealpath(home);
   let cur = start;
   for (;;) {
-    if (cur !== home && isProjectRootLike(cur)) return cur;
+    if (safeRealpath(cur) !== homeReal && isProjectRootLike(cur)) return cur;
     const parent = dirname(cur);
-    if (parent === cur || cur === home) return undefined;
+    if (parent === cur || safeRealpath(cur) === homeReal) return undefined;
     cur = parent;
   }
 }
@@ -214,14 +228,14 @@ function projectRootFor(dir: string): string {
 
 export function resolveJobsDirPath(
   raw: string | undefined,
-  ctx?: { cwd?: string },
+  ctx?: { cwd?: string; home?: string },
 ): { dir: string; projectLocal: boolean } {
   const p = raw ? expandTilde(raw) : raw;
   // Absolute paths are the user's explicit choice: used as-is, never flagged
   // project-local, and no ancestor walk needed.
   if (p && isAbsolute(p)) return { dir: p, projectLocal: false };
   const cwd = ctx?.cwd ?? process.cwd();
-  const root = cwd ? findProjectRoot(cwd) : undefined;
+  const root = cwd ? findProjectRoot(cwd, ctx?.home) : undefined;
   if (!p) {
     return root
       ? { dir: join(root, PROJECT_LOCAL_JOBS_REL), projectLocal: true }
@@ -960,13 +974,14 @@ export default function (pi: ExtensionAPI) {
   // machine-global dir is included only for the project-local default (so
   // pre-project-local logs are still reclaimed); an explicit absolute jobsDir
   // is treated as fully isolated and swept alone.
-  function sharedJobsDirs(
-    projectDir: string,
-    projectLocal: boolean,
-  ): string[] {
+  function sharedJobsDirs(projectDir: string, projectLocal: boolean): string[] {
     if (!projectLocal) return [projectDir];
     const global = globalJobsDir();
-    return projectDir === global ? [global] : [global, projectDir];
+    // Dedup aliased paths (equal strings, or symlinks to the same dir) so the
+    // sweep never counts/removes the same log twice.
+    return safeRealpath(projectDir) === safeRealpath(global)
+      ? [global]
+      : [global, projectDir];
   }
 
   // Auto-clean at session boundaries. Two parts:
@@ -993,10 +1008,7 @@ export default function (pi: ExtensionAPI) {
     if (cfg.jobsDirProjectLocal && trusted) ensureGitExcluded(cfg.jobsDir);
     cleanSessionJobs(cfg.cleanupDays, ctx);
     if (!cfg.globalAutoClean) return;
-    for (const dir of sharedJobsDirs(
-      cfg.jobsDir,
-      cfg.jobsDirProjectLocal,
-    )) {
+    for (const dir of sharedJobsDirs(cfg.jobsDir, cfg.jobsDirProjectLocal)) {
       if (cfg.jobsDirProjectLocal && !trusted && dir === cfg.jobsDir) continue;
       const markerPath = join(dir, ".last-clean");
       try {
@@ -2235,18 +2247,17 @@ export default function (pi: ExtensionAPI) {
       result = { removed: 0, kept: 0, skippedRunning: 0 };
       // "all" spans every shared jobs dir — the current project's plus the
       // machine-global default (so pre-project-local logs are still reachable).
-      for (const dir of sharedJobsDirs(
-        cfg.jobsDir,
-        cfg.jobsDirProjectLocal,
-      )) {
+      for (const dir of sharedJobsDirs(cfg.jobsDir, cfg.jobsDirProjectLocal)) {
         const r = cleanOldJobs(days, dir, ctx);
         result.removed += r.removed;
         result.kept += r.kept;
         result.skippedRunning += r.skippedRunning;
-        // A manual clean refreshes the throttle marker so the next auto-sweep
-        // doesn't immediately redo this work.
+        // Do not create a jobs dir just to stamp the throttle marker — that
+        // would dirty git status in a repo with no jobs (and mutate an
+        // untrusted repo). Only refresh the marker when the dir already exists.
+        if (!existsSync(dir)) continue;
+        if (cfg.jobsDirProjectLocal) ensureGitExcluded(dir);
         try {
-          mkdirSync(dir, { recursive: true });
           writeFileSync(join(dir, ".last-clean"), String(Date.now()));
         } catch {
           // best-effort
