@@ -1625,6 +1625,45 @@ test("bgclean: default scope is this session's logs; all: true sweeps everything
   }
 });
 
+test("bgclean all: sweeps stale per-project digest markers, keeps fresh ones", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const fs = await import("node:fs");
+    const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const staleMarkers = [".bgrun-used-abc123", ".digest-nudge-def456"];
+    const freshMarker = ".bgrun-used-fresh0";
+    for (const name of [...staleMarkers, freshMarker]) {
+      const p = join(dir, name);
+      fs.writeFileSync(p, "1");
+      if (staleMarkers.includes(name)) fs.utimesSync(p, old, old);
+    }
+    // A backdated finished log so the sweep also has a normal job to remove.
+    const logPath = join(dir, "job-1-1.log");
+    fs.writeFileSync(logPath, "out\n__BGRUN_EXIT__=0\n");
+    fs.utimesSync(logPath, old, old);
+
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgclean = tools.get("bgclean")!;
+    await bgclean.execute(
+      "call-mk",
+      { days: 1, all: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    for (const name of staleMarkers) {
+      assert.ok(!existsSync(join(dir, name)), `stale marker swept: ${name}`);
+    }
+    assert.ok(existsSync(join(dir, freshMarker)), "fresh marker kept");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("bgclean: rejects negative days", async () => {
   const { pi, tools, ctx } = makeFakePi();
   await loadExtension(pi);

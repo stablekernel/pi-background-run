@@ -35,7 +35,7 @@ Restart pi after install so the extension loads.
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Jobs from other sessions are only listed when `adoptForeignJobs` is enabled. |
 | `bgtail` | Read the newest lines of a job's log (default 40), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
 | `bggrep` | Regex search over a job's log: line-numbered matches, optional `context` lines, capped (~50 matches, ~2KB/line, ~8KB) and condensed. Runs inside the extension, so it reaches **any** jobs dir — including global logs that project-sandboxed tools (`ctx_execute_file`) cannot. With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
-| `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Pass `all: true` to sweep the whole shared jobs dir. Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
+| `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Pass `all: true` to sweep the whole shared jobs dir; that also sweeps stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`). Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
 
 ## Slash commands
 

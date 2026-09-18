@@ -830,6 +830,21 @@ export default function (pi: ExtensionAPI) {
         // ignore
       }
     }
+    // Per-project digest markers (.bgrun-used-*, .digest-nudge-*) are not
+    // session-scoped, so they'd otherwise accumulate one-per-project forever.
+    // Sweep the ones whose project has been quiet past the retention window;
+    // a project that runs bgrun again re-writes its usage marker at spawn.
+    for (const name of entries) {
+      if (!name.startsWith(".bgrun-used-") && !name.startsWith(".digest-nudge-"))
+        continue;
+      const markerPath = join(jobsDir, name);
+      try {
+        if (statSync(markerPath).mtimeMs > cutoff) continue;
+        unlinkSync(markerPath);
+      } catch {
+        // ignore
+      }
+    }
     if (result.removed > 0 && ctx?.hasUI) {
       ctx.ui.notify(`bgrun: cleaned ${result.removed} old job log(s)`, "info");
     }
