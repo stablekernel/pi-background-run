@@ -64,7 +64,7 @@ export const DIGEST_PRESETS: DigestPreset[] = [
   // is record-based (`RS='<testcase'`, not line-based) and matches ` name="`
   // with a leading space so it never picks up `classname="..."`.
   command:
-   'printf \'failures: %s  errors: %s\\n\' "$(grep -o \'<failure\' "$1" | wc -l | tr -d \' \')" "$(grep -o \'<error\' "$1" | wc -l | tr -d \' \')"; awk -v RS=\'<testcase\' \'NR>1 { if (match($0, / name="[^"]*"/)) { name=substr($0, RSTART+7, RLENGTH-8); if ($0 ~ /<failure|<error/) print name } }\' "$1" | sort -u | head -10',
+   "printf 'failures: %s  errors: %s\\n' \"$(grep -o '<failure' \"$1\" | wc -l | tr -d ' ')\" \"$(grep -o '<error' \"$1\" | wc -l | tr -d ' ')\"; awk -v RS='<testcase' 'NR>1 { if (match($0, / name=\"[^\"]*\"/)) { name=substr($0, RSTART+7, RLENGTH-8); if ($0 ~ /<failure|<error/) print name } }' \"$1\" | sort -u | head -10",
  },
 ];
 
@@ -268,9 +268,7 @@ export function selectDigestEntry(
  // also pass. Config order decides ties.
  if (target.type !== undefined) {
   const want = target.type.toLowerCase();
-  const hit = pick(
-   entries.filter((e) => e.type?.toLowerCase() === want),
-  );
+  const hit = pick(entries.filter((e) => e.type?.toLowerCase() === want));
   // A type-matching entry always carries a non-empty type, so `entry.type` is
   // the label fallback — no need for the preset-id default here.
   if (hit?.entry.type) {
