@@ -194,7 +194,7 @@ three:
 `name` names the job (and its log file); `type` never affects the id or the
 display — its only job is selecting the scorecard. Selection tries `type`
 entries first (exact, case-insensitive), then falls back to `match.name` /
-`match.command` regexes. The config `type` is capped to the same 40 characters
+`match.command` globs. The config `type` is capped to the same 40 characters
 as the job `type`, so an over-long type still matches.
 
 #### Setting it up
@@ -271,7 +271,7 @@ because it does not depend on the agent naming every job consistently:
     { "type": "test",  "preset": "go-test" },
     { "type": "build", "label": "build",
       "command": "grep -E '^error' \"$1\" | head -5" },
-    { "match": { "command": "cargo" }, "label": "cargo", "preset": "go-test" },
+    { "match": { "command": "*cargo*" }, "label": "cargo", "preset": "go-test" },
     { "preset": "go-test" }
   ]
 }
@@ -296,23 +296,24 @@ Selection order (exactly one entry, or none):
 declared that same type — exact and case-insensitive (`"test"` matches
 `"Test"`) — and must ALSO satisfy the entry's `match` if it has one. All type
 entries are checked first, in config order, regardless of where they sit
-relative to regex entries. First type match wins.
-2. **Regex/default fallback.** If no type entry matched — including when the
+relative to match entries. First type match wins.
+2. **Match/default fallback.** If no type entry matched — including when the
 job has no type — the entries *without* a `type` are scanned in config order:
-`match.name` / `match.command` regexes and no-`match` defaults, first match
+`match.name` / `match.command` globs and no-`match` defaults, first match
 wins. Put a no-`match` default **last** so jobs you didn't anticipate still get
 a scorecard.
 3. No match → no digest.
 
 - `type` and `match` compose (AND): with both present the entry matches only a
-  job of that type that also satisfies the regex. Use `match` alone for jobs
+  job of that type that also satisfies the glob. Use `match` alone for jobs
   that won't pass a `type`.
-- `match.name` and `match.command` are **regexes** tested against the job's
+- `match.name` and `match.command` are **globs** tested against the job's
   `name` and command line. Both present → both must match. Matching is
-  **case-insensitive and unanchored (substring)** — so `"unit-tests"` matches
-  `"unit-tests-run3"`.
+  **case-insensitive and whole-string** — `*` matches any run, `?` exactly one
+  character, everything else is literal — so `"*unit*"` matches
+  `"unit-tests-run3"` while a bare `"unit-tests"` matches only exactly that.
 - `label` sets the wake tag: `digest (<label>): …`. Precedence: `label` →
-  (type entry) the type string → (matched regex entry) `match.name` → the
+  (type entry) the type string → (matched glob entry) `match.name` → the
   entry's preset id (else `command`). So a bare `{ "preset": "go-test" }`
   wakes as `digest (go-test):`.
 - First match wins; exactly one digest block is appended per wake.

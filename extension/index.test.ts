@@ -2809,6 +2809,16 @@ test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort
     writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: ["go-test"] });
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
     assert.equal(cfg.digest, undefined);
+    // A present-but-unusable section (wrong type) is unconfigured, not a crash.
+    for (const bad of ["go-test", 42, true]) {
+      writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: bad });
+      cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+      assert.equal(
+        cfg.digest,
+        undefined,
+        `digest ${JSON.stringify(bad)} is ignored`,
+      );
+    }
     // Empty array and all-invalid arrays normalize to undefined (the nudge
     // checks `cfg.digest` truthiness).
     writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: [] });
@@ -2819,6 +2829,37 @@ test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort
     });
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
     assert.equal(cfg.digest, undefined);
+  } finally {
+    delete process.env.PI_BGRUN_USER_CONFIG;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: digest label is trimmed and capped at 60", async () => {
+  const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
+  const mod: any = await import(url);
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  process.env.PI_BGRUN_USER_CONFIG = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-home-")),
+    "user.json",
+  );
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { label: "  spaced  ", command: "echo a" },
+        { label: "x".repeat(100), command: "echo b" },
+        { label: "   ", command: "echo c" },
+      ],
+    });
+    const cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.deepEqual(cfg.digest, [
+      // leading/trailing whitespace trimmed.
+      { label: "spaced", command: "echo a" },
+      // over-long label capped at 60.
+      { label: "x".repeat(60), command: "echo b" },
+      // blank label dropped, entry kept.
+      { command: "echo c" },
+    ]);
   } finally {
     delete process.env.PI_BGRUN_USER_CONFIG;
     rmSync(proj, { recursive: true, force: true });
@@ -2895,13 +2936,13 @@ test("entryMatchesJob: absent/empty match, name, command, and AND semantics", ()
   // No matcher / empty matcher → matches every job.
   assert.equal(entryMatchesJob({ preset: "go-test" }, target), true);
   assert.equal(entryMatchesJob({ match: {}, preset: "go-test" }, target), true);
-  // Name regex.
+  // Name glob: `*` is any run; a bare pattern is a whole-string match.
   assert.equal(
-    entryMatchesJob({ match: { name: "^unit-" }, preset: "go-test" }, target),
+    entryMatchesJob({ match: { name: "unit-*" }, preset: "go-test" }, target),
     true,
   );
   assert.equal(
-    entryMatchesJob({ match: { name: "^e2e-" }, preset: "go-test" }, target),
+    entryMatchesJob({ match: { name: "e2e-*" }, preset: "go-test" }, target),
     false,
   );
   // A name matcher never matches a job that has no name.
@@ -2912,17 +2953,17 @@ test("entryMatchesJob: absent/empty match, name, command, and AND semantics", ()
     ),
     false,
   );
-  // Command regex.
+  // Command glob: substring needs explicit `*` on both sides.
   assert.equal(
     entryMatchesJob(
-      { match: { command: "cargo build" }, preset: "go-test" },
+      { match: { command: "*cargo build*" }, preset: "go-test" },
       target,
     ),
     false,
   );
   assert.equal(
     entryMatchesJob(
-      { match: { command: "go test" }, preset: "go-test" },
+      { match: { command: "*go test*" }, preset: "go-test" },
       target,
     ),
     true,
@@ -2930,25 +2971,33 @@ test("entryMatchesJob: absent/empty match, name, command, and AND semantics", ()
   // Both present → AND.
   assert.equal(
     entryMatchesJob(
-      { match: { name: "unit", command: "go test" }, preset: "go-test" },
+      { match: { name: "*unit*", command: "*go test*" }, preset: "go-test" },
       target,
     ),
     true,
   );
   assert.equal(
     entryMatchesJob(
-      { match: { name: "unit", command: "cargo" }, preset: "go-test" },
+      { match: { name: "*unit*", command: "*cargo*" }, preset: "go-test" },
       target,
     ),
     false,
   );
-  // Uncompilable regex → non-match, never throws.
+  // Glob, not regex: `[` is a literal character, so it matches only a literal
+  // `[` — never throws, never a regex class.
   assert.equal(
     entryMatchesJob(
       { match: { name: "[" }, preset: "go-test" },
-      { command: "go test" },
+      { name: "unit-tests", command: "go test" },
     ),
     false,
+  );
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "[" }, preset: "go-test" },
+      { name: "[", command: "go test" },
+    ),
+    true,
   );
 });
 
@@ -2956,7 +3005,7 @@ test("selectDigestEntry: first match wins, default fallback, no match → undefi
   const goTest = DIGEST_PRESETS.find((p) => p.id === "go-test")!;
   const entries = [
     { match: { name: "unit-tests" }, preset: "go-test" },
-    { match: { command: "cargo build" }, command: "echo build" },
+    { match: { command: "*cargo build*" }, command: "echo build" },
     { preset: "jest" },
   ];
   // First entry matches by name.
@@ -3022,20 +3071,38 @@ test("selectDigestEntry: label precedence (label → match.name → preset id/co
   );
 });
 
+test("selectDigestEntry: a glob match.name labels the wake with wildcards stripped", () => {
+  assert.deepEqual(
+    selectDigestEntry([{ match: { name: "*cargo*" }, command: "echo hi" }], {
+      name: "cargo-build",
+      command: "cargo build --release",
+    }),
+    { command: "echo hi", label: "cargo" },
+  );
+  // A pattern that strips to nothing falls back to the preset id / "command".
+  assert.deepEqual(
+    selectDigestEntry([{ match: { name: "*" }, command: "echo hi" }], {
+      name: "anything",
+      command: "anything",
+    }),
+    { command: "echo hi", label: "command" },
+  );
+});
+
 // ── type-first digest selection (job type declared at spawn) ──────────────
 
 test("selectDigestEntry: type-first selection (exact, case-insensitive) + fallback", () => {
   const entries = [
     {
       match: { name: "unit" },
-      label: "regex-unit",
-      command: "echo regex-unit",
+      label: "match-unit",
+      command: "echo match-unit",
     },
     { type: "test", command: "echo type-test" },
     { label: "default", command: "echo default" },
   ];
   // A job declaring the type selects the type entry first, even though an
-  // earlier regex entry also matches.
+  // earlier match entry also matches.
   assert.deepEqual(
     selectDigestEntry(entries, {
       type: "test",
@@ -3049,14 +3116,14 @@ test("selectDigestEntry: type-first selection (exact, case-insensitive) + fallba
     selectDigestEntry(entries, { type: "TEST", command: "go test" }),
     { command: "echo type-test", label: "test" },
   );
-  // A job type with no entry falls through to the regex/default scan.
+  // A job type with no entry falls through to the match/default scan.
   assert.deepEqual(
     selectDigestEntry(entries, {
       type: "lint",
       name: "unit",
       command: "go test",
     }),
-    { command: "echo regex-unit", label: "regex-unit" },
+    { command: "echo match-unit", label: "match-unit" },
   );
   // No type at all: unchanged legacy behavior.
   assert.deepEqual(selectDigestEntry(entries, { command: "ls" }), {
@@ -3065,18 +3132,18 @@ test("selectDigestEntry: type-first selection (exact, case-insensitive) + fallba
   });
 });
 
-test("selectDigestEntry: type beats regex entries regardless of config order", () => {
+test("selectDigestEntry: type beats match entries regardless of config order", () => {
   const want = { command: "echo typed", label: "typed" };
-  const regexFirst = [
-    { match: { command: "go test" }, label: "regex", command: "echo regex" },
+  const matchFirst = [
+    { match: { command: "go test" }, label: "match", command: "echo match" },
     { type: "test", label: "typed", command: "echo typed" },
   ];
   const typeFirst = [
     { type: "test", label: "typed", command: "echo typed" },
-    { match: { command: "go test" }, label: "regex", command: "echo regex" },
+    { match: { command: "go test" }, label: "match", command: "echo match" },
   ];
   assert.deepEqual(
-    selectDigestEntry(regexFirst, { type: "test", command: "go test" }),
+    selectDigestEntry(matchFirst, { type: "test", command: "go test" }),
     want,
   );
   assert.deepEqual(
@@ -3140,31 +3207,47 @@ test("selectDigestEntry: label precedence for type entries (label → type)", ()
   );
 });
 
-test("entryMatchesJob: name/command regexes are case-insensitive and unanchored", () => {
+test("entryMatchesJob: glob is whole-string, case-insensitive, * and ? wildcards", () => {
   const target = { name: "unit-tests-run3", command: "go test ./..." };
-  // Unanchored substring — the whole point: a noisy job name still matches.
+  // A noisy name needs an explicit wildcard — a bare pattern is whole-string.
   assert.equal(
     entryMatchesJob(
-      { match: { name: "unit-tests" }, preset: "go-test" },
+      { match: { name: "*unit-tests*" }, preset: "go-test" },
       target,
     ),
     true,
   );
   // Case-insensitive.
   assert.equal(
-    entryMatchesJob({ match: { name: "UNIT" }, preset: "go-test" }, target),
+    entryMatchesJob({ match: { name: "*UNIT*" }, preset: "go-test" }, target),
     true,
   );
   assert.equal(
     entryMatchesJob(
-      { match: { command: "GO TEST" }, preset: "go-test" },
+      { match: { command: "*GO TEST*" }, preset: "go-test" },
+      target,
+    ),
+    true,
+  );
+  // A bare pattern matches the whole string only (no implicit substring).
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit-tests" }, preset: "go-test" },
+      target,
+    ),
+    false,
+  );
+  // `?` is exactly one character.
+  assert.equal(
+    entryMatchesJob(
+      { match: { name: "unit-test?-run3" }, preset: "go-test" },
       target,
     ),
     true,
   );
   // A non-matching pattern still fails.
   assert.equal(
-    entryMatchesJob({ match: { name: "e2e" }, preset: "go-test" }, target),
+    entryMatchesJob({ match: { name: "*e2e*" }, preset: "go-test" }, target),
     false,
   );
 });
@@ -3757,7 +3840,7 @@ test("wake digest: match by command line chooses the matching entry", async () =
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: [
         {
-          match: { command: "cargo build" },
+          match: { command: "*cargo build*" },
           label: "build",
           command: "echo build-ok",
         },
@@ -3825,16 +3908,20 @@ test("wake digest: no entry matches and no default → no digest block", async (
   }
 });
 
-test("wake digest: invalid regex entry dropped, later valid entry used", async () => {
+test("wake digest: non-matching literal entry skipped, later entry used", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: [
+        // `[` is a literal glob char, not a regex class — it just won't match.
         { match: { name: "[" }, label: "broken", command: "echo broken" },
         { label: "ok", command: "echo ok" },
       ],
     });
-    const wake = await runDigestJob(proj, { command: "echo hi" });
+    const wake = await runDigestJob(proj, {
+      name: "unit-tests",
+      command: "echo hi",
+    });
     assert.match(digestLineOf(wake)!, /^digest \(ok\): ok$/);
   } finally {
     teardownDigestEnv(dir, proj, home);
@@ -3860,7 +3947,7 @@ test("wake digest: type + match compose end-to-end (normalization keeps match)",
       digest: [
         {
           type: "test",
-          match: { name: "unit" },
+          match: { name: "*unit*" },
           label: "unit",
           command: "echo unit",
         },
@@ -3932,26 +4019,26 @@ test("wake digest: job type selects the matching type entry (digest (test))", as
   }
 });
 
-test("wake digest: type is case-insensitive; unknown type falls through to regex/default", async () => {
+test("wake digest: type is case-insensitive; unknown type falls through to match/default", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: [
         { type: "test", label: "typed-test", command: "echo typed" },
-        { match: { command: "run" }, label: "regex", command: "echo regex" },
+        { match: { command: "*run*" }, label: "match", command: "echo match" },
         { label: "default", command: "echo default" },
       ],
     });
     // Case-insensitive exact type match.
     let wake = await runDigestJob(proj, { type: "TEST", command: "echo hi" });
     assert.match(digestLineOf(wake)!, /^digest \(typed-test\): typed$/);
-    // Unknown type → falls through to the regex scan.
+    // Unknown type → falls through to the match scan.
     wake = await runDigestJob(proj, {
       type: "lint",
       command: "npm run lint",
     });
-    assert.match(digestLineOf(wake)!, /^digest \(regex\): regex$/);
-    // Unknown type + no regex match → default entry.
+    assert.match(digestLineOf(wake)!, /^digest \(match\): match$/);
+    // Unknown type + no match → default entry.
     wake = await runDigestJob(proj, { type: "lint", command: "ls" });
     assert.match(digestLineOf(wake)!, /^digest \(default\): default$/);
   } finally {
@@ -3959,15 +4046,15 @@ test("wake digest: type is case-insensitive; unknown type falls through to regex
   }
 });
 
-test("wake digest: type entry beats an earlier regex entry (type-first order)", async () => {
+test("wake digest: type entry beats an earlier match entry (type-first order)", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: [
         {
-          match: { command: "go test" },
-          label: "regex",
-          command: "echo regex",
+          match: { command: "*go test*" },
+          label: "match",
+          command: "echo match",
         },
         { type: "test", label: "typed", command: "echo typed" },
       ],

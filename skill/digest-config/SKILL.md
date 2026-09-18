@@ -29,7 +29,7 @@ both `preset` and `command` are set within one entry, the preset wins:
     { "type": "test",  "preset": "go-test" },
     { "type": "build", "label": "build",
       "command": "grep -E '^error' \"$1\" | head -5" },
-    { "match": { "command": "cargo" }, "label": "cargo", "preset": "go-test" },
+    { "match": { "command": "*cargo*" }, "label": "cargo", "preset": "go-test" },
     { "preset": "go-test" }
   ]
 }
@@ -48,20 +48,21 @@ Selection (exactly one entry, or none):
    a job declaring that exact type that also satisfies the entry's `match` if
    it has one. First type match wins.
 2. Otherwise the entries **without** a `type` are scanned in config order:
-   `match.name` / `match.command` regexes and no-`match` defaults.
+   `match.name` / `match.command` globs and no-`match` defaults.
 3. No match → no digest.
 
 - `type` and `match` compose (AND): with both present, only a job of that type
-  that also satisfies the regex matches.
-- `match.name` / `match.command` are **regexes** tested against the job's
+  that also satisfies the glob matches.
+- `match.name` / `match.command` are **globs** tested against the job's
   `name` and command line; both present → both must match. They are
-  **case-insensitive and unanchored (substring)**.
+  **case-insensitive and whole-string** (`*` any run, `?` one character;
+  write `*text*` for a substring).
 - An entry with no `match` (or an empty `match`) matches every job — put it
   **last** as the default. Include one so jobs you did not anticipate still
   get a scorecard.
 - `label` sets the wake tag; without it a type entry uses its `type` string, a
-  regex entry uses the matched `match.name`, else the preset id (or `command`).
-- An invalid regex, an invalid `type`, or an entry with no valid
+  glob entry uses the matched `match.name`, else the preset id (or `command`).
+- An invalid `match` (non-string), an invalid `type`, or an entry with no valid
   `preset`/`command` is dropped silently; an empty/all-invalid list counts as
   unconfigured.
 
@@ -103,7 +104,7 @@ advisory; a preset entry with no `type` still applies to every job.
 6. **Write the config, one `type` entry per job type.** Merge the entries into
    `<project>/.pi/pi-bgrun.json`, preserving any existing keys, giving each
    entry the `type` you identified in step 2, and putting the no-`match`
-   default entry **last**. Use `match.name` / `match.command` regexes only for
+   default entry **last**. Use `match.name` / `match.command` globs only for
    jobs that will not pass a `type`. Create the file if absent. Tell the user
    (or the agent driving `bgrun`) which `type:` value to pass for each job.
 7. **Smoke-test each entry.** Start a real `bgrun` job of each configured type

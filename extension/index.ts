@@ -111,7 +111,7 @@ interface BgrunConfig {
   // undefined when unconfigured or fully invalid — an empty array is normalized
   // to undefined so the session_start nudge still sees "not configured"). The
   // object form is normalized to a single entry with no matchers. Each entry
-  // carries an optional `match` (regexes against the job name / command line),
+  // carries an optional `match` (globs against the job name / command line),
   // an optional wake `label`, and a `preset` or custom `command`. At wake time
   // the FIRST matching entry wins. Presets are shipped sh commands (see
   // digestPresets.ts); command receives the job's log path as $1. Resolved from
@@ -271,8 +271,10 @@ function warnDigestInvalid(field: string, value: unknown): void {
   // list of { type, match, label, preset, command } entries.
   const shapeHint =
     " — digest takes an object or an array of { type, match, label, preset, command } entries";
+  // field "" means the whole `digest` section was unusable (wrong shape).
+  const where = field ? `digest.${field}` : "digest";
   console.error(
-    `[pi-bgrun] ignoring invalid digest.${field} in pi-bgrun.json: ${JSON.stringify(value)}${hint}${shapeHint}`,
+    `[pi-bgrun] ignoring invalid ${where} in pi-bgrun.json: ${JSON.stringify(value)}${hint}${shapeHint}`,
   );
 }
 
@@ -293,19 +295,11 @@ export function digestNudgeMarkerPath(
   return join(jobsDir, `.digest-nudge-${key}`);
 }
 
-function isValidRegexSource(src: string): boolean {
-  try {
-    new RegExp(src);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // Job and config `type` values are short routing tokens. Both sides cap at the
 // same length; if only the job side truncated, a >MAX_TYPE_LEN config type
 // would silently never match the job's truncated type.
 const MAX_TYPE_LEN = 40;
+const MAX_LABEL_LEN = 60;
 
 // Normalize one digest entry from the object-or-array config. Best-effort:
 // anything unusable is dropped (never throws). An entry without a usable
@@ -323,7 +317,7 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
 
   // `type` and `match` compose (AND): both are kept and both must match at
   // selection time. An invalid `type` (present but not a non-empty string)
-  // drops the whole entry — same best-effort policy as an uncompilable regex.
+  // drops the whole entry (same best-effort policy as an invalid `match`).
   // Types are lowercase-normalized and capped to MAX_TYPE_LEN — the same cap
   // the job side applies — so selection is an exact compare and a long config
   // type still matches the (truncated) long job type.
@@ -348,25 +342,21 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
     }
     const rawMatch = entry.match as { name?: unknown; command?: unknown };
     const normalized: DigestMatch = {};
+    // A glob pattern is any string; a blank one is treated as absent so it
+    // doesn't constrain matching. A non-string is invalid → drop the entry.
     if (rawMatch.name !== undefined) {
-      if (
-        typeof rawMatch.name !== "string" ||
-        !isValidRegexSource(rawMatch.name)
-      ) {
+      if (typeof rawMatch.name !== "string") {
         warnDigestInvalid("match.name", rawMatch.name);
         return undefined;
       }
-      normalized.name = rawMatch.name;
+      if (rawMatch.name.trim()) normalized.name = rawMatch.name;
     }
     if (rawMatch.command !== undefined) {
-      if (
-        typeof rawMatch.command !== "string" ||
-        !isValidRegexSource(rawMatch.command)
-      ) {
+      if (typeof rawMatch.command !== "string") {
         warnDigestInvalid("match.command", rawMatch.command);
         return undefined;
       }
-      normalized.command = rawMatch.command;
+      if (rawMatch.command.trim()) normalized.command = rawMatch.command;
     }
     if (normalized.name !== undefined || normalized.command !== undefined) {
       match = normalized;
@@ -401,7 +391,7 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   if (type) out.type = type;
   if (match) out.match = match;
   if (typeof entry.label === "string" && entry.label.trim()) {
-    out.label = entry.label;
+    out.label = entry.label.trim().slice(0, MAX_LABEL_LEN);
   }
   if (preset) out.preset = preset;
   if (command) out.command = command;
@@ -460,21 +450,38 @@ export function resolveConfig(ctx?: {
   const { dir: jobsDir, projectLocal: jobsDirProjectLocal } =
     resolveJobsDirPath(process.env.PI_BGRUN_DIR || dirFile, ctx);
   // Digest section: accept either the legacy single-object form (normalized to
-  // one entry with no matchers) or an ordered array of entries. Invalid entries
-  // are dropped best-effort (warnDigestInvalid logs once for the first one).
-  // When both preset and command are valid within an entry, both are kept here
-  // — resolveDigest() gives the preset precedence. An empty array or an
-  // all-invalid array normalizes to undefined so `cfg.digest` truthiness still
-  // means "configured" (the session_start nudge relies on that).
+  // one entry with no matchers) or an ordered array of entries. Invalid inputs
+  // are dropped best-effort (warnDigestInvalid logs once per distinct field) —
+  // including a present-but-unusable section (a string/number, or a list that
+  // empties out). When both preset and command are valid within an entry, both
+  // are kept here — resolveDigest() gives the preset precedence. An empty or
+  // all-invalid section normalizes to undefined so `cfg.digest` truthiness
+  // still means "configured" (the session_start nudge relies on that).
   let digest: BgrunConfig["digest"];
   if (Array.isArray(merged.digest)) {
     const entries = merged.digest
       .map((raw) => normalizeDigestEntry(raw))
       .filter((e): e is DigestEntry => e !== undefined);
-    if (entries.length) digest = entries;
-  } else if (merged.digest && typeof merged.digest === "object") {
-    const entry = normalizeDigestEntry(merged.digest);
-    if (entry) digest = [entry];
+    if (entries.length) {
+      digest = entries;
+    } else if (merged.digest.length) {
+      // A non-empty list that normalized to nothing: every entry was invalid.
+      warnDigestInvalid("", merged.digest);
+    }
+  } else if (merged.digest !== undefined && merged.digest !== null) {
+    // A present non-null value that isn't a list. `null` is treated as absent.
+    if (typeof merged.digest === "object") {
+      const entry = normalizeDigestEntry(merged.digest);
+      if (entry) {
+        digest = [entry];
+      } else {
+        warnDigestInvalid("", merged.digest);
+      }
+    } else {
+      // Present but not an object/list — a likely mistake like
+      // `"digest": "go-test"`, which would otherwise be silently unconfigured.
+      warnDigestInvalid("", merged.digest);
+    }
   }
   return {
     jobsDir,
@@ -1265,7 +1272,7 @@ export default function (pi: ExtensionAPI) {
           } else if (digestEntries?.length) {
             // Configured but nothing selected — otherwise silent. Surface the
             // job's type/name plus the configured types, once per distinct
-            // diagnostic (capped), so a type mismatch or dead regex is visible.
+            // diagnostic (capped), so a type mismatch or dead glob is visible.
             const warning = digestNoMatchWarning(digestTarget, digestEntries);
             if (
               !digestNoMatchWarned.has(warning) &&
