@@ -35,7 +35,7 @@ Restart pi after install so the extension loads.
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Jobs from other sessions are only listed when `adoptForeignJobs` is enabled. |
 | `bgtail` | Read the newest lines of a job's log (default 40), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
 | `bggrep` | Regex search over a job's log: line-numbered matches, optional `context` lines, capped (~50 matches, ~2KB/line, ~8KB) and condensed. Runs inside the extension, so it reaches **any** jobs dir — including global logs that project-sandboxed tools (`ctx_execute_file`) cannot. With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
-| `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched. Pass `all: true` to sweep every shared jobs dir (the current project's plus the machine-global one); that also sweeps stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`). Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
+| `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days). Never removes a running job's log. |
 
 ## Slash commands
 
@@ -153,21 +153,26 @@ Benefits:
   without pulling raw bytes into the context window.
 - Each checkout/worktree gets its own logs — no cross-project clutter in a
   machine-global dir.
-- The dir is auto-added to the repo's `.git/info/exclude` at session start or
-  on the first `bgrun` (local-only — the tracked `.gitignore` is never
-  touched), so logs never pollute `git status`. Works in linked worktrees too
+- The dir is auto-added to the repo's `.git/info/exclude` (local-only — the
+  tracked `.gitignore` is never touched), so logs never pollute `git status`.
+  This happens on the first `bgrun`; at session start it also happens for
+  **trusted** projects only, so merely opening pi in an untrusted repo neither
+  edits `.git/info/exclude` nor creates the dir. Works in linked worktrees too
   (`.git` file → pointed git dir).
 
 **Upgrading from a pre-project-local version:** in a repo the default jobs dir
 is now `<project>/.pi-bgrun/jobs`, not `~/.pi-bgrun/jobs`. Keep the old
 behavior with an absolute `jobsDir`/`PI_BGRUN_DIR`. Old global logs aren't
-moved, but the orphan sweep and `bgclean all` still reach them — both now cover
-your project's dir **and** the machine-global one. Jobs are no longer
-discoverable across projects through a single shared dir.
+moved, but under the project-local default the orphan sweep and `bgclean all`
+still reach them — both cover your project's dir **and** the machine-global
+one. An explicit absolute `jobsDir` is swept alone, exactly as before. Jobs are
+no longer discoverable across projects through a single shared dir.
 
 Rules and migration notes:
 
-- Absolute `jobsDir` values behave exactly as in older versions — set
+- Absolute `jobsDir` values behave exactly as in older versions: used as-is,
+  never treated as project-local, and swept alone (the orphan sweep and
+  `bgclean all` do not also touch `~/.pi-bgrun/jobs`). Set
   `"jobsDir": "~/.pi-bgrun/jobs"` (or any absolute path) to keep using the
   machine-global dir inside a repo.
 - If the cwd has no `.git`/`.pi` at or above it, the default falls back to
@@ -394,12 +399,14 @@ not delete another session's artifacts.**
   than `cleanupDays`. This is what keeps orphans from sessions that
   crashed or will never be resumed from accumulating: a week-old finished log
   is garbage under the same retention its owning session would apply itself.
-  Throttled to once per `cleanupDays` via a `.last-clean` marker so
-  restart-heavy workflows don't re-sweep on every launch. Running jobs are
-  pid-protected, so live sessions are never affected.
+  Under the project-local default it covers the current project's dir plus the
+  machine-global one; an explicit absolute `jobsDir` is swept alone. Throttled
+  to once per `cleanupDays` via a `.last-clean` marker so restart-heavy
+  workflows don't re-sweep on every launch. Running jobs are pid-protected, so
+  live sessions are never affected.
 - **Manual**: `bgclean` cleans this session's old logs; `bgclean` with
-  `all: true` sweeps every session's logs across both the project and
-  machine-global dirs immediately (and refreshes the markers).
+  `all: true` sweeps every session's logs across the shared dirs immediately
+  (and refreshes the markers).
 - Running jobs are never swept while their pid is alive.
 
 ## Status

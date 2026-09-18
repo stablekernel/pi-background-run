@@ -181,14 +181,27 @@ function isProjectRootLike(dir: string): boolean {
 }
 
 // Nearest ancestor of `start` (inclusive) that looks like a project root.
+// The user's home directory is never treated as a project root: pi's global
+// agent dir (~/.pi/agent) would otherwise make every cwd under $HOME resolve
+// to $HOME.
 function findProjectRoot(start: string): string | undefined {
+  const home = homedir();
   let cur = start;
   for (;;) {
-    if (isProjectRootLike(cur)) return cur;
+    if (cur !== home && isProjectRootLike(cur)) return cur;
     const parent = dirname(cur);
-    if (parent === cur) return undefined; // filesystem root — no project above
+    if (parent === cur || cur === home) return undefined;
     cur = parent;
   }
+}
+
+// Expand a leading `~` (bare or `~/...`) to the user's home directory so a
+// config/env path like `~/.pi-bgrun/jobs` is absolute rather than a relative
+// path interpreted project-locally.
+function expandTilde(p: string): string {
+  if (p === "~") return homedir();
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return p;
 }
 
 // Project/worktree root for identity keys — the enclosing project root when
@@ -203,18 +216,19 @@ export function resolveJobsDirPath(
   raw: string | undefined,
   ctx?: { cwd?: string },
 ): { dir: string; projectLocal: boolean } {
+  const p = raw ? expandTilde(raw) : raw;
   // Absolute paths are the user's explicit choice: used as-is, never flagged
   // project-local, and no ancestor walk needed.
-  if (raw && isAbsolute(raw)) return { dir: raw, projectLocal: false };
+  if (p && isAbsolute(p)) return { dir: p, projectLocal: false };
   const cwd = ctx?.cwd ?? process.cwd();
   const root = cwd ? findProjectRoot(cwd) : undefined;
-  if (!raw) {
+  if (!p) {
     return root
       ? { dir: join(root, PROJECT_LOCAL_JOBS_REL), projectLocal: true }
       : { dir: globalJobsDir(), projectLocal: false };
   }
   return root
-    ? { dir: join(root, raw), projectLocal: true }
+    ? { dir: join(root, p), projectLocal: true }
     : { dir: globalJobsDir(), projectLocal: false };
 }
 
@@ -488,8 +502,12 @@ export function resolveConfig(ctx?: {
   let project: BgrunConfigFile = {};
   try {
     if (ctx?.isProjectTrusted?.()) {
+      // Read the project config from the same root resolveJobsDirPath uses, so
+      // a session started in a subdirectory still picks up <root>/.pi config.
+      const cwd = ctx.cwd ?? process.cwd();
+      const projectRoot = findProjectRoot(cwd) ?? cwd;
       project = readConfigFile(
-        join(ctx.cwd ?? process.cwd(), CONFIG_DIR_NAME, "pi-bgrun.json"),
+        join(projectRoot, CONFIG_DIR_NAME, "pi-bgrun.json"),
       );
     }
   } catch {
@@ -655,8 +673,9 @@ function isRunningPid(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    // EPERM means the process exists but we can't signal it — still alive.
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
   }
 }
 
@@ -937,11 +956,15 @@ export default function (pi: ExtensionAPI) {
     return result;
   }
 
-  // Every shared jobs dir the orphan sweep should touch: the machine-global
-  // default (so logs written before project-local became the default, and logs
-  // from checkouts never revisited, still get reclaimed) plus the current
-  // project's dir when it is a different location.
-  function sharedJobsDirs(projectDir: string): string[] {
+  // Every shared jobs dir the orphan sweep / `bgclean all` should touch. The
+  // machine-global dir is included only for the project-local default (so
+  // pre-project-local logs are still reclaimed); an explicit absolute jobsDir
+  // is treated as fully isolated and swept alone.
+  function sharedJobsDirs(
+    projectDir: string,
+    projectLocal: boolean,
+  ): string[] {
+    if (!projectLocal) return [projectDir];
     const global = globalJobsDir();
     return projectDir === global ? [global] : [global, projectDir];
   }
@@ -960,13 +983,21 @@ export default function (pi: ExtensionAPI) {
   //     restart-heavy workflows don't re-sweep on every launch.
   function autoCleanJobs(ctx: ExtensionContext): void {
     const cfg = resolveConfig(ctx);
-    // Make sure a project-local jobs dir is git-ignored even when no bgrun has
-    // run yet this session (the dir is created below for the .last-clean
-    // marker).
-    if (cfg.jobsDirProjectLocal) ensureGitExcluded(cfg.jobsDir);
+    // Trust boundary: session start / shutdown must not write into a repo the
+    // user has not trusted. For an untrusted project we skip both the
+    // .git/info/exclude edit and the project-local dir sweep below (which would
+    // create the dir for its .last-clean marker). The bgrun tool still ensures
+    // exclusion at job-creation time — that is an explicit agent action, not an
+    // incidental side effect of opening a session.
+    const trusted = ctx?.isProjectTrusted?.() === true;
+    if (cfg.jobsDirProjectLocal && trusted) ensureGitExcluded(cfg.jobsDir);
     cleanSessionJobs(cfg.cleanupDays, ctx);
     if (!cfg.globalAutoClean) return;
-    for (const dir of sharedJobsDirs(cfg.jobsDir)) {
+    for (const dir of sharedJobsDirs(
+      cfg.jobsDir,
+      cfg.jobsDirProjectLocal,
+    )) {
+      if (cfg.jobsDirProjectLocal && !trusted && dir === cfg.jobsDir) continue;
       const markerPath = join(dir, ".last-clean");
       try {
         const last = Number(readFileSync(markerPath, "utf8").trim());
@@ -2196,17 +2227,18 @@ export default function (pi: ExtensionAPI) {
   }> {
     const cfg = resolveConfig(ctx);
     const { days = cfg.cleanupDays, all = false } = params;
-    if (typeof days !== "number" || days < 0 || !Number.isFinite(days)) {
-      throw new Error(
-        `bgclean: days must be a non-negative number, got ${days}`,
-      );
+    if (typeof days !== "number" || days <= 0 || !Number.isFinite(days)) {
+      throw new Error(`bgclean: days must be a positive number, got ${days}`);
     }
     let result;
     if (all) {
       result = { removed: 0, kept: 0, skippedRunning: 0 };
       // "all" spans every shared jobs dir — the current project's plus the
       // machine-global default (so pre-project-local logs are still reachable).
-      for (const dir of sharedJobsDirs(cfg.jobsDir)) {
+      for (const dir of sharedJobsDirs(
+        cfg.jobsDir,
+        cfg.jobsDirProjectLocal,
+      )) {
         const r = cleanOldJobs(days, dir, ctx);
         result.removed += r.removed;
         result.kept += r.kept;
@@ -2238,9 +2270,11 @@ export default function (pi: ExtensionAPI) {
     label: "Clean Old Background Jobs",
     description:
       "Remove old background job logs from disk. Default scope: THIS session's jobs only (other sessions' logs are " +
-      "untouched). Pass all: true to sweep every shared jobs dir — the current project's jobs dir plus the " +
-      "machine-global one — including stale per-project digest markers. Retention: cleanupDays config (default 7 " +
-      "days). Never removes a running job's log. Prints a summary of what was removed vs kept.",
+      "untouched); this also drops stale per-project digest markers in the session's jobs dir (they are not session " +
+      "data). Pass all: true to sweep every shared jobs dir — under the project-local default that is the current " +
+      "project's dir plus the machine-global one; an explicit absolute jobsDir is swept alone. Retention: " +
+      "cleanupDays config (default 7 days). Never removes a running job's log. Prints a summary of what was removed " +
+      "vs kept.",
     promptSnippet:
       "Remove old bgrun job logs (this session by default; all: true for every session's)",
     parameters: Type.Object({
@@ -2252,7 +2286,7 @@ export default function (pi: ExtensionAPI) {
       all: Type.Optional(
         Type.Boolean({
           description:
-            "Sweep every shared jobs dir (all sessions' logs), not just this session's (default false)",
+            "Sweep every shared jobs dir (all sessions' logs) — plus the machine-global dir under the project-local default; an absolute jobsDir is swept alone (default false)",
         }),
       ),
     }),
