@@ -5,5 +5,9 @@ node_modules/
 # Build artifacts
 dist/
 
+# Project-local job logs written by running the extension in this repo.
+# (The extension also auto-adds this to .git/info/exclude for other repos.)
+.pi-bgrun/
+
 # Transient agent working files — never committed.
 .pi/wip/
