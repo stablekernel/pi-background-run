@@ -371,7 +371,7 @@ test("bgrun: exit marker survives commands with # and explicit exit codes", asyn
 
 test("bgrun: successful command writes log + exit marker and wakes with ✅", async () => {
   await withJobsDir(async (dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
 
     const res = await bgrun.execute(
@@ -405,7 +405,7 @@ test("bgrun: successful command writes log + exit marker and wakes with ✅", as
 
 test("bgrun: failing command wakes with ❌ and the non-zero exit code", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
 
     await bgrun.execute(
@@ -423,25 +423,28 @@ test("bgrun: failing command wakes with ❌ and the non-zero exit code", async (
 });
 
 test("bgrun: when agent is busy, wake is queued as followUp", async () => {
-  await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
-    const bgrun = tools.get("bgrun")!;
+  await withJobsDir(
+    async (_dir, h) => {
+      const { wakes, tools, ctx } = h;
+      const bgrun = tools.get("bgrun")!;
 
-    await bgrun.execute(
-      "call-busy",
-      { command: "echo while-busy" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    await waitForWakes(wakes, 1);
-    assert.equal(wakes[0].options?.deliverAs, "followUp");
-  }, { idle: false });
+      await bgrun.execute(
+        "call-busy",
+        { command: "echo while-busy" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      await waitForWakes(wakes, 1);
+      assert.equal(wakes[0].options?.deliverAs, "followUp");
+    },
+    { idle: false },
+  );
 });
 
 test("bgtail: returns last N lines, strips the exit marker", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
 
@@ -470,7 +473,7 @@ test("bgtail: returns last N lines, strips the exit marker", async () => {
 
 test("bgtail: condenses output — strips ANSI, collapses repeats, caps long lines", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
 
@@ -518,7 +521,7 @@ test("bgtail: condenses output — strips ANSI, collapses repeats, caps long lin
 
 test("bgtail: raw=true skips condensing", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
 
@@ -552,7 +555,7 @@ test("bgtail: raw=true skips condensing", async () => {
 
 test("bgtail: total cap kicks in on large output with guidance note", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
 
@@ -589,7 +592,7 @@ test("bgtail: total cap kicks in on large output with guidance note", async () =
 
 test("bgstatus: shows running then done with exit code", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgstatus = tools.get("bgstatus")!;
 
@@ -744,7 +747,7 @@ test("bgrun: rejects empty command", async () => {
 
 test("bgrun: appends bgrun-job entries (running then done)", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, entries, tools, ctx } = h;
+    const { wakes, entries, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
 
     await bgrun.execute(
@@ -826,7 +829,7 @@ test("session_start: reconstructs in-memory Map from bgrun-job entries", async (
 
 test("bgrun: name flows into job id, response, entry, wake, and status", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, entries, tools, ctx } = h;
+    const { wakes, entries, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
 
     const res = await bgrun.execute(
@@ -861,7 +864,7 @@ test("bgrun: name flows into job id, response, entry, wake, and status", async (
 
 test("bgrun: name is optional — behavior unchanged without it", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
 
     const res = await bgrun.execute(
@@ -890,7 +893,7 @@ test("bgrun: name is optional — behavior unchanged without it", async () => {
 
 test("bgrun: blank name is ignored, over-long name is truncated", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
 
     // Blank name treated as absent.
@@ -973,7 +976,7 @@ test("bgrun: name survives session_start reconstruction", async () => {
 
 test("bgstatus: list shows name after job id", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgstatus = tools.get("bgstatus")!;
 
@@ -1253,18 +1256,22 @@ test("bgrun: job id encodes the CHILD's pid, not pi's own pid", async () => {
   });
 });
 
-test("bgclean all: a LIVE pid protects the log from a spurious exit marker", async () => {
+test("bgclean all: a live pid protects a log whose exit marker is NOT terminal", async () => {
   // Regression: a running job's own output can contain a line like
-  // "__BGRUN_EXIT__=0" (a test grepping this extension). Pid liveness must
-  // win, or the sweep deletes a live job's log. The exit marker is only
-  // trusted for jobs our record already knows finished.
+  // "__BGRUN_EXIT__=0" (a test grepping this extension). A non-terminal marker
+  // is not completion evidence, so pid liveness must win, or the sweep deletes
+  // a live job's log.
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
   markJobsDir(dir);
   try {
-    // Old "finished-looking" foreign log whose id-pid is THIS process (alive).
+    // Foreign log whose id-pid is THIS process (alive). The marker is followed
+    // by more output, so it is NOT the terminal line.
     const livePath = join(dir, `live-job-1000000000-${process.pid}.log`);
-    writeFileSync(livePath, "still running\n__BGRUN_EXIT__=0\n");
+    writeFileSync(
+      livePath,
+      "still running\n__BGRUN_EXIT__=0\nmore output follows\n",
+    );
     const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const fs = await import("node:fs");
     fs.utimesSync(livePath, oldTime, oldTime);
@@ -1965,7 +1972,7 @@ test("bgclean all: sweeps stale per-project digest markers, keeps fresh ones", a
     fs.writeFileSync(logPath, "out\n__BGRUN_EXIT__=0\n");
     fs.utimesSync(logPath, old, old);
 
-    const {tools, ctx } = h;
+    const { tools, ctx } = h;
     const bgclean = tools.get("bgclean")!;
     await bgclean.execute(
       "call-mk",
@@ -2983,7 +2990,7 @@ test("bgtail: prefers the session record's logPath when the jobsDir config chang
 
 test("bggrep: line-numbered matches; explicit pattern wins; default pattern; no-match case", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bggrep = tools.get("bggrep")!;
 
@@ -3047,7 +3054,7 @@ test("bggrep: line-numbered matches; explicit pattern wins; default pattern; no-
 
 test("bggrep: context lines with gap markers between distant matches", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bggrep = tools.get("bggrep")!;
 
@@ -3085,7 +3092,7 @@ test("bggrep: context lines with gap markers between distant matches", async () 
 
 test("bggrep: invalid pattern errors clearly", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bggrep = tools.get("bggrep")!;
     const res = await bgrun.execute(
@@ -3113,7 +3120,7 @@ test("bggrep: invalid pattern errors clearly", async () => {
 
 test("bggrep: caps at 50 matches with a not-shown note", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bggrep = tools.get("bggrep")!;
     const res = await bgrun.execute(
@@ -3191,7 +3198,7 @@ test("bggrep: prefers the session record's logPath when the jobsDir config chang
 
 test("bgtail: delta tailing — first read full tail, then only new lines, then none", async () => {
   await withJobsDir(async (dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
     const res = await bgrun.execute(
@@ -3235,7 +3242,7 @@ test("bgtail: delta tailing — first read full tail, then only new lines, then 
 
 test("bgtail: raw:true keeps the verbatim window but still advances the bookmark", async () => {
   await withJobsDir(async (dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
     const res = await bgrun.execute(
@@ -3269,7 +3276,7 @@ test("bgtail: raw:true keeps the verbatim window but still advances the bookmark
 
 test("bgtail: a shrunken log resets to a full tail with a note", async () => {
   await withJobsDir(async (dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
     const res = await bgrun.execute(
@@ -3296,7 +3303,7 @@ test("bgtail: a shrunken log resets to a full tail with a note", async () => {
 
 test("bgtail: a replaced log with the same line count resets to a full tail", async () => {
   await withJobsDir(async (dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
     const res = await bgrun.execute(
@@ -3329,7 +3336,7 @@ test("bgtail: a replaced log with the same line count resets to a full tail", as
 
 test("bggrep and bgtail normalize CRLF logs", async () => {
   await withJobsDir(async (dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
     const bggrep = tools.get("bggrep")!;
@@ -3365,7 +3372,7 @@ test("bggrep and bgtail normalize CRLF logs", async () => {
 
 test("bggrep: empty log reports zero lines, and a missing log is notFound", async () => {
   await withJobsDir(async (dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bggrep = tools.get("bggrep")!;
     const res = await bgrun.execute(
@@ -3406,7 +3413,7 @@ test("bggrep: empty log reports zero lines, and a missing log is notFound", asyn
 
 test("bggrep: context windows combine with the 50-match cap", async () => {
   await withJobsDir(async (dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bggrep = tools.get("bggrep")!;
     const res = await bgrun.execute(
@@ -3445,7 +3452,7 @@ test("bggrep: context windows combine with the 50-match cap", async () => {
 
 test("bgtail and bggrep clamp nonsensical numeric params", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const bgtail = tools.get("bgtail")!;
     const bggrep = tools.get("bggrep")!;
@@ -3499,7 +3506,7 @@ test("formatDuration: one decimal in seconds under a minute, m:ss above", async 
 
 test("wake message: Stats line (duration + line count) sits between Command: and Last output: on a green run", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
 
     await bgrun.execute(
@@ -3651,7 +3658,7 @@ test("bgstatus: read-only — checking status does not append transcript entries
 
 test("wake message: Stats line also present on a red (non-zero exit) run", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
 
     await bgrun.execute(
@@ -3669,7 +3676,7 @@ test("wake message: Stats line also present on a red (non-zero exit) run", async
 
 test("wake message: missing log file — Stats shows duration only, wake still sent", async () => {
   await withJobsDir(async (dir, h) => {
-    const {wakes, tools, ctx } = h;
+    const { wakes, tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
 
     // Unlink the log while the job runs; at exit the file is gone.
@@ -5291,7 +5298,7 @@ test("session_shutdown: sweeps this session's old logs and does not throw", asyn
 
 test("bgrun: no type → no type line in the started result", async () => {
   await withJobsDir(async (_dir, h) => {
-    const {tools, ctx } = h;
+    const { tools, ctx } = h;
     const bgrun = tools.get("bgrun")!;
     const res = await bgrun.execute(
       "call-ty3",
@@ -5578,11 +5585,7 @@ test("resolveConfig: project config is honored only when the project is trusted"
         userConfigPath: userCfg,
       });
       assert.equal(trusted.cleanupDays, 42, "trusted: file retention applied");
-      assert.equal(
-        trusted.adoptForeignJobs,
-        true,
-        "trusted: adoptForeignJobs",
-      );
+      assert.equal(trusted.adoptForeignJobs, true, "trusted: adoptForeignJobs");
       assert.equal(trusted.globalAutoClean, false, "trusted: globalAutoClean");
       assert.equal(
         trusted.showCompletedJobs,
@@ -5985,6 +5988,41 @@ test("session_start: a reconstructed done job is not re-persisted on every resum
       countDone(second.entries),
       1,
       "second resume must still leave exactly one done entry",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("bgclean all: a TERMINAL exit marker reclaims a finished log despite a reused live pid", async () => {
+  // A finished job writes the marker as the LAST line. If its pid is later
+  // reused by an unrelated live process, pid liveness alone would keep the log
+  // forever — the terminal marker must win.
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
+  try {
+    const donePath = join(dir, `done-job-1000000000-${process.pid}.log`);
+    writeFileSync(donePath, "finished ok\n__BGRUN_EXIT__=0\n");
+    const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const fs = await import("node:fs");
+    fs.utimesSync(donePath, oldTime, oldTime);
+
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    await tools
+      .get("bgclean")!
+      .execute(
+        "call-reused-pid",
+        { days: 7, all: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+
+    assert.ok(
+      !existsSync(donePath),
+      "terminal-marker log reclaimed even though its pid is alive (reused)",
     );
   } finally {
     delete process.env.PI_BGRUN_DIR;

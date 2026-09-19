@@ -247,11 +247,20 @@ function readLogSlice(
   }
 }
 
+// The wrapper writes __BGRUN_EXIT__=N as the FINAL line of the log. A marker
+// that is NOT the last non-empty line is just job output that happened to
+// contain the string (e.g. a command that greps a bgrun log) and is NOT
+// evidence of completion. Position matters both ways: trusting any marker would
+// let cleanup delete a running job's log; trusting none would let a finished
+// log whose pid was later reused live forever.
 function parseExitFromContent(content: string): number | null {
-  const lines = content.split("\n").filter((l) => l.startsWith(EXIT_MARKER));
-  if (lines.length === 0) return null;
-  const match = lines[lines.length - 1].match(/^__BGRUN_EXIT__=(-?\d+)/);
-  return match ? parseInt(match[1], 10) : null;
+  const lines = content.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim().length === 0) continue;
+    const match = lines[i].match(/^__BGRUN_EXIT__=(-?\d+)/);
+    return match ? parseInt(match[1], 10) : null;
+  }
+  return null;
 }
 
 export function parseExitFromLogPath(logPath: string): number | null {
@@ -620,7 +629,9 @@ export function resolveJobsDirPath(
   // exclusion and the untrusted-repo guard apply to the right thing.
   const joined = join(root, p);
   const rel = relative(root, joined);
-  const inside = !rel.startsWith("..") && !isAbsolute(rel);
+  // `..foo` is a sibling, not an escape — only `..` itself or `../` escapes.
+  const inside =
+    rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel);
   return { dir: joined, projectLocal: inside };
 }
 
@@ -680,7 +691,8 @@ function appendExcludePattern(
   // Defense-in-depth: the walk-up guarantees jobsDir sits under repoRoot, but
   // a future caller or symlinked path could break that — ../-prefixed
   // patterns are silently useless in gitignore semantics, so skip them.
-  if (rel.startsWith("..") || isAbsolute(rel)) return true;
+  if (rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel))
+    return true;
   const pattern = rel.split(sep).join("/") + "/";
   const excludePath = join(gitDir, "info", "exclude");
   let existing = "";
@@ -1258,15 +1270,20 @@ export default function (pi: ExtensionAPI) {
         result.kept++;
         continue;
       }
-      const rec = jobs.get(entry.id);
-      // A live pid protects the log: our own output can contain a spurious
-      // __BGRUN_EXIT__ line. Only override when we KNOW the job finished (a
-      // reused pid on a finished job is the one case where alive lies).
-      if (entry.alive && rec?.exitCode === undefined) {
-        result.skippedRunning++;
-        continue;
+      // A TERMINAL marker means the wrapper finished writing — trust it even
+      // when the pid looks alive (that is a reused pid; otherwise the log would
+      // never be reclaimed). A non-terminal marker is not completion evidence,
+      // so fall through to pid liveness, which protects a job that merely
+      // printed the string.
+      const finished = parseExitFromLogPath(entry.logPath) !== null;
+      if (!finished) {
+        const rec = jobs.get(entry.id);
+        if (entry.alive && rec?.exitCode === undefined) {
+          result.skippedRunning++;
+          continue;
+        }
       }
-      // pid dead (job exited/crashed) or our record says done → safe to remove.
+      // finished, dead pid, or our record says done → safe to remove.
       try {
         unlinkSync(entry.logPath);
         result.removed++;
@@ -1397,7 +1414,12 @@ export default function (pi: ExtensionAPI) {
       // The known machine-global dir is ours even without a .bgrun-jobs marker
       // (the project-local default never writes one there), so bypass the
       // ownership gate for it only; the project-local dir stays gated.
-      const isGlobal = safeRealpath(dir) === safeRealpath(globalJobsDir());
+      // The DEFAULT machine-global dir is ours even without a .bgrun-jobs
+      // marker (the project-local default never writes one there). A custom
+      // PI_BGRUN_GLOBAL_DIR is gated like any other dir, per the README.
+      const isGlobal =
+        !process.env.PI_BGRUN_GLOBAL_DIR &&
+        safeRealpath(dir) === safeRealpath(globalJobsDir());
       cleanOldJobs(cfg.cleanupDays, dir, ctx, { requireOwnership: !isGlobal });
       try {
         mkdirSync(dir, { recursive: true });
@@ -2428,7 +2450,7 @@ export default function (pi: ExtensionAPI) {
     // themselves from the context windows (lo > hi no-ops the inner loop).
     const context = Math.max(0, Math.floor(contextParam));
     if (!id) throw new Error("bggrep: id is required");
-    validateJobId(id, "bggrep");
+    // resolveLogForJob() below validates the id; no need to double-check.
     const source = pattern ?? DEFAULT_GREP_PATTERN;
     try {
       // Validate up front so a bad pattern fails immediately, without a worker.
