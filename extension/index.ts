@@ -270,7 +270,10 @@ function readLastLineFromContent(content: string, maxLen = 200): string | null {
   const lines = content.split("\n").filter((l) => l.trim().length > 0);
   if (lines.length === 0) return null;
   const real = lines.filter((l) => !l.startsWith(EXIT_MARKER));
-  const last = real[real.length - 1] ?? lines[lines.length - 1];
+  // No content lines (a marker-only log) → nothing to show. Never fall back to
+  // the exit-marker line — that leaks "__BGRUN_EXIT__=N" into the wake.
+  if (real.length === 0) return null;
+  const last = real[real.length - 1];
   return last.length > maxLen ? last.slice(0, maxLen) + "…" : last;
 }
 
@@ -611,9 +614,14 @@ export function resolveJobsDirPath(
       ? { dir: join(root, PROJECT_LOCAL_JOBS_REL), projectLocal: true }
       : { dir: globalJobsDir(), projectLocal: false };
   }
-  return root
-    ? { dir: join(root, p), projectLocal: true }
-    : { dir: globalJobsDir(), projectLocal: false };
+  if (!root) return { dir: globalJobsDir(), projectLocal: false };
+  // A relative path can escape the project root ("../outside"); only flag it
+  // project-local when the joined dir actually stays inside the root, so git
+  // exclusion and the untrusted-repo guard apply to the right thing.
+  const joined = join(root, p);
+  const rel = relative(root, joined);
+  const inside = !rel.startsWith("..") && !isAbsolute(rel);
+  return { dir: joined, projectLocal: inside };
 }
 
 // Auto-ignore a project-local jobs dir in git so logs never pollute
@@ -727,11 +735,19 @@ function projectHash(projectDir: string): string {
  * project-scoped even when the jobs dir is shared (an absolute/global
  * `jobsDir`); project-local dirs get the same per-project key harmlessly.
  */
+function projectMarkerPath(
+  jobsDir: string,
+  projectDir: string,
+  prefix: string,
+): string {
+  return join(jobsDir, `${prefix}${projectHash(projectDir)}`);
+}
+
 export function jobUsageMarkerPath(
   jobsDir: string,
   projectDir: string,
 ): string {
-  return join(jobsDir, `.bgrun-used-${projectHash(projectDir)}`);
+  return projectMarkerPath(jobsDir, projectDir, ".bgrun-used-");
 }
 
 /**
@@ -746,7 +762,7 @@ export function digestNudgeMarkerPath(
   jobsDir: string,
   projectDir: string,
 ): string {
-  return join(jobsDir, `.digest-nudge-${projectHash(projectDir)}`);
+  return projectMarkerPath(jobsDir, projectDir, ".digest-nudge-");
 }
 
 /**
@@ -894,7 +910,7 @@ export function resolveConfig(ctx?: {
       // Read the project config from the same root resolveJobsDirPath uses, so
       // a session started in a subdirectory still picks up <root>/.pi config.
       const cwd = ctx.cwd ?? process.cwd();
-      const projectRoot = findProjectRoot(cwd) ?? cwd;
+      const projectRoot = projectRootFor(cwd);
       project = readConfigFile(
         join(projectRoot, CONFIG_DIR_NAME, "pi-bgrun.json"),
       );
@@ -1135,6 +1151,10 @@ export default function (pi: ExtensionAPI) {
       // command output. Drop the marker line, plus the blank separator when the
       // output already ended in a newline.
       const markerAt = tailText.lastIndexOf("\n" + EXIT_MARKER);
+      if (markerAt === 0) {
+        // The file is only the wrapper's "\n<marker>\n" — no command output.
+        return 0;
+      }
       if (markerAt !== -1) {
         let extra = 0;
         for (let i = markerAt + 1; i < tailText.length; i++) {
@@ -1233,28 +1253,20 @@ export default function (pi: ExtensionAPI) {
     // Past the gate: sweep our own stale per-project marker files.
     sweepStaleMarkers(jobsDir, cutoff);
     for (const entry of scanLogFiles(jobsDir)) {
-      // mtime check FIRST — exit parsing costs a tail read, so only files old
-      // enough to be swept pay for it.
+      // mtime check FIRST — young files are never candidates, so skip early.
       if (entry.mtimeMs > cutoff) {
         result.kept++;
         continue;
       }
-      // Exit marker is the authoritative finished signal — check it BEFORE pid
-      // liveness, so completed jobs are never mistaken for running (pid reuse
-      // and shared pids made the old order keep stale jobs forever).
-      const exit = parseExitFromLogPath(entry.logPath);
-      if (exit === null) {
-        // No marker yet — running only if the pid is alive.
-        const rec = jobs.get(entry.id);
-        if (rec && rec.exitCode === undefined) {
-          result.skippedRunning++;
-          continue;
-        }
-        if (entry.alive) {
-          result.skippedRunning++;
-          continue;
-        }
+      const rec = jobs.get(entry.id);
+      // A live pid protects the log: our own output can contain a spurious
+      // __BGRUN_EXIT__ line. Only override when we KNOW the job finished (a
+      // reused pid on a finished job is the one case where alive lies).
+      if (entry.alive && rec?.exitCode === undefined) {
+        result.skippedRunning++;
+        continue;
       }
+      // pid dead (job exited/crashed) or our record says done → safe to remove.
       try {
         unlinkSync(entry.logPath);
         result.removed++;
@@ -1382,7 +1394,11 @@ export default function (pi: ExtensionAPI) {
       } catch {
         // no marker yet — run the sweep
       }
-      cleanOldJobs(cfg.cleanupDays, dir, ctx);
+      // The known machine-global dir is ours even without a .bgrun-jobs marker
+      // (the project-local default never writes one there), so bypass the
+      // ownership gate for it only; the project-local dir stays gated.
+      const isGlobal = safeRealpath(dir) === safeRealpath(globalJobsDir());
+      cleanOldJobs(cfg.cleanupDays, dir, ctx, { requireOwnership: !isGlobal });
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(markerPath, String(Date.now()));
@@ -1569,6 +1585,9 @@ export default function (pi: ExtensionAPI) {
           logPath: d.logPath,
           exitedAt: d.exitedAt,
           exitCode: isDone ? (d.exitCode ?? -1) : undefined,
+          // Mark the done entry as already persisted, or revalidateStaleJobs
+          // appends a duplicate done card on every resume.
+          donePersisted: isDone,
           ctx,
         });
       }
@@ -1823,6 +1842,9 @@ export default function (pi: ExtensionAPI) {
         child.on("exit", async (code, signal) => {
           const rec = jobs.get(id);
           if (!rec) return;
+          // A spawn that emitted 'error' first already finalized this job; a
+          // follow-up 'exit' must not append a second done entry or wake.
+          if (rec.exitCode !== undefined) return;
           rec.exitedAt = Date.now();
           rec.exitCode = code ?? -1;
           // Set BEFORE the digest await: without it a read-only bgstatus in
@@ -2213,6 +2235,32 @@ export default function (pi: ExtensionAPI) {
     { lines: number; bytes: number; first: string }
   >();
 
+  // Resolve a job's log path and read its bounded slice, single-sourcing the
+  // "in-memory record first, then the configured jobs dir" rule shared by
+  // bgtail and bggrep. The record's logPath stays correct even if the config
+  // (and thus the resolved jobs dir) changes mid-session. On failure the caller
+  // renders tool-specific error details.
+  function resolveLogForJob(
+    id: string,
+    tool: string,
+    ctx?: ExtensionContext,
+  ):
+    | { logPath: string; content: string; size: number }
+    | { logPath: string; errorText: string; notFound: boolean } {
+    validateJobId(id, tool);
+    const logPath =
+      jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
+    const slice = readLogSlice(logPath, LOG_READ_BYTES);
+    if (!slice) {
+      return {
+        logPath,
+        errorText: logReadError(id, logPath),
+        notFound: !existsSync(logPath),
+      };
+    }
+    return { logPath, content: slice.content, size: slice.size };
+  }
+
   // Shared by the bgtail tool (agent-facing) and the /bgtail slash command
   // (human-facing).
   async function bgtailCore(
@@ -2228,21 +2276,19 @@ export default function (pi: ExtensionAPI) {
     // tool schema, and lines < 1 would corrupt slicing (slice(-0) = whole log).
     const lines = Math.max(1, Math.floor(linesParam));
     if (!id) throw new Error("bgtail: id is required");
-    validateJobId(id, "bgtail");
-    // Prefer this session's record: its logPath stays correct even if the
-    // config (and thus the resolved jobs dir) changes mid-session — e.g. a
-    // user switching to project-local logs right after upgrading.
-    const logPath =
-      jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
-    const slice = readLogSlice(logPath, LOG_READ_BYTES);
-    if (!slice) {
+    const resolved = resolveLogForJob(id, "bgtail", ctx);
+    if ("errorText" in resolved) {
       return {
-        content: [{ type: "text", text: logReadError(id, logPath) }],
-        details: { id, logPath, notFound: !existsSync(logPath) },
+        content: [{ type: "text", text: resolved.errorText }],
+        details: {
+          id,
+          logPath: resolved.logPath,
+          notFound: resolved.notFound,
+        },
         isError: true,
       };
     }
-    const content = slice.content;
+    const { logPath, content, size } = resolved;
     // Content lines only: the exit marker and blanks are filtered BEFORE the
     // window is sliced, so "last N lines" means the last N content lines
     // (matching pre-delta behavior) and bookmarks count content lines.
@@ -2260,7 +2306,7 @@ export default function (pi: ExtensionAPI) {
     const replaced =
       prev !== undefined && prev.lines > 0 && prev.first !== first;
     const shrank =
-      prev !== undefined && (prev.lines > total || prev.bytes > slice.size);
+      prev !== undefined && (prev.lines > total || prev.bytes > size);
     let window: string[];
     let header: string | undefined;
     let newLines: number | undefined;
@@ -2278,7 +2324,7 @@ export default function (pi: ExtensionAPI) {
       if (fresh.length === 0) {
         tailBookmarks.set(id, {
           lines: total,
-          bytes: slice.size,
+          bytes: size,
           first,
         });
         return {
@@ -2306,7 +2352,7 @@ export default function (pi: ExtensionAPI) {
     }
     tailBookmarks.set(id, {
       lines: total,
-      bytes: slice.size,
+      bytes: size,
       first,
     });
     const shown = window;
@@ -2383,9 +2429,6 @@ export default function (pi: ExtensionAPI) {
     const context = Math.max(0, Math.floor(contextParam));
     if (!id) throw new Error("bggrep: id is required");
     validateJobId(id, "bggrep");
-    // Record-first, same as bgtail — correct across config changes.
-    const logPath =
-      jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
     const source = pattern ?? DEFAULT_GREP_PATTERN;
     try {
       // Validate up front so a bad pattern fails immediately, without a worker.
@@ -2395,15 +2438,21 @@ export default function (pi: ExtensionAPI) {
         `bggrep: invalid pattern ${JSON.stringify(source)}: ${(err as Error).message}`,
       );
     }
-    const slice = readLogSlice(logPath, LOG_READ_BYTES);
-    if (!slice) {
+    // Record-first, same as bgtail — correct across config changes.
+    const resolved = resolveLogForJob(id, "bggrep", ctx);
+    if ("errorText" in resolved) {
       return {
-        content: [{ type: "text", text: logReadError(id, logPath) }],
-        details: { id, matches: 0, logPath, notFound: !existsSync(logPath) },
+        content: [{ type: "text", text: resolved.errorText }],
+        details: {
+          id,
+          matches: 0,
+          logPath: resolved.logPath,
+          notFound: resolved.notFound,
+        },
         isError: true,
       };
     }
-    const content = slice.content;
+    const { logPath, content } = resolved;
     // /\r?\n/ normalizes CRLF (a trailing \r would break $-anchored patterns
     // and leak into output); blank lines are KEPT so L<n> numbers match the
     // file. A trailing empty split element is dropped; "" yields zero lines.

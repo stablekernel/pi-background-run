@@ -1302,54 +1302,40 @@ test("bgrun: job id encodes the CHILD's pid, not pi's own pid", async () => {
   }
 });
 
-test("bgclean all: removes a FINISHED job's old log even when its id-pid is alive", async () => {
-  // Regression: exit marker must win over pid liveness. Old code checked
-  // pid first, so any log whose id-pid happened to be a live process (e.g.
-  // pi's own pid from the old id bug, or pid reuse) was kept forever.
+test("bgclean all: a LIVE pid protects the log from a spurious exit marker", async () => {
+  // Regression: a running job's own output can contain a line like
+  // "__BGRUN_EXIT__=0" (a test grepping this extension). Pid liveness must
+  // win, or the sweep deletes a live job's log. The exit marker is only
+  // trusted for jobs our record already knows finished.
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
   markJobsDir(dir);
   try {
-    // Old finished foreign log whose id-pid is THIS process (alive!) — must
-    // still be removed by an explicit global sweep.
-    const oldPath = join(dir, `stale-job-1000000000-${process.pid}.log`);
-    writeFileSync(oldPath, "stale\n__BGRUN_EXIT__=2\n");
+    // Old "finished-looking" foreign log whose id-pid is THIS process (alive).
+    const livePath = join(dir, `live-job-1000000000-${process.pid}.log`);
+    writeFileSync(livePath, "still running\n__BGRUN_EXIT__=0\n");
     const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const fs = await import("node:fs");
-    fs.utimesSync(oldPath, oldTime, oldTime);
+    fs.utimesSync(livePath, oldTime, oldTime);
 
     const { pi, tools, ctx } = makeFakePi();
     await loadExtension(pi);
     const bgclean = tools.get("bgclean")!;
 
-    // Default scope: this session only — the foreign log is untouched.
-    const scoped = await bgclean.execute(
-      "call-stale-scoped",
-      { days: 7 },
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.match(scoped.content[0].text as string, /removed 0/);
-    assert.ok(
-      existsSync(oldPath),
-      "foreign log untouched by session-scoped bgclean",
-    );
-
     const result = await bgclean.execute(
-      "call-stale",
+      "call-live-marker",
       { days: 7, all: true },
       undefined,
       undefined,
       ctx,
     );
-    assert.match(
-      result.content[0].text as string,
-      /removed 1 job log\(s\) \(all sessions\)/,
+    assert.ok(
+      existsSync(livePath),
+      "live-pid log kept despite a spurious exit marker",
     );
     assert.ok(
-      !existsSync(oldPath),
-      "finished job's log removed despite live id-pid",
+      result.details.skippedRunning >= 1,
+      "live log counted as skipped-running",
     );
   } finally {
     delete process.env.PI_BGRUN_DIR;
@@ -6132,6 +6118,67 @@ test("bggrep: a pathological regex returns within the budget instead of hanging"
     assert.ok(
       res.isError === true || typeof res.content[0].text === "string",
       "returns a result (no hang, no throw)",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session_start: a reconstructed done job is not re-persisted on every resume", async () => {
+  // Regression: reconstructed done records were re-appended on each resume
+  // (exitCode set but donePersisted unset), so the transcript grew a duplicate
+  // done card per restart.
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const id = `resume-done-${Date.now()}-99999999`;
+    const logPath = join(dir, `${id}.log`);
+    writeFileSync(logPath, "out\n__BGRUN_EXIT__=0\n");
+    const baseEntries: CapturedEntry[] = [
+      {
+        type: "custom",
+        customType: "bgrun-job",
+        data: {
+          id,
+          pid: 99999999,
+          cmd: "echo done",
+          started: Date.now() - 1000,
+          logPath,
+          state: "done",
+          exitCode: 0,
+          exitedAt: Date.now() - 500,
+        },
+      },
+    ];
+    const countDone = (entries: CapturedEntry[]) =>
+      entries.filter(
+        (e) =>
+          e.customType === "bgrun-job" &&
+          e.data?.id === id &&
+          e.data?.state === "done",
+      ).length;
+
+    // Resume 1.
+    const first = makeFakePi({ priorEntries: baseEntries });
+    await loadExtension(first.pi);
+    first.ctx.hasUI = true; // drive updateWidget → revalidateStaleJobs
+    await first.fireSessionStart();
+    assert.equal(
+      countDone(first.entries),
+      1,
+      "first resume must not append a duplicate done entry",
+    );
+
+    // Resume 2: fresh extension instance over the transcript resume 1 left.
+    const second = makeFakePi({ priorEntries: first.entries });
+    await loadExtension(second.pi);
+    second.ctx.hasUI = true;
+    await second.fireSessionStart();
+    assert.equal(
+      countDone(second.entries),
+      1,
+      "second resume must still leave exactly one done entry",
     );
   } finally {
     delete process.env.PI_BGRUN_DIR;
