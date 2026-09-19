@@ -3,6 +3,9 @@
   "version": "0.5.0",
   "description": "Run long shell commands detached in the background for pi; get woken on completion. Output lands in a file; context stays clean.",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "license": "MIT",
   "publishConfig": {
     "access": "public"
@@ -25,6 +28,7 @@
   },
   "files": [
     "extension/",
+    "!extension/index.test.ts",
     "skill/",
     "README.md",
     "LICENSE"
@@ -57,6 +61,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
+    "@types/node": "^24.0.0",
     "typebox": "^1.3.0",
     "typescript": "^5.7.0"
   }

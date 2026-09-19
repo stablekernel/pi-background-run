@@ -50,7 +50,7 @@ no polling.
    - `done exit=<non-zero>` → failure; analyze the log.
    - `running` but the job should have finished long ago → likely crashed (the
      process died without writing the exit marker). Analyze the log with
-     `ctx_execute_file`.
+     `bggrep` (any jobs dir) or `ctx_execute_file` (project-local logs only).
 
 ### Reading results without flooding context
 
@@ -63,7 +63,10 @@ positional-peek tool for everything else.
 
 - **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing) — polling a running job is nearly free.
 - **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Reaches the configured jobs dir (including a global one) that project-sandboxed `ctx_execute_file` cannot (it runs inside the extension). Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
-- **Whole-log failure analysis:** `ctx_execute_file` on the log path:
+- **Whole-log failure analysis:** `ctx_execute_file` on the log path — **project-local
+  `jobsDir` only** (e.g. `.pi-bgrun/jobs` in `pi-bgrun.json`). The default global
+  dir (`~/.pi-bgrun/jobs`) is outside the project sandbox; use `bggrep` there instead.
+  Copy the `log:` path from `bgrun`'s `started:` line (do not use `~` — it may not expand).
 
   ```javascript
   ctx_execute_file(
@@ -73,7 +76,7 @@ positional-peek tool for everything else.
            const fails=L.filter(l=>/(--- FAIL|FAIL|panic:|Error:)/.test(l)); \
            console.log(`lines: ${L.length}, failures: ${fails.length}`); \
            console.log(fails.slice(0,40).join('\\n'));"
-  )
+  })
   ```
 
   A 10 000-line `make test` log collapses to a ~30-line summary in context.
@@ -83,7 +86,9 @@ positional-peek tool for everything else.
 - `bash grep` output is uncapped — a retry-storm log can dump thousands of
   matching lines (megabytes) straight into context, and staying safe depends
   on remembering `| head` on every single call. `bggrep` is bounded by design
-  (~50 matches, ~2KB/line, ~8KB).
+  (last 2 MB of the log, per-line 10 000-char pre-truncation, ~50 matches,
+  ~8KB, plus a wall-clock match budget so a runaway regex errors instead of
+  hanging).
 - It takes the job id — no log-path reconstruction, no shell-quoting of the
   regex — and reaches the configured jobs dir (including a global one) that
   project-sandboxed `ctx_execute_file` cannot.
@@ -93,7 +98,7 @@ positional-peek tool for everything else.
 Plain `grep` via bash is fine only for a one-off search you know is tiny.
 
 **Never `cat`, `Read`, `bash cat`, or `bash grep` a full bgrun log.** Always
-`bgtail`, `bggrep`, or `ctx_execute_file`.
+`bgtail`, `bggrep`, or (for project-local logs) `ctx_execute_file`.
 
 ## After a pi restart or session switch
 
@@ -102,10 +107,10 @@ Plain `grep` via bash is fine only for a one-off search you know is tiny.
 - After a restart/switch, run `bgstatus(<job-id>)` — the id still resolves via the
   log's `__BGRUN_EXIT__=N` marker. To browse everything on disk, use
   `bgstatus(includeDone: true)`.
-- Each session only tracks its own jobs by default. Other sessions' *running*
-  jobs appear only when `adoptForeignJobs` is enabled in
+- Each session only tracks its own jobs by default. Running jobs from other
+  sessions appear only when `adoptForeignJobs` is enabled in
   `~/.pi/agent/pi-bgrun.json` (or `PI_BGRUN_FOREIGN_JOBS=1`); finished foreign
-  logs from the shared dir can also appear when finished jobs are included.
+  logs appear with `bgstatus(includeDone: true)` regardless.
 
 ## Rules
 
@@ -124,5 +129,4 @@ Plain `grep` via bash is fine only for a one-off search you know is tiny.
   pass covers the current project's jobs dir AND the machine-global
   `~/.pi-bgrun/jobs`; an explicit absolute `jobsDir` is swept alone. Retention
   is `cleanupDays` (default 7, configurable).
-- To stop a running job, use `bash` with `kill <pid>` (the pid is in the `bgstatus`
-  output). There is no `bgkill` tool.
+- To stop a running job, use `bash` with `kill -- -<pid>` (process group — required because the child is spawned detached). The pid is the last `--`-separated segment of the job id; it is not shown as a separate field in `bgstatus` output. There is no `bgkill` tool.
