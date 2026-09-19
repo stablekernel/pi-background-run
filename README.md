@@ -8,10 +8,14 @@ pi-background-run **wakes the live agent session** so it proactively reads a
 condensed digest of the results and continues — no polling, no human intervention.
 
 Built as a [pi](https://github.com/earendil-works/pi-coding-agent) extension. No
-shell runner, no poller, no sidecar files — the extension spawns the job in-process,
+shell runner and no external daemon — the extension spawns the job in-process,
 detects completion via the child `exit` event, and calls `pi.sendUserMessage` to wake
 the agent. The log file is self-describing (full output + a trailing
-`__BGRUN_EXIT__=N` marker), so exit codes survive pi restarting.
+`__BGRUN_EXIT__=N` marker), so exit codes survive pi restarting. Two small pieces
+exist beyond the spawn: a 30s timer that only re-checks jobs whose live child handle
+is gone (reconstructed from a restart, or adopted from another session), and a
+`.last-clean` marker that throttles the **global** orphan sweep (the
+session-scoped sweep is unthrottled).
 
 ## Install
 
@@ -19,11 +23,9 @@ the agent. The log file is self-describing (full output + a trailing
 pi install npm:pi-background-run
 ```
 
-Or the scoped alias (same code, permanent namespace claim):
-
-```bash
-pi install npm:@stablekernel/pi-background-run
-```
+The scoped alias `@stablekernel/pi-background-run` is the same package (permanent
+namespace claim, published in lockstep). Prefer the unscoped name; the alias is
+not deprecated, so both stay installable and receive every release.
 
 Restart pi after install so the extension loads.
 
@@ -33,8 +35,8 @@ Restart pi after install so the extension loads.
 | ------ | --------- |
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
-| `bgtail` | Read the newest lines of a job's log (default 40), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
-| `bggrep` | Regex search over a job's log: line-numbered matches, optional `context` lines, capped (~50 matches, ~2KB/line, ~8KB) and condensed. Runs inside the extension, so it reaches the configured jobs dir (including a global one) that project-sandboxed tools (`ctx_execute_file`) cannot. With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
+| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB**), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
+| `bggrep` | Regex search over the **last 2 MB** of a job's log: line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Runs inside the extension, so it reaches the configured jobs dir (including a global one) that project-sandboxed tools (`ctx_execute_file`) cannot. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days); `days` must be a positive number (`days: 0` is rejected rather than purging everything). Never removes a running job's log. |
 
 ## Slash commands
@@ -55,7 +57,7 @@ wake messages) is the agent's workflow.
 
 ## Roadmap / not provided
 
-- `bgkill` — not implemented; use `bash` with `kill` (job ids end in the child pid) if you ever need to stop a running job.
+- `bgkill` — not implemented; to stop a running job, use `kill -- -<pid>` (kill the process group — the child is spawned detached). The pid is the last `--`-separated segment of the job id (e.g. `unit-tests-1726680000-12345` → pid `12345`); it is not shown as a separate field in `bgstatus` output.
 - `bgwait` — not implemented; the wake mechanism makes blocking on a job unnecessary in the normal flow.
 
 ## How it works
@@ -63,7 +65,7 @@ wake messages) is the agent's workflow.
 ```text
 agent calls bgrun(command: "make test-short", name: "unit-tests")
   → extension resolves log path: <jobsDir>/<slug>-<ts>-<pid>.log (default <project>/.pi-bgrun/jobs/ in a repo, else ~/.pi-bgrun/jobs/)
-  → spawn('sh', ['-c', '<cmd>; ec=$?; printf "\\n__BGRUN_EXIT__=%d\\n" "$ec"; exit $ec'],
+  → spawn('sh', ['-c', 'sh -c "$1"; ec=$?; printf "\\n__BGRUN_EXIT__=%d\\n" "$ec"; exit "$ec"', 'bgrun', '<cmd>'],
           { stdio: ['ignore', logFd, logFd], detached: true }).unref()
   → records job in-memory + appends a bgrun-job entry to the session
   → returns "started: <job-id>"
@@ -101,11 +103,23 @@ only bounded digests ever enter the conversation:
 **Why `bggrep` instead of `bash grep` on the log?** A bash grep's output is
 uncapped — a retry-storm log can dump thousands of matching lines straight
 into context, and safety depends on remembering `| head` on every call.
-`bggrep` is bounded by design (~50 matches, ~2KB/line, ~8KB), takes the job id instead of
+`bggrep` is bounded by design (last 2 MB of the log, per-line 10 000-char
+pre-truncation before matching, ~50 matches, ~8KB), takes the job id instead of
 a reconstructed log path (no shell-quoting of the regex), reaches the
 configured jobs dir (including a global one) that project-sandboxed tools like
 `ctx_execute_file` cannot, and reports match counts, line numbers, and
 skip markers. Plain `grep` is fine only for a one-off search you know is tiny.
+
+### Bounded matching
+
+`bggrep` takes a **caller-supplied regex**, and a pathological one (for example
+`(a+)+$`) can backtrack exponentially. V8 has no regex step limit and cannot
+interrupt a regex running on the main thread, so the match loop runs in a
+worker with a wall-clock budget (default `2000ms`, override with
+`PI_BGRUN_GREP_TIMEOUT_MS`). If the budget is exceeded the worker is terminated
+and `bggrep` returns an error — **a runaway pattern fails, it never hangs the
+session.** Normal patterns and logs finish far inside the budget; worker
+startup adds a few tens of milliseconds per call.
 
 ## Configuration
 
@@ -162,7 +176,7 @@ Benefits:
   This happens on the first `bgrun`; at session start it also happens for
   **trusted** projects only, so merely opening pi in an untrusted repo neither
   edits `.git/info/exclude` nor creates the dir. Works in linked worktrees too
-  (`.git` file → pointed git dir).
+  (writes to the common git dir, resolved via the worktree's `commondir` file).
 
 **Upgrading from a pre-project-local version:** in a repo the default jobs dir
 is now `<project>/.pi-bgrun/jobs`, not `~/.pi-bgrun/jobs`. Keep the old
@@ -200,6 +214,8 @@ Environment variables (same knobs, handy for one-off overrides):
 | `PI_BGRUN_SHOW_COMPLETED` | `false` | Include finished jobs in `bgstatus` listings by default. |
 | `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |
 | `PI_BGRUN_GLOBAL_AUTO_CLEAN` | `true` | Set `0`/`false` to disable the automatic orphan sweep (see below). |
+| `PI_BGRUN_GREP_TIMEOUT_MS` | `2000` | Wall-clock budget for a `bggrep` match. A caller-supplied regex that exceeds it is aborted (its worker terminated) and reported as an error instead of hanging — see [Bounded matching](#bounded-matching). |
+| `PI_BGRUN_USER_CONFIG` | `~/.pi/agent/pi-bgrun.json` | Override the user-level config file path (see [Configuration](#configuration)). |
 
 ### Digest scorecard (opt-in)
 
@@ -220,7 +236,8 @@ three:
 | `type` | no | trimmed, lowercased, blank → none, ≤40 chars | digest routing only; the first-class selector |
 
 `name` names the job (and its log file); `type` never affects the id or the
-display — its only job is selecting the scorecard. Selection tries `type`
+widget, but is echoed in `bgstatus <id>` and `bgrun`'s `started:` line — its
+main job is selecting the scorecard. Selection tries `type`
 entries first (exact, case-insensitive), then falls back to `match.name` /
 `match.command` globs. The config `type` is capped to the same 40 characters
 as the job `type`, so an over-long type still matches.
@@ -412,7 +429,27 @@ not delete another session's artifacts.**
 - **Manual**: `bgclean` cleans this session's old logs; `bgclean` with
   `all: true` sweeps every session's logs across the shared dirs immediately
   (and refreshes the markers).
+
 - Running jobs are never swept while their pid is alive.
+
+**The jobs dir is only *auto*-swept when it is recognizably ours.** `bgrun`
+writes a `.bgrun-jobs` ownership marker into the dir on first use; the
+automatic global sweep refuses to delete `*.log` files in a dir without it, so
+a stray `PI_BGRUN_DIR` (or a config pointing at an unrelated directory) can't
+be quietly emptied a week later. Manual `bgclean all` is an explicit
+instruction, so it bypasses the gate and always works.
+
+The dir also carries small bookkeeping files. The digest markers
+(`.bgrun-used-*`, `.digest-nudge-*`) and stale `.tmp-*.log` staging files are
+swept at `cleanupDays`; `.bgrun-jobs` and `.last-clean` persist until removed
+by hand:
+
+| File | Purpose |
+| --- | --- |
+| `.bgrun-jobs` | Ownership marker — gates the *automatic* global sweep. |
+| `.last-clean` | Throttles the global sweep to once per `cleanupDays`. |
+| `.bgrun-used-<hash>` | Per-project evidence that bgrun has run here (digest nudge). |
+| `.digest-nudge-<hash>` | Per-project: the one-shot digest nudge was already shown. |
 
 ## Status
 

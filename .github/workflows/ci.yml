@@ -35,7 +35,7 @@ jobs:
           bun-version: latest
 
       - name: bun install
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: tsc --noEmit
         id: tsc
@@ -54,6 +54,14 @@ jobs:
           echo "$pack_output"
           file_count=$(echo "$pack_output" | grep -oP 'total files:\s*\K[0-9]+' || echo "?")
           echo "file_count=${file_count}" >> "$GITHUB_OUTPUT"
+          # Enforce the allowlist: test files and other non-runtime files must
+          # never ship in the published tarball (they bloat installs and leak
+          # internals). npm's `files` negation should exclude these; fail loudly
+          # if a future edit drops the negation.
+          if echo "$pack_output" | grep -qE '(index\.test\.ts|/test/|\.test\.)'; then
+            echo "::error::test files found in the published tarball — fix package.json files[]"
+            exit 1
+          fi
 
       # Sticky PR comment: one report per PR, updated in place on every run
       # (found via the hidden marker, so comments never stack up).
@@ -102,9 +110,12 @@ jobs:
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
           PACK_OUTCOME: ${{ steps.pack.outcome }}
           PACK_FILES: ${{ steps.pack.outputs.file_count }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          JOB_STATUS: ${{ job.status }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           {
-            echo "## CI — ${{ github.workflow }} — ${{ job.status }}"
+            echo "## CI — ${WORKFLOW_NAME} — ${JOB_STATUS}"
             echo ""
             echo "| Check | Result |"
             echo "|---|---|"
@@ -112,5 +123,5 @@ jobs:
             echo "| tests | \`${TESTS_OUTCOME}\` |"
             echo "| npm pack --dry-run | \`${PACK_OUTCOME}\` — ${PACK_FILES} files in tarball |"
             echo ""
-            echo "Ref: \`${{ github.sha }}\`"
+            echo "Ref: \`${COMMIT_SHA}\`"
           } >> "$GITHUB_STEP_SUMMARY"

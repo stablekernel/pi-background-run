@@ -42,6 +42,17 @@ import {
   digestNudgeMarkerPath,
   jobUsageMarkerPath,
 } from "./index.ts";
+import type {
+  EntryRenderer,
+  ExtensionAPI,
+  SessionShutdownEvent,
+  SessionStartEvent,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+
+function markJobsDir(dir: string): void {
+  writeFileSync(join(dir, ".bgrun-jobs"), "");
+}
 
 // All test temp files live under one per-run root so cleanup and git hygiene
 // stay trivial — nothing is written into the repo or the real $HOME.
@@ -82,36 +93,101 @@ interface CapturedWake {
   options?: Record<string, unknown>;
 }
 
+interface CapturedEntry {
+  type: string;
+  customType?: string;
+  data?: Record<string, any>;
+}
+
+// The slice of ExtensionAPI the extension under test actually calls. Typing the
+// fake against these REAL signatures means a host-API change (e.g.
+// registerCommand's options shape, or an event rename) fails tsc here instead of
+// silently passing because the fake was `any`.
+type UsedExtensionAPI = Pick<
+  ExtensionAPI,
+  | "on"
+  | "registerTool"
+  | "registerCommand"
+  | "registerEntryRenderer"
+  | "sendUserMessage"
+  | "appendEntry"
+>;
+
+// Tools as the tests consume them: real metadata types from ToolDefinition, but
+// a loose result shape so assertions can read `.content[0].text` without having
+// to narrow the TextContent | ImageContent union at ~90 call sites.
+type FakeTool = Pick<
+  ToolDefinition<any, any, any>,
+  "name" | "label" | "description" | "parameters" | "promptSnippet"
+> & {
+  execute(
+    toolCallId: string,
+    params: any,
+    signal: AbortSignal | undefined,
+    onUpdate: undefined,
+    ctx: FakeContext,
+  ): Promise<{
+    content: { type: string; text: string }[];
+    details: any;
+    isError?: boolean;
+  }>;
+};
+
+interface FakeUIContext {
+  notify(text: string, kind?: string): void;
+  setStatus(key: string, text: string | undefined): void;
+  setWidget(key: string, lines: string[] | undefined): void;
+}
+
+interface FakeContext {
+  isIdle(): boolean;
+  hasUI: boolean;
+  ui: FakeUIContext;
+  sessionManager: { getEntries(): CapturedEntry[] };
+  [key: string]: unknown;
+}
+
+interface FakeCommand {
+  description?: string;
+  handler: (args: string, ctx: FakeContext) => Promise<void> | void;
+}
+
+type FakeHandler = (event: any, ctx: FakeContext) => Promise<any> | any;
+
+type FakeRenderer = (
+  entry: { data?: Record<string, any> },
+  opts: { expanded?: boolean },
+  theme: unknown,
+) => unknown;
+
+interface FakePiHandles {
+  pi: ExtensionAPI;
+  wakes: CapturedWake[];
+  entries: CapturedEntry[];
+  tools: Map<string, FakeTool>;
+  commands: Map<string, FakeCommand>;
+  entryRenderers: Map<string, FakeRenderer>;
+  ctx: FakeContext;
+  handlers: Map<string, FakeHandler[]>;
+  fireSessionStart: () => Promise<void>;
+  fireSessionShutdown: () => Promise<void>;
+}
+
 function makeFakePi(
   opts: {
     idle?: boolean;
-    priorEntries?: any[];
+    priorEntries?: CapturedEntry[];
     ctxFields?: Record<string, unknown>;
   } = {},
-): {
-  pi: any;
-  wakes: CapturedWake[];
-  entries: any[];
-  tools: Map<string, { execute: (...args: any[]) => Promise<any> }>;
-  commands: Map<
-    string,
-    { description?: string; handler: (...args: any[]) => Promise<void> }
-  >;
-  ctx: any;
-  handlers: Map<string, ((...args: any[]) => Promise<any>)[]>;
-  fireSessionStart: () => Promise<void>;
-} {
+): FakePiHandles {
   const wakes: CapturedWake[] = [];
-  const entries: any[] = opts.priorEntries ? [...opts.priorEntries] : [];
-  const tools = new Map<
-    string,
-    { execute: (...args: any[]) => Promise<any> }
-  >();
-  const commands = new Map<
-    string,
-    { description?: string; handler: (...args: any[]) => Promise<void> }
-  >();
-  const handlers = new Map<string, ((...args: any[]) => Promise<any>)[]>();
+  const entries: CapturedEntry[] = opts.priorEntries
+    ? [...opts.priorEntries]
+    : [];
+  const tools = new Map<string, FakeTool>();
+  const commands = new Map<string, FakeCommand>();
+  const entryRenderers = new Map<string, FakeRenderer>();
+  const handlers = new Map<string, FakeHandler[]>();
   const idle = opts.idle ?? true;
   const ctx = {
     isIdle: () => idle,
@@ -119,30 +195,52 @@ function makeFakePi(
     ui: { notify() {}, setWidget() {}, setStatus() {} },
     sessionManager: { getEntries: () => entries },
     ...(opts.ctxFields as Record<string, unknown> | undefined),
-  };
-  const pi = {
-    sendUserMessage(text: string, options?: Record<string, unknown>) {
-      wakes.push({ text, options });
+  } as unknown as FakeContext;
+
+  // Typed against the real ExtensionAPI members the extension uses — the
+  // compile-time drift guard. `as ExtensionAPI` below is the unavoidable seam
+  // (the fake is deliberately partial); the *shapes* here are the real ones.
+  const used: UsedExtensionAPI = {
+    sendUserMessage(content, options) {
+      wakes.push({
+        text: content as string,
+        options: options as Record<string, unknown> | undefined,
+      });
     },
-    appendEntry(customType: string, data?: unknown) {
-      entries.push({ type: "custom", customType, data });
+    appendEntry(customType, data) {
+      entries.push({
+        type: "custom",
+        customType,
+        data: data as Record<string, any> | undefined,
+      });
     },
-    registerEntryRenderer() {},
-    registerTool(def: any) {
-      tools.set(def.name, def);
+    registerEntryRenderer(customType: string, renderer: EntryRenderer<any>) {
+      entryRenderers.set(customType, renderer as unknown as FakeRenderer);
     },
-    registerCommand(name: string, def: any) {
-      commands.set(name, def);
+    registerTool(def) {
+      tools.set(def.name, def as unknown as FakeTool);
     },
-    on(event: string, handler: (...args: any[]) => Promise<any>) {
+    registerCommand(name, options) {
+      commands.set(name, options as unknown as FakeCommand);
+    },
+    on(event: string, handler: unknown) {
       const list = handlers.get(event) ?? [];
-      list.push(handler);
+      list.push(handler as FakeHandler);
       handlers.set(event, list);
     },
   };
+  const pi = used as ExtensionAPI;
+
   const fireSessionStart = async () => {
+    const event = { reason: "startup" } as unknown as SessionStartEvent;
     for (const h of handlers.get("session_start") ?? []) {
-      await h({ reason: "startup" }, ctx);
+      await h(event, ctx);
+    }
+  };
+  const fireSessionShutdown = async () => {
+    const event = { reason: "shutdown" } as unknown as SessionShutdownEvent;
+    for (const h of handlers.get("session_shutdown") ?? []) {
+      await h(event, ctx);
     }
   };
   return {
@@ -151,28 +249,28 @@ function makeFakePi(
     entries,
     tools,
     commands,
+    entryRenderers,
     ctx,
     handlers,
     fireSessionStart,
+    fireSessionShutdown,
   };
 }
 
-async function loadExtension(
-  fakePi: any,
-): Promise<Map<string, { execute: (...args: any[]) => Promise<any> }>> {
+async function loadExtension(fakePi: ExtensionAPI): Promise<void> {
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod = await import(url);
   mod.default(fakePi);
-  return fakePi.tools as Map<
-    string,
-    { execute: (...args: any[]) => Promise<any> }
-  >;
 }
 
+// Default below Bun's 5s test timeout so a stuck wait rejects with a clear
+// message instead of racing the harness kill (a flake-masking failure mode).
 function waitForWakes(
   wakes: CapturedWake[],
   count: number,
-  timeoutMs = 5000,
+  // Under bun's 5s per-test timeout so this fires first with a clearer error,
+  // but above the ~55ms these tests normally take, leaving CI-load headroom.
+  timeoutMs = 4000,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
@@ -189,6 +287,52 @@ function waitForWakes(
     tick();
   });
 }
+
+test("bgrun: exit marker survives commands with # and explicit exit codes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+    const mod = await import(
+      pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+    );
+
+    await bgrun.execute(
+      "call-hash",
+      { command: "echo hi #" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const hashId = wakes[0].text.match(/`([^`]+)`/)?.[1];
+    assert.ok(hashId, "got hash job id");
+    const hashLog = readFileSync(join(dir, `${hashId}.log`), "utf8");
+    assert.match(hashLog, /__BGRUN_EXIT__=0/);
+
+    await bgrun.execute(
+      "call-exit3",
+      { command: "exit 3" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 2);
+    assert.match(wakes[1].text, /finished \(exit 3\)/);
+    const exit3Id = wakes[1].text.match(/`([^`]+)`/)?.[1];
+    assert.ok(exit3Id, "got exit3 job id");
+    assert.equal(
+      mod.parseExitFromLogPath(join(dir, `${exit3Id}.log`)),
+      3,
+      "marker recoverable after restart",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("bgrun: successful command writes log + exit marker and wakes with ✅", async () => {
   const dir = mkTmp("pi-bgrun-test-");
@@ -629,13 +773,13 @@ test("bgrun: appends bgrun-job entries (running then done)", async () => {
     // One running entry appended at start.
     const runningEntries = entries.filter((e) => e.data?.state === "running");
     assert.equal(runningEntries.length, 1, "running entry appended at start");
-    assert.equal(runningEntries[0].data.cmd, "echo entry-test");
+    assert.equal(runningEntries[0]?.data?.cmd, "echo entry-test");
 
     await waitForWakes(wakes, 1);
     // One done entry appended on exit.
     const doneEntries = entries.filter((e) => e.data?.state === "done");
     assert.equal(doneEntries.length, 1, "done entry appended on exit");
-    assert.equal(doneEntries[0].data.exitCode, 0);
+    assert.equal(doneEntries[0]?.data?.exitCode, 0);
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
@@ -1164,6 +1308,7 @@ test("bgclean all: removes a FINISHED job's old log even when its id-pid is aliv
   // pi's own pid from the old id bug, or pid reuse) was kept forever.
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
   try {
     // Old finished foreign log whose id-pid is THIS process (alive!) — must
     // still be removed by an explicit global sweep.
@@ -1368,6 +1513,7 @@ test("session_start: done entries with missing exitCode (signal kills) reconstru
 test("auto-clean: session boundaries sweep this session's old logs AND week-old foreign orphans by default", async () => {
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
   delete process.env.PI_BGRUN_FOREIGN_JOBS;
   delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN;
   try {
@@ -1447,6 +1593,7 @@ test("auto-clean: session boundaries sweep this session's old logs AND week-old 
 test("auto-clean: globalAutoClean=false opts out — foreign orphans untouched, own old logs still swept", async () => {
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
   delete process.env.PI_BGRUN_FOREIGN_JOBS;
   process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN = "0";
   try {
@@ -1624,6 +1771,8 @@ test("auto-clean: .last-clean throttles per dir under the project-local default 
     const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const projJobs = join(proj, ".pi-bgrun", "jobs");
     mkdirSync(projJobs, { recursive: true });
+    // The automatic sweep only touches a dir carrying our ownership marker.
+    markJobsDir(projJobs);
     const projOld = join(projJobs, "old-proj-1000000000-99999.log");
     writeFileSync(projOld, "done\n__BGRUN_EXIT__=0\n");
     utimesSync(projOld, oldTime, oldTime);
@@ -1702,6 +1851,7 @@ test("auto-clean: untrusted project aliased by a global symlink writes nothing (
 test("auto-clean: global orphan sweep is throttled via .last-clean; manual bgclean all always runs", async () => {
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
   delete process.env.PI_BGRUN_FOREIGN_JOBS;
   delete process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN; // default: on
   try {
@@ -1768,6 +1918,7 @@ test("auto-clean: global orphan sweep is throttled via .last-clean; manual bgcle
 test("bgclean: default scope is this session's logs; all: true sweeps everything", async () => {
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
   // Isolate bgclean's scoping from the global orphan auto-sweep (default on)
   // so the foreign log survives session_start for bgclean to (not) act on.
   process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN = "0";
@@ -2739,6 +2890,28 @@ test("ensureGitExcluded: linked worktree (.git file) writes to the pointed git d
   }
 });
 
+test("ensureGitExcluded: linked worktree (.git file) writes to commondir exclude", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const wt = mkdtempSync(join(tmpdir(), "pi-bgrun-wt-"));
+  const common = mkdtempSync(join(tmpdir(), "pi-bgrun-common-"));
+  const wtGitDir = join(common, "worktrees", "wt1");
+  try {
+    mkdirSync(join(common, "info"), { recursive: true });
+    mkdirSync(wtGitDir, { recursive: true });
+    writeFileSync(join(wt, ".git"), `gitdir: ${wtGitDir}\n`);
+    writeFileSync(join(wtGitDir, "commondir"), "../..\n");
+    mod.ensureGitExcluded(join(wt, ".pi-bgrun", "jobs"));
+    const exclude = readFileSync(join(common, "info", "exclude"), "utf8");
+    assert.match(exclude, /^\.pi-bgrun\/jobs\/$/m);
+    assert.ok(!existsSync(join(wtGitDir, "info", "exclude")));
+  } finally {
+    rmSync(wt, { recursive: true, force: true });
+    rmSync(common, { recursive: true, force: true });
+  }
+});
+
 test("ensureGitExcluded: gitdir pointer with spaces in the path", async () => {
   const mod = await import(
     pathToFileURL(join(process.cwd(), "extension/index.ts")).href
@@ -3531,6 +3704,133 @@ test("wake message: Stats line (duration + line count) sits between Command: and
     rmSync(dir, { recursive: true, force: true });
   }
 });
+test("redactForSlug: credential values never reach a filename or status line", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  // Every credential SHAPE a shell command commonly carries. Each entry is
+  // [command, substring that must NOT survive]. Regression guard for the
+  // original too-narrow regex, which only caught `key: value` / `key=value`
+  // with a short hard-coded key list and missed all of these.
+  const leaks: [string, string][] = [
+    // Header arguments (quoted, bare, `=`-joined). The X-Request-Id cases are
+    // deliberately NOT secret-named, so ONLY the -H/--header rules can redact
+    // them (otherwise the auth/assignment rules mask a broken header branch).
+    ["curl -H 'X-Request-Id: abc123' https://x", "abc123"],
+    ["curl --header 'X-Request-Id: abc123' https://x", "abc123"],
+    ['curl --header="X-Request-Id: abc123" https://x', "abc123"],
+    ["curl -H 'Authorization: Bearer abc123' https://x", "abc123"],
+    ["curl --header 'Authorization: Basic abc123' https://x", "abc123"],
+    ['curl --header="X-Session: abc123" https://x', "abc123"],
+    // Auth scheme + credential in a bare (non-header) value.
+    ["deploy Authorization: Bearer abc123", "abc123"],
+    ["auth: Bearer abc123", "abc123"],
+    // Underscore-prefixed env keys (no \b between `_` and the key word).
+    ["GITHUB_TOKEN=ghp_abc123 git push", "ghp_abc123"],
+    ["AWS_SECRET_ACCESS_KEY=abc123 aws s3 cp a b", "abc123"],
+    ["NPM_TOKEN=npm_zzz npm publish", "npm_zzz"],
+    ["env DB_PASSWORD=hunter2 ./run", "hunter2"],
+    ["MYSQL_PWD=hunter2 mysql -u root", "hunter2"],
+    // JSON (quotes around key and value).
+    ['curl --data {"password":"hunter2"} https://x', "hunter2"],
+    // Flag with a space (not `=`) and the `=` form.
+    ["curl --api-key abc123 https://x", "abc123"],
+    ["curl --api-key=abc123 https://x", "abc123"],
+    ["mysql --password secret db", "secret"],
+    ["deploy --token abc123", "abc123"],
+    ["run --client-secret shhh", "shhh"],
+    // URL userinfo and curl user:pass forms.
+    ["git clone https://oauth2:glpat-abc@gitlab.com/x/y", "glpat-abc"],
+    ["curl -u user:pass https://x", "user:pass"],
+    ["curl --user user:pass https://x", "user:pass"],
+  ];
+  for (const [command, secret] of leaks) {
+    const out = mod.redactForSlug(command);
+    assert.ok(
+      !out.includes(secret),
+      `secret ${JSON.stringify(secret)} leaked: ${JSON.stringify(command)} -> ${JSON.stringify(out)}`,
+    );
+    assert.match(out, /REDACTED/, `redaction marker missing for ${command}`);
+  }
+  // Non-secret commands must be left ALONE — over-redaction mangles a slug.
+  // `-h` (help) must NOT be treated as the case-sensitive `-H` header flag.
+  for (const command of [
+    "make test-short",
+    "grep -h pattern file",
+    "mkdir -p src/lib",
+    "sort -u names.txt",
+    "npm run build -- --watch",
+    "timeout=30 node app.js",
+    "author=AUTHOR_NAME deploy",
+  ]) {
+    assert.equal(
+      mod.redactForSlug(command),
+      command,
+      `non-secret command was altered: ${command}`,
+    );
+  }
+});
+
+test("bgstatus: read-only — checking status does not append transcript entries", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
+  try {
+    const id = `read-only-job-${Math.floor(Date.now() / 1000)}-${process.pid}`;
+    const logPath = join(dir, `${id}.log`);
+    // No exit marker yet — session_start sees a live pid (this process) and
+    // keeps the reconstructed job as running.
+    writeFileSync(logPath, "working…\n");
+
+    const priorEntries = [
+      {
+        type: "custom",
+        customType: "bgrun-job",
+        data: {
+          id,
+          pid: process.pid,
+          cmd: "sleep 999",
+          name: undefined,
+          started: Date.now(),
+          logPath,
+          state: "running",
+        },
+      },
+    ];
+    const { pi, entries, tools, ctx, fireSessionStart } = makeFakePi({
+      priorEntries,
+    });
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    const afterStart = entries.length;
+
+    // The job finishes while pi is still up: marker lands in the log.
+    writeFileSync(logPath, "working…\n\n__BGRUN_EXIT__=0\n");
+
+    const bgstatus = tools.get("bgstatus")!;
+    const res = await bgstatus.execute(
+      "call-ro",
+      { includeDone: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      res.content[0].text as string,
+      /done exit=0/,
+      "revalidation still reports the accurate done state",
+    );
+    assert.equal(
+      entries.length,
+      afterStart,
+      "no transcript entry appended by a status check",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("wake message: Stats line also present on a red (non-zero exit) run", async () => {
   const dir = mkTmp("pi-bgrun-test-");
@@ -3597,10 +3897,7 @@ test("resolveConfig: digest resolves from a trusted project config", async () =>
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod: any = await import(url);
   const proj = mkTmp("pi-bgrun-proj-");
-  process.env.PI_BGRUN_USER_CONFIG = join(
-    mkTmp("pi-bgrun-home-"),
-    "user.json",
-  ); // does not exist
+  process.env.PI_BGRUN_USER_CONFIG = join(mkTmp("pi-bgrun-home-"), "user.json"); // does not exist
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: { preset: "go-test" },
@@ -3620,10 +3917,7 @@ test("resolveConfig: digest resolves from a trusted project config", async () =>
 test("resolveConfig: digest absent everywhere → undefined", async () => {
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod: any = await import(url);
-  process.env.PI_BGRUN_USER_CONFIG = join(
-    mkTmp("pi-bgrun-home-"),
-    "user.json",
-  );
+  process.env.PI_BGRUN_USER_CONFIG = join(mkTmp("pi-bgrun-home-"), "user.json");
   try {
     const cfg = mod.resolveConfig({});
     assert.equal(cfg.digest, undefined);
@@ -3636,10 +3930,7 @@ test("resolveConfig: untrusted project → no digest even when the project confi
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod: any = await import(url);
   const proj = mkTmp("pi-bgrun-proj-");
-  process.env.PI_BGRUN_USER_CONFIG = join(
-    mkTmp("pi-bgrun-home-"),
-    "user.json",
-  );
+  process.env.PI_BGRUN_USER_CONFIG = join(mkTmp("pi-bgrun-home-"), "user.json");
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: { preset: "go-test" },
@@ -3711,10 +4002,7 @@ test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod: any = await import(url);
   const proj = mkTmp("pi-bgrun-proj-");
-  process.env.PI_BGRUN_USER_CONFIG = join(
-    mkTmp("pi-bgrun-home-"),
-    "user.json",
-  );
+  process.env.PI_BGRUN_USER_CONFIG = join(mkTmp("pi-bgrun-home-"), "user.json");
   try {
     // Both invalid → no digest at all.
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
@@ -3768,10 +4056,7 @@ test("resolveConfig: digest label is trimmed and capped at 60", async () => {
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod: any = await import(url);
   const proj = mkTmp("pi-bgrun-proj-");
-  process.env.PI_BGRUN_USER_CONFIG = join(
-    mkTmp("pi-bgrun-home-"),
-    "user.json",
-  );
+  process.env.PI_BGRUN_USER_CONFIG = join(mkTmp("pi-bgrun-home-"), "user.json");
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: [
@@ -3799,10 +4084,7 @@ test("resolveConfig: digest type normalized; invalid type drops entry; match kep
   const url = pathToFileURL(join(process.cwd(), "extension/index.ts")).href;
   const mod: any = await import(url);
   const proj = mkTmp("pi-bgrun-proj-");
-  process.env.PI_BGRUN_USER_CONFIG = join(
-    mkTmp("pi-bgrun-home-"),
-    "user.json",
-  );
+  process.env.PI_BGRUN_USER_CONFIG = join(mkTmp("pi-bgrun-home-"), "user.json");
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
       digest: [
@@ -4845,7 +5127,12 @@ test("wake digest: match by command line chooses the matching entry", async () =
         { label: "default", command: "echo default" },
       ],
     });
-    const wake = await runDigestJob(proj, { command: "cargo build --release" });
+    // Keep the literal selector text in the command, but do not actually run
+    // cargo — the command is really spawned, and a real toolchain is slow/flaky
+    // on CI.
+    const wake = await runDigestJob(proj, {
+      command: 'echo "cargo build --release"',
+    });
     const line = digestLineOf(wake);
     assert.ok(line, "wake carries a digest line");
     assert.match(line!, /^digest \(build\): build-ok$/);
@@ -4956,7 +5243,7 @@ test("wake digest: type + match compose end-to-end (normalization keeps match)",
     let wake = await runDigestJob(proj, {
       type: "test",
       name: "unit-tests",
-      command: "go test",
+      command: "echo hi",
     });
     assert.match(digestLineOf(wake)!, /^digest \(unit\): unit$/);
     // type "test" but name does not match → second entry proves `match` is
@@ -4964,7 +5251,7 @@ test("wake digest: type + match compose end-to-end (normalization keeps match)",
     wake = await runDigestJob(proj, {
       type: "test",
       name: "other",
-      command: "go test",
+      command: "echo hi",
     });
     assert.match(digestLineOf(wake)!, /^digest \(any-test\): any$/);
   } finally {
@@ -5017,27 +5304,56 @@ test("wake digest: job type selects the matching type entry (digest (test))", as
   }
 });
 
-test("wake digest: type is case-insensitive; unknown type falls through to match/default", async () => {
+// Split into three tests: each spawns a real job, and bundling three into one
+// blew bun's 5s per-test budget on a loaded CI runner.
+const CASE_INSENSITIVE_DIGEST = [
+  { type: "test", label: "typed-test", command: "echo typed" },
+  { match: { command: "*run*" }, label: "match", command: "echo match" },
+  { label: "default", command: "echo default" },
+];
+
+test("wake digest: type match is case-insensitive", async () => {
   const { dir, proj, home } = setupDigestEnv();
   try {
     writeJson(join(proj, ".pi", "pi-bgrun.json"), {
-      digest: [
-        { type: "test", label: "typed-test", command: "echo typed" },
-        { match: { command: "*run*" }, label: "match", command: "echo match" },
-        { label: "default", command: "echo default" },
-      ],
+      digest: CASE_INSENSITIVE_DIGEST,
     });
-    // Case-insensitive exact type match.
-    let wake = await runDigestJob(proj, { type: "TEST", command: "echo hi" });
+    const wake = await runDigestJob(proj, {
+      type: "TEST",
+      command: "echo hi",
+    });
     assert.match(digestLineOf(wake)!, /^digest \(typed-test\): typed$/);
-    // Unknown type → falls through to the match scan.
-    wake = await runDigestJob(proj, {
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: unknown type falls through to a match entry", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: CASE_INSENSITIVE_DIGEST,
+    });
+    // The command must MATCH `*run*` (the entry selector) but must also be
+    // cheap to actually spawn — `npm run lint` runs for real and made this
+    // test wait on npm startup (~1.6s locally, >5s on CI).
+    const wake = await runDigestJob(proj, {
       type: "lint",
-      command: "npm run lint",
+      command: "echo run",
     });
     assert.match(digestLineOf(wake)!, /^digest \(match\): match$/);
-    // Unknown type + no match → default entry.
-    wake = await runDigestJob(proj, { type: "lint", command: "ls" });
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: unknown type with no match uses the default entry", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: CASE_INSENSITIVE_DIGEST,
+    });
+    const wake = await runDigestJob(proj, { type: "lint", command: "ls" });
     assert.match(digestLineOf(wake)!, /^digest \(default\): default$/);
   } finally {
     teardownDigestEnv(dir, proj, home);
@@ -5059,7 +5375,7 @@ test("wake digest: type entry beats an earlier match entry (type-first order)", 
     });
     const wake = await runDigestJob(proj, {
       type: "test",
-      command: "go test ./...",
+      command: 'echo "go test ./..."',
     });
     assert.match(digestLineOf(wake)!, /^digest \(typed\): typed$/);
   } finally {
@@ -5108,7 +5424,7 @@ test("bgrun: type flows into the started result, entries, and resume reconstruct
 
     // The persisted done entry carries the type.
     const done = entries.filter((e) => e.customType === "bgrun-job").at(-1);
-    assert.equal(done.data.type, "test");
+    assert.equal(done?.data?.type, "test");
 
     // Resume: a fresh instance reconstructs the in-memory map from entries.
     const {
@@ -5134,6 +5450,41 @@ test("bgrun: type flows into the started result, entries, and resume reconstruct
       "reconstructed record carries the type",
     );
     assert.equal((status.details as any).type, "test");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session_shutdown: sweeps this session's old logs and does not throw", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const { pi, wakes, tools, ctx, fireSessionStart, fireSessionShutdown } =
+      makeFakePi();
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    const bgrun = tools.get("bgrun")!;
+    const res = await bgrun.execute(
+      "call-shutdown",
+      { command: "true" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)?.[1];
+    assert.ok(id, "got job id");
+    await waitForWakes(wakes, 1);
+    const logPath = join(dir, `${id}.log`);
+    assert.ok(existsSync(logPath), "log exists before shutdown");
+
+    // Backdate so retention (default 7d) considers it old.
+    const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    utimesSync(logPath, old, old);
+
+    await fireSessionShutdown();
+    assert.ok(!existsSync(logPath), "old log swept on session_shutdown");
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
@@ -5394,5 +5745,396 @@ test("digest nudge: a bgrun in a nested cwd writes the usage marker at the proje
     assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
   } finally {
     teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("resolveConfig: project config is honored only when the project is trusted", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  const userCfg = join(
+    mkdtempSync(join(tmpdir(), "pi-bgrun-user-")),
+    "none.json",
+  );
+  const prevDir = process.env.PI_BGRUN_DIR;
+  delete process.env.PI_BGRUN_DIR;
+  try {
+    mkdirSync(join(proj, ".pi"), { recursive: true });
+    writeFileSync(
+      join(proj, ".pi", "pi-bgrun.json"),
+      JSON.stringify({
+        cleanupDays: 42,
+        adoptForeignJobs: true,
+        globalAutoClean: false,
+        showCompletedJobs: true,
+      }),
+    );
+
+    const untrusted = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => false,
+      userConfigPath: userCfg,
+    });
+    assert.equal(untrusted.cleanupDays, 7, "untrusted: default retention");
+    assert.equal(untrusted.adoptForeignJobs, false, "untrusted: default adopt");
+
+    const trusted = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => true,
+      userConfigPath: userCfg,
+    });
+    assert.equal(trusted.cleanupDays, 42, "trusted: file retention applied");
+    assert.equal(trusted.adoptForeignJobs, true, "trusted: adoptForeignJobs");
+    assert.equal(trusted.globalAutoClean, false, "trusted: globalAutoClean");
+    assert.equal(trusted.showCompletedJobs, true, "trusted: showCompletedJobs");
+  } finally {
+    if (prevDir !== undefined) process.env.PI_BGRUN_DIR = prevDir;
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: user file applies; project file overrides it key-by-key", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  const userDir = mkdtempSync(join(tmpdir(), "pi-bgrun-user-"));
+  const userCfg = join(userDir, "pi-bgrun.json");
+  const prevDir = process.env.PI_BGRUN_DIR;
+  delete process.env.PI_BGRUN_DIR;
+  try {
+    writeFileSync(
+      userCfg,
+      JSON.stringify({ cleanupDays: 5, globalAutoClean: false }),
+    );
+    mkdirSync(join(proj, ".pi"), { recursive: true });
+    writeFileSync(
+      join(proj, ".pi", "pi-bgrun.json"),
+      JSON.stringify({ cleanupDays: 11 }),
+    );
+
+    const trusted = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => true,
+      userConfigPath: userCfg,
+    });
+    assert.equal(
+      trusted.cleanupDays,
+      11,
+      "project overrides the same user key",
+    );
+    assert.equal(
+      trusted.globalAutoClean,
+      false,
+      "user keys absent from the project file survive",
+    );
+
+    // Untrusted project: its file is skipped, the user file still applies.
+    const untrusted = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => false,
+      userConfigPath: userCfg,
+    });
+    assert.equal(untrusted.cleanupDays, 5, "untrusted: user value used");
+    assert.equal(
+      untrusted.globalAutoClean,
+      false,
+      "untrusted: user value used",
+    );
+  } finally {
+    if (prevDir !== undefined) process.env.PI_BGRUN_DIR = prevDir;
+    rmSync(proj, { recursive: true, force: true });
+    rmSync(userDir, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: env vars override config files", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  const userDir = mkdtempSync(join(tmpdir(), "pi-bgrun-user-"));
+  const userCfg = join(userDir, "pi-bgrun.json");
+  const prevDir = process.env.PI_BGRUN_DIR;
+  const prevDays = process.env.PI_BGRUN_CLEANUP_DAYS;
+  delete process.env.PI_BGRUN_DIR;
+  try {
+    writeFileSync(userCfg, JSON.stringify({ cleanupDays: 11 }));
+    process.env.PI_BGRUN_CLEANUP_DAYS = "3";
+
+    const cfg = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => true,
+      userConfigPath: userCfg,
+    });
+    assert.equal(cfg.cleanupDays, 3, "env beats both config files");
+  } finally {
+    if (prevDir !== undefined) process.env.PI_BGRUN_DIR = prevDir;
+    if (prevDays === undefined) delete process.env.PI_BGRUN_CLEANUP_DAYS;
+    else process.env.PI_BGRUN_CLEANUP_DAYS = prevDays;
+    rmSync(proj, { recursive: true, force: true });
+    rmSync(userDir, { recursive: true, force: true });
+  }
+});
+
+test("resolveConfig: malformed JSON is ignored with a warning, not a throw", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  const proj = mkdtempSync(join(tmpdir(), "pi-bgrun-proj-"));
+  const userDir = mkdtempSync(join(tmpdir(), "pi-bgrun-user-"));
+  const userCfg = join(userDir, "pi-bgrun.json");
+  const prevDir = process.env.PI_BGRUN_DIR;
+  delete process.env.PI_BGRUN_DIR;
+  const originalError = console.error;
+  const warnings: string[] = [];
+  console.error = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(" "));
+  };
+  try {
+    writeFileSync(userCfg, "{ not json");
+
+    const cfg = mod.resolveConfig({
+      cwd: proj,
+      isProjectTrusted: () => true,
+      userConfigPath: userCfg,
+    });
+    assert.equal(cfg.cleanupDays, 7, "falls back to defaults");
+    assert.ok(
+      warnings.some((w) => w.includes("malformed")),
+      "a malformed-config warning is emitted",
+    );
+  } finally {
+    console.error = originalError;
+    if (prevDir !== undefined) process.env.PI_BGRUN_DIR = prevDir;
+    rmSync(proj, { recursive: true, force: true });
+    rmSync(userDir, { recursive: true, force: true });
+  }
+});
+test("bgstatus <id>: reports done from the log when the in-memory record lags", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
+  try {
+    const id = `lag-job-${Math.floor(Date.now() / 1000)}-${process.pid}`;
+    const logPath = join(dir, `${id}.log`);
+    writeFileSync(logPath, "working…\n");
+
+    const priorEntries = [
+      {
+        type: "custom",
+        customType: "bgrun-job",
+        data: {
+          id,
+          pid: process.pid,
+          cmd: "sleep 999",
+          started: Date.now(),
+          logPath,
+          state: "running",
+        },
+      },
+    ];
+    const { pi, tools, ctx, fireSessionStart } = makeFakePi({ priorEntries });
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    // The job finishes (marker lands) but no child 'exit' event exists for a
+    // reconstructed record — by-id must derive done from the log/pid rather
+    // than reporting "running" until the next poll tick.
+    writeFileSync(logPath, "working…\n\n__BGRUN_EXIT__=0\n");
+
+    const bgstatus = tools.get("bgstatus")!;
+    const res = await bgstatus.execute(
+      "call-lag",
+      { id },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      res.content[0].text as string,
+      /done exit=0/,
+      "by-id reflects the log, not the stale in-memory record",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("entry renderer: bgrun-job renders running and done/expanded without throwing", async () => {
+  const { pi, entryRenderers } = makeFakePi();
+  await loadExtension(pi);
+  const render = entryRenderers.get("bgrun-job");
+  assert.ok(render, "a renderer is registered for bgrun-job");
+  // Minimal theme stub: the renderer only calls fg()/bg() for styling.
+  const theme = {
+    bg: (_key: string, text: string) => text,
+    fg: (_key: string, text: string) => text,
+  };
+  const base = {
+    id: "render-job-1",
+    cmd: "make test",
+    started: Date.now(),
+    logPath: "/tmp/render-job-1.log",
+  };
+  const running = render({ data: { ...base, state: "running" } }, {}, theme);
+  assert.ok(running, "running entry renders");
+  const done = render(
+    { data: { ...base, state: "done", exitCode: 0, exitedAt: Date.now() } },
+    { expanded: true },
+    theme,
+  );
+  assert.ok(done, "done + expanded entry renders");
+});
+test("bggrep: the match budget trips and reports an error (timeout plumbing)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  process.env.PI_BGRUN_GREP_TIMEOUT_MS = "1"; // force the budget to trip
+  markJobsDir(dir);
+  try {
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const id = `grep-budget-${Math.floor(Date.now() / 1000)}-${process.pid}`;
+    writeFileSync(join(dir, `${id}.log`), "alpha\nbeta\ngamma\n");
+    const bggrep = tools.get("bggrep")!;
+    const t0 = Date.now();
+    const res = await bggrep.execute(
+      "c",
+      { id, pattern: "(a+)+$" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const elapsed = Date.now() - t0;
+    assert.equal(res.isError, true, "budget exceeded is an error result");
+    assert.match(
+      res.content[0].text as string,
+      /match budget/,
+      "explains the budget was exceeded",
+    );
+    assert.ok(elapsed < 5_000, `returned within budget (${elapsed}ms)`);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    delete process.env.PI_BGRUN_GREP_TIMEOUT_MS;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bggrepTimeoutMs: falls back to the default for missing/invalid values", async () => {
+  const mod = await import(
+    pathToFileURL(join(process.cwd(), "extension/index.ts")).href
+  );
+  delete process.env.PI_BGRUN_GREP_TIMEOUT_MS;
+  assert.equal(mod.bggrepTimeoutMs(), 2_000, "default when unset");
+  process.env.PI_BGRUN_GREP_TIMEOUT_MS = "0";
+  assert.equal(mod.bggrepTimeoutMs(), 2_000, "non-positive falls back");
+  process.env.PI_BGRUN_GREP_TIMEOUT_MS = "nope";
+  assert.equal(mod.bggrepTimeoutMs(), 2_000, "non-numeric falls back");
+  process.env.PI_BGRUN_GREP_TIMEOUT_MS = "250";
+  assert.equal(mod.bggrepTimeoutMs(), 250, "valid override honored");
+  delete process.env.PI_BGRUN_GREP_TIMEOUT_MS;
+});
+test("bgstatus <id>: unknown id errors, and a log-only job recovers as done", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
+  try {
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const bgstatus = tools.get("bgstatus")!;
+
+    const missing = await bgstatus.execute(
+      "c1",
+      { id: "ghost-1-999999" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(missing.isError, true, "unknown id is an error");
+    assert.match(
+      missing.content[0].text as string,
+      /No job found with id/,
+      "unknown id explains itself",
+    );
+
+    const id = `recovered-${Math.floor(Date.now() / 1000)}-${process.pid}`;
+    writeFileSync(
+      join(dir, `${id}.log`),
+      "did the thing\n\n__BGRUN_EXIT__=0\n",
+    );
+    const done = await bgstatus.execute(
+      "c2",
+      { id },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      done.content[0].text as string,
+      /done exit=0 \(recovered from log\)/,
+      "log-only job recovers as done",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("jobs dir: .tmp-*.log staging files are skipped as jobs and swept when stale", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
+  try {
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const tmp = join(dir, ".tmp-build-1-deadbeef.log");
+    writeFileSync(tmp, "half-written");
+    const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    utimesSync(tmp, old, old);
+
+    const list = await tools
+      .get("bgstatus")!
+      .execute("c1", {}, undefined, undefined, ctx);
+    assert.ok(
+      !(list.content[0].text as string).includes(".tmp-build-1-deadbeef"),
+      "staging file is not listed as a job",
+    );
+
+    await tools
+      .get("bgclean")!
+      .execute("c2", { days: 1, all: true }, undefined, undefined, ctx);
+    assert.ok(!existsSync(tmp), "stale staging file is reclaimed");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bggrep: a pathological regex returns within the budget instead of hanging", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  markJobsDir(dir);
+  try {
+    const { pi, tools, ctx } = makeFakePi();
+    await loadExtension(pi);
+    const id = `patho-${Math.floor(Date.now() / 1000)}-${process.pid}`;
+    // A long run of `a` then `b` is the classic catastrophic-backtracking input
+    // for `^(a+)+$`. Under Node/V8 this would lock the thread; the worker must
+    // abort at the 2s budget. Under Bun's engine it completes quickly.
+    writeFileSync(join(dir, `${id}.log`), "a".repeat(60_000) + "b\n");
+    const t0 = Date.now();
+    const res = await tools
+      .get("bggrep")!
+      .execute("c", { id, pattern: "^(a+)+$" }, undefined, undefined, ctx);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 5_000, `bounded by the budget (${elapsed}ms)`);
+    assert.ok(
+      res.isError === true || typeof res.content[0].text === "string",
+      "returns a result (no hang, no throw)",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -93,7 +93,9 @@ jobs:
         env:
           PKG_VERSION: ${{ steps.version_check.outputs.pkg_version }}
         run: |
-          npm publish --provenance --access public
+          # No --provenance flag: trusted publishing (OIDC) makes npm generate
+          # provenance attestations automatically. Passing the flag is redundant.
+          npm publish --access public
           echo "::notice::Published pi-background-run@${PKG_VERSION} to npm"
 
       - name: Publish primary dry-run
@@ -112,7 +114,7 @@ jobs:
           PKG_VERSION: ${{ steps.version_check.outputs.pkg_version }}
         run: |
           node -e "const p=require('./package.json'); p.name='@stablekernel/pi-background-run'; require('fs').writeFileSync('./package.json', JSON.stringify(p,null,2)+'\n')"
-          npm publish --provenance --access public
+          npm publish --access public
           echo "::notice::Published @stablekernel/pi-background-run@${PKG_VERSION} to npm"
 
       - name: Publish alias dry-run
@@ -121,16 +123,11 @@ jobs:
           node -e "const p=require('./package.json'); p.name='@stablekernel/pi-background-run'; require('fs').writeFileSync('./package.json', JSON.stringify(p,null,2)+'\n')"
           npm publish --dry-run --access public
 
-      # ── Deprecate the alias in favor of the primary ────────────────────────
-      # Only on real publish. The alias is a permanent namespace claim; the README
-      # and install instructions point at the unscoped primary.
-      - name: Deprecate alias
-        if: ${{ github.event_name == 'release' || !inputs.dry-run }}
-        env:
-          PKG_VERSION: ${{ steps.version_check.outputs.pkg_version }}
-        continue-on-error: true
-        run: |
-          npm deprecate "@stablekernel/pi-background-run@${PKG_VERSION}" "Use pi-background-run (the unscoped primary) instead: pi install npm:pi-background-run"
+      # NOTE: the scoped alias is published, not deprecated. `npm deprecate`
+      # cannot authenticate via OIDC trusted publishing (it needs a long-lived
+      # token, which npm is retiring), and the alias is a permanent namespace
+      # claim that tracks the primary. To deprecate the alias manually:
+      #   npm deprecate "@stablekernel/pi-background-run@<version>" "Use pi-background-run instead"
 
       - name: Write publish summary
         if: always()
@@ -141,9 +138,11 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           PRIMARY_OUTCOME: ${{ steps.publish_primary.outcome }}
           ALIAS_OUTCOME: ${{ steps.publish_alias.outcome }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           {
-            echo "## Release — ${{ github.workflow }} — ${{ job.status }}"
+            echo "## Release — ${WORKFLOW_NAME} — ${JOB_STATUS}"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"

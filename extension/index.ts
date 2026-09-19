@@ -50,7 +50,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   DIGEST_PRESET_IDS,
   digestNoMatchWarning,
@@ -64,6 +64,11 @@ import {
 // code survives pi restarting. `;` (not `&&`) ensures the printf runs even when
 // the command fails. Never use `set -e` in the wrapper.
 const EXIT_MARKER = "__BGRUN_EXIT__=";
+const JOBS_DIR_MARKER = ".bgrun-jobs";
+// Tail-read caps — avoid whole-file readFileSync on runaway logs.
+const LOG_TAIL_BYTES = 256 * 1024; // exit marker + last line
+const LOG_READ_BYTES = 2 * 1024 * 1024; // bgtail / bggrep
+const BGGREP_LINE_CAP = 10_000; // per-line match length cap
 
 const DEFAULT_CLEANUP_DAYS = 7;
 const STALE_POLL_MS = 30_000; // re-check interval for jobs with no live child handle
@@ -79,12 +84,366 @@ function globalJobsDir(): string {
   );
 }
 
+// bggrep runs caller-supplied regexes. A pathological pattern (e.g. /^(a+)+$/)
+// can backtrack catastrophically, and V8 has no regex step limit and cannot
+// interrupt a regex running on the main thread — so the match loop runs in a
+// worker with a wall-clock budget. On expiry the worker is terminated and a
+// bounded error is returned instead of hanging the session. Bun's engine is
+// more backtracking-resistant, but Node is the common case.
+const BGGREP_DEFAULT_TIMEOUT_MS = 2_000;
+
+// Executed inside the worker (eval'd). Uses require(): available in an eval
+// worker on both Node and Bun, unlike a static import (the eval body is CJS).
+const BGGREP_WORKER_SOURCE = `
+const { parentPort, workerData } = require("node:worker_threads");
+try {
+  const re = new RegExp(workerData.source);
+  const lines = workerData.lines;
+  const cap = workerData.cap;
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+    if (line.length > cap) line = line.slice(0, cap);
+    if (re.test(line)) out.push(i);
+  }
+  parentPort.postMessage({ ok: true, matches: out });
+} catch (err) {
+  parentPort.postMessage({ ok: false, message: String((err && err.message) || err) });
+}
+`;
+
+// Read at call time so tests (and users) can lower the budget; a non-positive
+// or non-numeric value falls back to the default.
+export function bggrepTimeoutMs(): number {
+  const raw = Number(process.env.PI_BGRUN_GREP_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : BGGREP_DEFAULT_TIMEOUT_MS;
+}
+
+type GrepMatchOutcome =
+  | { kind: "ok"; matchIdx: number[] }
+  | { kind: "timeout" }
+  | { kind: "invalid"; message: string };
+
+// Bounded between lines only — a single pathological line can still stall.
+// Used solely when worker_threads is unavailable (never on Node or Bun).
+function matchLinesSyncBounded(
+  source: string,
+  lines: string[],
+  cap: number,
+  budgetMs: number,
+): GrepMatchOutcome {
+  let re: RegExp;
+  try {
+    re = new RegExp(source);
+  } catch (err) {
+    return { kind: "invalid", message: (err as Error).message };
+  }
+  const out: number[] = [];
+  const start = Date.now();
+  for (let i = 0; i < lines.length; i++) {
+    if ((i & 0x3ff) === 0 && Date.now() - start > budgetMs) {
+      return { kind: "timeout" };
+    }
+    const line = lines[i].length > cap ? lines[i].slice(0, cap) : lines[i];
+    if (re.test(line)) out.push(i);
+  }
+  return { kind: "ok", matchIdx: out };
+}
+
+async function matchLinesWithBudget(
+  source: string,
+  lines: string[],
+  cap: number,
+  budgetMs: number,
+): Promise<GrepMatchOutcome> {
+  let WorkerCtor: typeof import("node:worker_threads").Worker;
+  try {
+    ({ Worker: WorkerCtor } = await import("node:worker_threads"));
+  } catch {
+    return matchLinesSyncBounded(source, lines, cap, budgetMs);
+  }
+  let worker: import("node:worker_threads").Worker;
+  try {
+    worker = new WorkerCtor(BGGREP_WORKER_SOURCE, {
+      eval: true,
+      workerData: { source, lines, cap },
+    });
+  } catch {
+    return matchLinesSyncBounded(source, lines, cap, budgetMs);
+  }
+  return new Promise<GrepMatchOutcome>((resolve) => {
+    let settled = false;
+    const finish = (outcome: GrepMatchOutcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.removeAllListeners();
+      // Swallow a late 'error' emitted after listeners are dropped, or it
+      // becomes an unhandled emitter throw on the way to terminate().
+      worker.on("error", () => {});
+      void worker.terminate();
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => finish({ kind: "timeout" }), budgetMs);
+    worker.on(
+      "message",
+      (msg: { ok: boolean; matches?: number[]; message?: string }) => {
+        finish(
+          msg.ok
+            ? { kind: "ok", matchIdx: msg.matches ?? [] }
+            : { kind: "invalid", message: msg.message ?? "invalid pattern" },
+        );
+      },
+    );
+    worker.on("error", (err) =>
+      finish({ kind: "invalid", message: err.message }),
+    );
+    worker.on("exit", (code) => {
+      // Any exit before a message is a failure — including exit 0, which would
+      // otherwise linger until the budget and be misreported as a timeout.
+      if (!settled) {
+        finish({
+          kind: "invalid",
+          message: `grep worker exited with code ${code} before a result`,
+        });
+      }
+    });
+  });
+}
+
 // Default regex for bggrep when the caller passes no pattern: common failure
 // signatures across test runners and build tools. ONLY a convenience default —
 // bggrep's contract is that the caller's own pattern always wins, because a
 // generic default on arbitrary tools/languages misses more than it catches.
 export const DEFAULT_GREP_PATTERN =
   "--- FAIL:|^FAIL\\b|^panic:|fatal error:|AssertionError|Error:|error:|make: \\*\\*\\*.*Error|✗|✖";
+
+function readLogSlice(
+  logPath: string,
+  maxBytes: number,
+): { content: string; truncated: boolean; size: number } | null {
+  try {
+    const st = statSync(logPath);
+    const size = st.size;
+    if (size === 0) return { content: "", truncated: false, size: 0 };
+    const readLen = Math.min(size, maxBytes);
+    const fd = openSync(logPath, "r");
+    try {
+      const buf = Buffer.alloc(readLen);
+      // Honor the byte count: a short read (file rotated/truncated between stat
+      // and read) would otherwise leave the buffer's tail zero-filled and leak
+      // NUL bytes into bgtail/bggrep output.
+      const n = readSync(fd, buf, 0, readLen, size - readLen);
+      return {
+        content: (n < readLen ? buf.subarray(0, n) : buf).toString("utf8"),
+        truncated: readLen < size,
+        size,
+      };
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function parseExitFromContent(content: string): number | null {
+  const lines = content.split("\n").filter((l) => l.startsWith(EXIT_MARKER));
+  if (lines.length === 0) return null;
+  const match = lines[lines.length - 1].match(/^__BGRUN_EXIT__=(-?\d+)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+export function parseExitFromLogPath(logPath: string): number | null {
+  const slice = readLogSlice(logPath, LOG_TAIL_BYTES);
+  if (!slice) return null;
+  return parseExitFromContent(slice.content);
+}
+
+function readLastLogLine(logPath: string, maxLen = 200): string | null {
+  const slice = readLogSlice(logPath, LOG_TAIL_BYTES);
+  if (!slice) return null;
+  return readLastLineFromContent(slice.content, maxLen);
+}
+
+function readLastLineFromContent(content: string, maxLen = 200): string | null {
+  const lines = content.split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return null;
+  const real = lines.filter((l) => !l.startsWith(EXIT_MARKER));
+  const last = real[real.length - 1] ?? lines[lines.length - 1];
+  return last.length > maxLen ? last.slice(0, maxLen) + "…" : last;
+}
+
+function validateJobId(id: string, tool: string): void {
+  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
+    throw new Error(`${tool}: invalid job id ${JSON.stringify(id)}`);
+  }
+}
+
+function isRunningPid(pid: number): boolean {
+  if (pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // EPERM means the process exists but we can't signal it — treat as alive.
+    return code === "EPERM";
+  }
+}
+
+function pidFromId(id: string): number | null {
+  const parts = id.split("-");
+  const pid = parseInt(parts[parts.length - 1], 10);
+  return Number.isFinite(pid) ? pid : null;
+}
+
+// One entry per *.log in a jobs dir, with the derived state every caller needs
+// (finish marker, owning pid + liveness, timestamps). This is the single scan
+// used by cleanup, foreign-job adoption, and bgstatus — they used to each
+// re-implement the readdir/filter/parse/pid dance and drifted apart.
+interface ScannedLogFile {
+  id: string;
+  logPath: string;
+  pid: number | null; // pid encoded in the id's last segment
+  alive: boolean; // pid > 0 and signalable (or EPERM)
+  mtimeMs: number;
+  birthtimeMs: number;
+}
+
+interface ScannedLog extends ScannedLogFile {
+  exit: number | null; // parsed __BGRUN_EXIT__ marker, null while running
+}
+
+// The scan WITHOUT the exit-marker read. Exit parsing needs a tail read of the
+// file, so callers that can filter by mtime first (cleanup) use this and pay
+// for the read only on files they may actually act on.
+function scanLogFiles(jobsDir: string): ScannedLogFile[] {
+  let names: string[];
+  try {
+    names = readdirSync(jobsDir);
+  } catch {
+    return []; // jobs dir doesn't exist — nothing to scan
+  }
+  const out: ScannedLogFile[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".log")) continue;
+    // .tmp-*.log is the pre-rename staging file (see the spawn path). It is
+    // never a job — a crashed spawn can leave one behind; sweepStaleMarkers
+    // reclaims it.
+    if (name.startsWith(".tmp-")) continue;
+    const logPath = join(jobsDir, name);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(logPath);
+    } catch {
+      continue; // vanished between readdir and stat
+    }
+    const pid = pidFromId(name.slice(0, -".log".length));
+    out.push({
+      id: name.slice(0, -".log".length),
+      logPath,
+      pid,
+      alive: pid !== null && pid > 0 && isRunningPid(pid),
+      mtimeMs: st.mtimeMs,
+      birthtimeMs: st.birthtimeMs,
+    });
+  }
+  return out;
+}
+
+// The full scan (exit marker resolved) for callers that need finished/running
+// state for every entry.
+function scanJobsDir(jobsDir: string): ScannedLog[] {
+  return scanLogFiles(jobsDir).map((e) => ({
+    ...e,
+    exit: parseExitFromLogPath(e.logPath),
+  }));
+}
+
+// Redact obvious credential values before they reach a filename, widget, or
+// status line. The raw command still appears in the wake message (needed for
+// context), but the persisted job id / slug is a much longer-lived leak
+// channel (it survives in filenames and `bgstatus` output for cleanupDays).
+// ── Secret redaction for slugs ─────────────────────────────────────────────
+// A job id becomes a filename, and filenames get listed, shared, and scraped.
+// Commands routinely embed credentials, so redact values BEFORE they reach a
+// slug. This deliberately errs toward over-redaction: a mangled slug is
+// cosmetic, a leaked token is not.
+
+// Secret-ish key words, matched as a substring of a longer key (GH_TOKEN,
+// AWS_SECRET_ACCESS_KEY, DB_PASSWORD) with a trailing non-letter guard so
+// "author"/"designer" are not mistaken for "auth"/"sig".
+const SECRET_KEY_WORDS =
+  "authorization|pass(?:word|wd|phrase)?|passw(?:or)?d|secret|token|" +
+  "api[-_]?key|apikey|access[-_]?key|private[-_]?key|client[-_]?secret|" +
+  "credential(?:s)?|session[-_]?id|signature|pwd|bearer|auth";
+// A key: optional surrounding word chars/dots/dashes, then a secret word.
+const SECRET_KEY = String.raw`[A-Za-z0-9_.-]*(?:${SECRET_KEY_WORDS})(?![A-Za-z])`;
+// A value: a quoted string, a `scheme credential` pair ("Bearer abc"), or a
+// bare token. The scheme form is tried first so the credential after it is
+// consumed too — otherwise "Authorization: Bearer abc" redacts only "Bearer".
+const SECRET_VALUE = String.raw`(?:'[^']*'|"[^"]*"|(?:bearer|basic|token|digest)\s+\S+|\S+)`;
+const SECRET_ASSIGN_RE = new RegExp(
+  String.raw`(${SECRET_KEY})["']?\s*[:=]\s*["']?${SECRET_VALUE}`,
+  "gi",
+);
+const SECRET_FLAG_RE = new RegExp(
+  String.raw`(^|\s)(-{1,2}${SECRET_KEY})(\s*[:=]\s*|\s+)["']?${SECRET_VALUE}`,
+  "gi",
+);
+
+export function redactForSlug(command: string): string {
+  return (
+    command
+      // Header arguments: -H stays CASE-SENSITIVE (so a lower-case `-h`/help
+      // flag is never mangled); --header is case-insensitive. The whole
+      // argument is consumed — any header can carry a token.
+      .replace(/(^|\s)-H(=|\s+)('[^']*'|"[^"]*"|\S+)/g, "$1-H$2-REDACTED")
+      .replace(
+        /(^|\s)--header(=|\s+)('[^']*'|"[^"]*"|\S+)/gi,
+        "$1--header$2-REDACTED",
+      )
+      // curl -u user:pass / --user user:pass (only when it looks like a pair,
+      // so unrelated flags like `sort -u` are left alone).
+      .replace(/(^|\s)-u(\s+)([^\s:]+:[^\s]+)/g, "$1-u$2-REDACTED")
+      .replace(/(^|\s)--user(\s+)([^\s:]+:[^\s]+)/g, "$1--user$2-REDACTED")
+      // URL userinfo: scheme://user:pass@host.
+      .replace(/([a-z][a-z0-9+.-]*:\/\/)([^\s/@]+)@/gi, "$1-REDACTED@")
+      // KEY=value / KEY: value, including quoted JSON ("password":"x").
+      .replace(SECRET_ASSIGN_RE, "$1-REDACTED")
+      // --flag value / --flag=value / --flag: value.
+      .replace(SECRET_FLAG_RE, "$1$2-REDACTED")
+  );
+}
+
+function resolveGitCommonDir(gitDir: string): string {
+  const commonFile = join(gitDir, "commondir");
+  if (!existsSync(commonFile)) return gitDir;
+  try {
+    const rel = readFileSync(commonFile, "utf8").trim();
+    return isAbsolute(rel) ? rel : join(gitDir, rel);
+  } catch {
+    return gitDir;
+  }
+}
+
+function ensureJobsDirMarker(jobsDir: string): void {
+  try {
+    mkdirSync(jobsDir, { recursive: true });
+    const marker = join(jobsDir, JOBS_DIR_MARKER);
+    if (!existsSync(marker)) writeFileSync(marker, "");
+  } catch {
+    // best-effort
+  }
+}
+
+function logReadError(id: string, logPath: string): string {
+  if (existsSync(logPath)) {
+    return `Log for job ${id} at ${logPath} exists but could not be read (file may be too large or unreadable)`;
+  }
+  return `No log found for job ${id} at ${logPath}`;
+}
 
 // ── Configuration ───────────────────────────────────────────────────────────
 //
@@ -152,12 +511,23 @@ function parseBoolEnv(v: string | undefined): boolean | undefined {
 }
 
 function readConfigFile(path: string): BgrunConfigFile {
+  let text: string;
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8"));
+    text = readFileSync(path, "utf8");
+  } catch {
+    return {}; // missing — normal, not an error
+  }
+  try {
+    const raw = JSON.parse(text);
     if (raw && typeof raw === "object" && !Array.isArray(raw))
       return raw as BgrunConfigFile;
-  } catch {
-    // missing or malformed — treat as empty
+    console.error(
+      `[pi-bgrun] config ${path} is not a JSON object — ignoring its contents`,
+    );
+  } catch (err) {
+    console.error(
+      `[pi-bgrun] config ${path} is malformed JSON (${(err as Error).message}) — ignoring its contents`,
+    );
   }
   return {};
 }
@@ -297,6 +667,7 @@ function appendExcludePattern(
     if (!m) return false; // unparseable .git file — retry later
     gitDir = m[1].trim();
   }
+  gitDir = resolveGitCommonDir(gitDir);
   const rel = relative(repoRoot, jobsDir);
   // Defense-in-depth: the walk-up guarantees jobsDir sits under repoRoot, but
   // a future caller or symlinked path could break that — ../-prefixed
@@ -505,12 +876,16 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
 export function resolveConfig(ctx?: {
   cwd?: string;
   isProjectTrusted?: () => boolean;
+  // Test seam: os.homedir() caches in some runtimes, so tests inject the user
+  // config path instead of mutating HOME.
+  userConfigPath?: string;
 }): BgrunConfig {
-  // User config: $HOME/.pi/agent/pi-bgrun.json, overridable via
-  // PI_BGRUN_USER_CONFIG (mirrors the PI_BGRUN_DIR escape hatch — mainly for
-  // tests, which cannot swap the real home dir).
+  // User config: $HOME/.pi/agent/pi-bgrun.json. Overridable by an explicit
+  // test seam (ctx.userConfigPath) and by PI_BGRUN_USER_CONFIG (mirrors the
+  // PI_BGRUN_DIR escape hatch — mainly for tests, which cannot swap home).
   const user = readConfigFile(
-    process.env.PI_BGRUN_USER_CONFIG ||
+    ctx?.userConfigPath ??
+      process.env.PI_BGRUN_USER_CONFIG ??
       join(homedir(), ".pi", "agent", "pi-bgrun.json"),
   );
   let project: BgrunConfigFile = {};
@@ -652,6 +1027,7 @@ interface JobRecord {
   logPath: string;
   exitedAt?: number;
   exitCode?: number;
+  donePersisted?: boolean; // done entry already appended to the transcript
   child?: ReturnType<typeof spawn>; // absent for adopted (fs-discovered) jobs
   ctx: ExtensionContext; // captured at tool-call time for isIdle() in the exit handler
   adopted?: boolean; // true when discovered from the jobs dir (another session's job)
@@ -683,16 +1059,6 @@ interface BgStatusDetails {
   recovered?: boolean;
 }
 
-function isRunningPid(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM means the process exists but we can't signal it — still alive.
-    return (err as NodeJS.ErrnoException)?.code === "EPERM";
-  }
-}
-
 export default function (pi: ExtensionAPI) {
   const jobs = new Map<string, JobRecord>();
   // Poller for stale job records — anything running with no live ChildProcess
@@ -704,7 +1070,7 @@ export default function (pi: ExtensionAPI) {
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   function makeSlug(command: string): string {
-    const raw = command
+    const raw = redactForSlug(command)
       .toLowerCase()
       .replace(/[/\\.-]+/g, " ")
       .trim();
@@ -715,9 +1081,14 @@ export default function (pi: ExtensionAPI) {
     return slug || "job";
   }
 
-  // Normalize an optional human-readable name: trim, drop blank, cap length.
+  // Normalize an optional human-readable name: strip control characters
+  // (newlines, tabs, escape/ANSI bytes) so a name can never forge extra lines
+  // in the wake, widget, toast, or transcript; collapse whitespace; cap length.
   function sanitizeName(name: string | undefined): string | undefined {
-    const trimmed = (name ?? "").trim();
+    const trimmed = (name ?? "")
+      .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
     if (!trimmed) return undefined;
     return trimmed.slice(0, 80);
   }
@@ -726,19 +1097,6 @@ export default function (pi: ExtensionAPI) {
   // bgrun param and the config `type` truncate identically (see MAX_TYPE_LEN).
   function sanitizeType(type: string | undefined): string | undefined {
     return normalizeType(type);
-  }
-
-  function readLastLogLine(logPath: string, maxLen = 200): string | null {
-    try {
-      const content = readFileSync(logPath, "utf8");
-      const lines = content.split("\n").filter((l) => l.trim().length > 0);
-      if (lines.length === 0) return null;
-      const real = lines.filter((l) => !l.startsWith(EXIT_MARKER));
-      const last = real[real.length - 1] ?? lines[lines.length - 1];
-      return last.length > maxLen ? last.slice(0, maxLen) + "…" : last;
-    } catch {
-      return null;
-    }
   }
 
   // Count the log's total lines with a bounded-memory streaming scan (one
@@ -793,32 +1151,14 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function parseExitFromLog(logPath: string): number | null {
-    try {
-      const content = readFileSync(logPath, "utf8");
-      const lines = content
-        .split("\n")
-        .filter((l) => l.startsWith(EXIT_MARKER));
-      if (lines.length === 0) return null;
-      const match = lines[lines.length - 1].match(/^__BGRUN_EXIT__=(\d+)/);
-      return match ? parseInt(match[1], 10) : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function pidFromId(id: string): number | null {
-    // id format: <slug>-<ts>-<pid>
-    const parts = id.split("-");
-    const pid = parseInt(parts[parts.length - 1], 10);
-    return Number.isFinite(pid) ? pid : null;
-  }
-
   // ── Live status widget ────────────────────────────────────────────────────
 
-  function updateWidget(ctx: ExtensionContext): void {
+  function updateWidget(
+    ctx: ExtensionContext,
+    opts: { persistRevalidate?: boolean } = {},
+  ): void {
     if (!ctx.hasUI) return;
-    revalidateStaleJobs();
+    revalidateStaleJobs({ persist: opts.persistRevalidate ?? true });
     const running: JobRecord[] = [];
     for (const rec of jobs.values()) {
       if (rec.exitCode === undefined) running.push(rec);
@@ -831,11 +1171,10 @@ export default function (pi: ExtensionAPI) {
     for (const rec of running) {
       const startedAt = formatSince(rec.started);
       const cmd = rec.cmd.length > 40 ? rec.cmd.slice(0, 37) + "…" : rec.cmd;
-      const label = rec.name ? `${rec.name} · ${cmd}` : cmd.padEnd(40);
+      const label = rec.name ? `${rec.name} · ${cmd}` : cmd;
       const tag = rec.adopted ? " (adopted)" : "";
-      lines.push(
-        `  ${rec.id.slice(0, 20)}  ${label}  (since ${startedAt})${tag}`,
-      );
+      // Full id (not truncated) so it can be copied straight into /bgtail <id>.
+      lines.push(`  ${rec.id}  ${label}  (since ${startedAt})${tag}`);
     }
     ctx.ui.setWidget("bgrun", lines);
   }
@@ -856,7 +1195,10 @@ export default function (pi: ExtensionAPI) {
     for (const name of names) {
       if (
         !name.startsWith(".bgrun-used-") &&
-        !name.startsWith(".digest-nudge-")
+        !name.startsWith(".digest-nudge-") &&
+        // Only OUR staging files (`.tmp-<slug>-<ts>-<hex>.log`), never an
+        // unrelated `.tmp-*` that happens to live in the dir.
+        !(name.startsWith(".tmp-") && name.endsWith(".log"))
       )
         continue;
       try {
@@ -873,55 +1215,53 @@ export default function (pi: ExtensionAPI) {
     days: number,
     jobsDir: string,
     ctx?: ExtensionContext,
+    // The ownership marker protects the AUTOMATIC global sweep from deleting
+    // logs in an unrelated dir (a stray PI_BGRUN_DIR). An explicit
+    // `bgclean all` is the user's direct intent, so it bypasses the gate.
+    opts: { requireOwnership?: boolean } = {},
   ): { removed: number; kept: number; skippedRunning: number } {
     const result = { removed: 0, kept: 0, skippedRunning: 0 };
-    let entries: string[];
-    try {
-      entries = readdirSync(jobsDir);
-    } catch {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    if (
+      opts.requireOwnership !== false &&
+      !existsSync(join(jobsDir, JOBS_DIR_MARKER))
+    ) {
+      // Not recognizably ours — touch NOTHING, marker files included. The gate
+      // exists so a stray PI_BGRUN_DIR is never emptied.
       return result;
     }
-    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-    for (const name of entries) {
-      if (!name.endsWith(".log")) continue;
-      const logPath = join(jobsDir, name);
-      let st;
-      try {
-        st = statSync(logPath);
-      } catch {
-        continue;
-      }
-      // mtime check
-      if (st.mtimeMs > cutoff) {
+    // Past the gate: sweep our own stale per-project marker files.
+    sweepStaleMarkers(jobsDir, cutoff);
+    for (const entry of scanLogFiles(jobsDir)) {
+      // mtime check FIRST — exit parsing costs a tail read, so only files old
+      // enough to be swept pay for it.
+      if (entry.mtimeMs > cutoff) {
         result.kept++;
         continue;
       }
-      const id = name.slice(0, -".log".length);
       // Exit marker is the authoritative finished signal — check it BEFORE pid
       // liveness, so completed jobs are never mistaken for running (pid reuse
       // and shared pids made the old order keep stale jobs forever).
-      const finished = parseExitFromLog(logPath) !== null;
-      if (!finished) {
+      const exit = parseExitFromLogPath(entry.logPath);
+      if (exit === null) {
         // No marker yet — running only if the pid is alive.
-        const rec = jobs.get(id);
+        const rec = jobs.get(entry.id);
         if (rec && rec.exitCode === undefined) {
           result.skippedRunning++;
           continue;
         }
-        const pid = pidFromId(id);
-        if (pid !== null && pid > 0 && isRunningPid(pid)) {
+        if (entry.alive) {
           result.skippedRunning++;
           continue;
         }
       }
       try {
-        unlinkSync(logPath);
+        unlinkSync(entry.logPath);
         result.removed++;
       } catch {
         // ignore
       }
     }
-    sweepStaleMarkers(jobsDir, cutoff);
     if (result.removed > 0 && ctx?.hasUI) {
       ctx.ui.notify(`bgrun: cleaned ${result.removed} old job log(s)`, "info");
     }
@@ -940,15 +1280,25 @@ export default function (pi: ExtensionAPI) {
     const result = { removed: 0, kept: 0, skippedRunning: 0 };
     const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
     for (const rec of jobs.values()) {
+      // Adopted foreign jobs belong to another session — this session neither
+      // owns nor reports on them (counting them as "skipped running" was
+      // misleading).
+      if (rec.adopted) continue;
       if (rec.exitCode === undefined) {
         result.skippedRunning++;
         continue;
       }
-      let st;
+      let st: ReturnType<typeof statSync>;
       try {
         st = statSync(rec.logPath);
       } catch {
-        continue; // already gone
+        // Log already gone (cleaned by a global sweep). Drop the in-memory
+        // record once it's past retention so finished jobs can't pin the Map
+        // (and its ExtensionContext) for the life of the process.
+        if (rec.exitedAt !== undefined && rec.exitedAt < cutoff) {
+          jobs.delete(rec.id);
+        }
+        continue;
       }
       if (st.mtimeMs > cutoff) {
         result.kept++;
@@ -957,6 +1307,7 @@ export default function (pi: ExtensionAPI) {
       try {
         unlinkSync(rec.logPath);
         result.removed++;
+        jobs.delete(rec.id);
       } catch {
         // ignore
       }
@@ -1051,10 +1402,43 @@ export default function (pi: ExtensionAPI) {
   //    session's history; the log on disk still covers id lookup + cleanup).
   //  - Reconstructed jobs ARE this session's history: mark them done and
   //    append a done entry so future resumes reconstruct them as done too.
-  function revalidateStaleJobs(): void {
+  // `persist: false` is for read-only callers (bgstatus): they still need an
+  // accurate view, but asking for status must not append transcript cards.
+  // The stale poller / session_start re-run with persistence and reconcile.
+  function persistDoneEntry(rec: JobRecord, exit: number): void {
+    rec.donePersisted = true;
+    pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
+      id: rec.id,
+      pid: rec.pid,
+      cmd: rec.cmd,
+      name: rec.name,
+      type: rec.type,
+      started: rec.started,
+      logPath: rec.logPath,
+      state: "done",
+      exitCode: exit >= 0 ? exit : undefined,
+      exitedAt: rec.exitedAt,
+    });
+  }
+
+  function revalidateStaleJobs(opts: { persist?: boolean } = {}): void {
+    const persist = opts.persist ?? true;
     for (const [id, rec] of jobs) {
-      if (rec.child || rec.exitCode !== undefined) continue;
-      let exit = parseExitFromLog(rec.logPath);
+      if (rec.child) continue;
+      if (rec.exitCode !== undefined) {
+        // Already reconciled. A read-only pass (bgstatus, persist:false) sets
+        // exitCode WITHOUT persisting, so a later persisting pass must still
+        // write the done entry — otherwise the transcript card stays "running"
+        // for the rest of the session.
+        if (persist && !rec.donePersisted && !rec.adopted) {
+          persistDoneEntry(rec, rec.exitCode);
+        }
+        continue;
+      }
+      let exit = parseExitFromLogPath(rec.logPath);
+      if (exit === null && rec.pid <= 0) {
+        exit = -1;
+      }
       if (exit === null && rec.pid > 0 && !isRunningPid(rec.pid)) {
         // pid gone with no marker — killed/crashed before the wrapper could write it,
         // or the log was already cleaned up
@@ -1066,18 +1450,7 @@ export default function (pi: ExtensionAPI) {
       } else {
         rec.exitCode = exit;
         rec.exitedAt = Date.now();
-        pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
-          id: rec.id,
-          pid: rec.pid,
-          cmd: rec.cmd,
-          name: rec.name,
-          type: rec.type,
-          started: rec.started,
-          logPath: rec.logPath,
-          state: "done",
-          exitCode: exit >= 0 ? exit : undefined,
-          exitedAt: rec.exitedAt,
-        });
+        if (persist) persistDoneEntry(rec, exit);
       }
     }
   }
@@ -1215,34 +1588,19 @@ export default function (pi: ExtensionAPI) {
     const cfg = resolveConfig(ctx);
     const jobsDir = cfg.jobsDir;
     if (cfg.adoptForeignJobs) {
-      try {
-        for (const name of readdirSync(jobsDir)) {
-          if (!name.endsWith(".log")) continue;
-          const id = name.slice(0, -".log".length);
-          if (jobs.has(id)) continue;
-          const logPath = join(jobsDir, name);
-          const exit = parseExitFromLog(logPath);
-          if (exit !== null) continue; // finished — nothing to show in the widget
-          const pid = pidFromId(id);
-          if (pid === null || pid <= 0 || !isRunningPid(pid)) continue; // dead pid, marker just not written yet
-          let started = Date.now();
-          try {
-            started = statSync(logPath).birthtimeMs;
-          } catch {
-            // keep fallback
-          }
-          jobs.set(id, {
-            id,
-            pid,
-            cmd: "(started by another session)",
-            started,
-            logPath,
-            ctx,
-            adopted: true,
-          });
-        }
-      } catch {
-        // jobs dir doesn't exist — nothing to adopt.
+      for (const entry of scanJobsDir(jobsDir)) {
+        if (jobs.has(entry.id)) continue;
+        if (entry.exit !== null) continue; // finished — nothing to show in the widget
+        if (!entry.alive) continue; // dead pid, marker just not written yet
+        jobs.set(entry.id, {
+          id: entry.id,
+          pid: entry.pid ?? -1,
+          cmd: "(started by another session)",
+          started: entry.birthtimeMs || Date.now(),
+          logPath: entry.logPath,
+          ctx,
+          adopted: true,
+        });
       }
     }
 
@@ -1328,6 +1686,7 @@ export default function (pi: ExtensionAPI) {
       if (cfg.jobsDirProjectLocal) ensureGitExcluded(cfg.jobsDir);
       const jobsDir = cfg.jobsDir;
       mkdirSync(jobsDir, { recursive: true });
+      ensureJobsDirMarker(jobsDir);
       // Evidence-of-use marker (best-effort): lets the digest nudge tell that
       // THIS project has run bgrun, without scanning the shared jobs dir.
       try {
@@ -1343,213 +1702,274 @@ export default function (pi: ExtensionAPI) {
       const ts = Math.floor(Date.now() / 1000);
       // The id must carry the CHILD's pid (liveness checks depend on it), but the
       // log fd must exist before spawn. Create at a temp path, rename after spawn.
+      // randomBytes (not Math.random) plus O_EXCL: the temp name is not
+      // guessable and a pre-planted symlink cannot be truncated through.
       const tmpPath = join(
         jobsDir,
-        `.tmp-${slug}-${ts}-${Math.random().toString(36).slice(2, 8)}.log`,
+        `.tmp-${slug}-${ts}-${randomBytes(4).toString("hex")}.log`,
       );
-      let logFd: number;
+      let logFd: number | undefined;
+      let logPath = tmpPath;
       try {
-        logFd = openSync(tmpPath, "w");
+        // 0600: job logs can contain secrets pulled from the environment.
+        logFd = openSync(tmpPath, "wx", 0o600);
       } catch (err) {
         throw new Error(
           `bgrun: cannot create log file: ${(err as Error).message}`,
         );
       }
-      const wrapped = `${command}; ec=$?; printf '\\n${EXIT_MARKER}%d\\n' "$ec"; exit $ec`;
-
-      const child = spawn("sh", ["-c", wrapped], {
-        stdio: ["ignore", logFd, logFd],
-        detached: true,
-      });
-      child.unref();
-
-      const childPid = child.pid ?? -1;
-      const id = `${slug}-${ts}-${childPid}`;
-      const logPath = join(jobsDir, `${id}.log`);
       try {
-        renameSync(tmpPath, logPath);
-      } catch (err) {
-        console.error(
-          `[pi-bgrun] rename to final log path failed:`,
-          (err as Error).message,
-        );
-      }
+        // Pass command as argv — interpolation breaks on #, quotes, heredocs.
+        const wrapper = `sh -c "$1"; ec=$?; printf '\\n${EXIT_MARKER}%d\\n' "$ec"; exit "$ec"`;
+        const child = spawn("sh", ["-c", wrapper, "bgrun", command], {
+          stdio: ["ignore", logFd, logFd],
+          detached: true,
+        });
+        child.unref();
 
-      const record: JobRecord = {
-        id,
-        pid: childPid,
-        cmd: command,
-        name,
-        type,
-        started: Date.now(),
-        logPath,
-        child,
-        ctx,
-      };
-      jobs.set(id, record);
+        const childPid = child.pid ?? -1;
+        const id = `${slug}-${ts}-${childPid}`;
+        const finalLogPath = join(jobsDir, `${id}.log`);
+        try {
+          renameSync(tmpPath, finalLogPath);
+          logPath = finalLogPath;
+        } catch (err) {
+          console.error(
+            `[pi-bgrun] rename to final log path failed:`,
+            (err as Error).message,
+          );
+        }
 
-      // Persist a bgrun-job entry (running state) — transcript card + restart recovery.
-      pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
-        id,
-        pid: childPid,
-        cmd: command,
-        name,
-        type,
-        started: Date.now(),
-        logPath,
-        state: "running",
-      });
+        const record: JobRecord = {
+          id,
+          pid: childPid,
+          cmd: command,
+          name,
+          type,
+          started: Date.now(),
+          logPath,
+          child,
+          ctx,
+        };
+        jobs.set(id, record);
 
-      closeSync(logFd);
-
-      updateWidget(ctx);
-
-      // ── exit handler: record exit, persist done entry, wake, notify, widget ─
-      child.on("exit", async (code, signal) => {
-        const rec = jobs.get(id);
-        if (!rec) return;
-        rec.exitedAt = Date.now();
-        rec.exitCode = code ?? -1;
-        delete rec.child; // release the handle reference
-
-        const exitCode = code ?? parseExitFromLog(logPath) ?? -1;
-        const exitStr =
-          exitCode >= 0 ? String(exitCode) : `signal ${signal ?? "?"}`;
-        const exitEmoji = exitCode === 0 ? "✅" : "❌";
-        const lastLine = readLastLogLine(logPath);
-
-        // Universal stats — duration + log line count. Non-heuristic, always
-        // present, never pattern-based. A missing log contributes no line
-        // count (duration is always known).
-        const logLines = countLogLines(logPath);
-        const statsParts = [formatDuration(rec.exitedAt - rec.started)];
-        if (logLines !== null)
-          statsParts.push(`${logLines.toLocaleString("en-US")} lines`);
-
-        // Persist the done-state entry.
+        // Persist a bgrun-job entry (running state) — transcript card + restart recovery.
         pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
           id,
-          pid: rec.pid,
-          cmd: rec.cmd,
-          name: rec.name,
-          type: rec.type,
-          started: rec.started,
+          pid: childPid,
+          cmd: command,
+          name,
+          type,
+          started: Date.now(),
           logPath,
-          state: "done",
-          exitCode: exitCode >= 0 ? exitCode : undefined,
-          exitedAt: rec.exitedAt,
+          state: "running",
         });
 
-        // Opt-in project-config digest (best-effort, silent-fail). rec.ctx is
-        // the ExtensionContext captured at tool-call time and retains
-        // everything resolveConfig needs (cwd + isProjectTrusted), so the
-        // digest config is resolved here at exit — config edits made while the
-        // job ran are picked up, and trust is evaluated against the same
-        // session that spawned the job. No spawn-time capture needed. When a
-        // digest is configured, the wake is sent only after this bounded
-        // attempt (≤ ~5.25s: 5s timeout + 250ms kill grace) completes; a digest
-        // that fails, times out, or prints
-        // nothing appends nothing, and the exit code / universal part above are
-        // never affected.
-        let digestBlock: { label: string; text: string } | undefined;
-        try {
-          // First matching entry wins, in config order. The label defaults to
-          // the entry's label, the entry's type, a matched `match.name`, then
-          // the entry's preset id (or "command").
-          const digestEntries = resolveConfig(rec.ctx).digest;
-          const digestTarget: DigestJobTarget = {
+        updateWidget(ctx);
+
+        const finishSpawnFailure = (err: Error) => {
+          const rec = jobs.get(id);
+          if (!rec || rec.exitCode !== undefined) return;
+          rec.exitedAt = Date.now();
+          rec.exitCode = -1;
+          rec.donePersisted = true;
+          delete rec.child;
+          try {
+            appendFileSync(
+              rec.logPath,
+              `\n[pi-bgrun] spawn failed: ${err.message}\n${EXIT_MARKER}-1\n`,
+            );
+          } catch {
+            // best-effort
+          }
+          pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
+            id,
+            pid: rec.pid,
+            cmd: rec.cmd,
             name: rec.name,
-            type: rec.type,
-            command: rec.cmd,
-          };
-          const selected = selectDigestEntry(digestEntries, digestTarget);
-          if (selected) {
-            const raw = await runDigestCommand(selected.command, logPath);
-            const text = raw === undefined ? undefined : capDigestOutput(raw);
-            if (text) digestBlock = { label: selected.label, text };
-          } else if (digestEntries?.length) {
-            // Configured but nothing selected — otherwise silent. Surface the
-            // job's type/name plus the configured types, once per distinct
-            // diagnostic (capped), so a type mismatch or dead glob is visible.
-            const warning = digestNoMatchWarning(digestTarget, digestEntries);
-            if (!digestNoMatchWarned.has(warning)) {
-              if (digestNoMatchWarned.size < DIGEST_NO_MATCH_WARN_CAP) {
-                digestNoMatchWarned.add(warning);
-                console.error(warning);
-              } else if (!digestNoMatchSuppressed) {
-                // Don't silently drop further distinct mismatches.
-                digestNoMatchSuppressed = true;
-                console.error(
-                  `[pi-bgrun] further digest no-match diagnostics suppressed (cap ${DIGEST_NO_MATCH_WARN_CAP})`,
-                );
-              }
+            started: rec.started,
+            logPath: rec.logPath,
+            state: "done",
+            exitCode: -1,
+            exitedAt: rec.exitedAt,
+          });
+          const namePrefix = rec.name ? `"${rec.name}" ` : "";
+          const wake =
+            `❌ Background job ${namePrefix}\`${id}\` failed to start: ${err.message}\n` +
+            `Command: ${command}`;
+          try {
+            if (rec.ctx.isIdle()) pi.sendUserMessage(wake);
+            else pi.sendUserMessage(wake, { deliverAs: "followUp" });
+          } catch {
+            try {
+              pi.sendUserMessage(wake, { deliverAs: "followUp" });
+            } catch (e2) {
+              console.error(
+                `[pi-bgrun] wake failed for job ${id}:`,
+                (e2 as Error).message,
+              );
             }
           }
-        } catch (e) {
-          // Silent-fail: a broken digest never breaks a wake (ground rule 3).
-          console.error(
-            `[pi-bgrun] digest failed for job ${id}:`,
-            (e as Error).message,
-          );
-        }
-
-        // Wake the agent.
-        const namePrefix = rec.name ? `"${rec.name}" ` : "";
-        let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
-        wake += `Command: ${command}\n`;
-        wake += `Stats: ${statsParts.join(", ")}\n`;
-        if (lastLine) wake += `Last output: ${lastLine}\n`;
-        if (digestBlock) {
-          wake += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
-        }
-        wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
-        try {
-          if (rec.ctx.isIdle()) {
-            pi.sendUserMessage(wake);
-          } else {
-            pi.sendUserMessage(wake, { deliverAs: "followUp" });
-          }
-        } catch {
-          try {
-            pi.sendUserMessage(wake, { deliverAs: "followUp" });
-          } catch (e2) {
-            console.error(
-              `[pi-bgrun] wake failed for job ${id}:`,
-              (e2 as Error).message,
+          if (rec.ctx.hasUI) {
+            rec.ctx.ui.notify(
+              `❌ ${(rec.name ?? command).slice(0, 50)} → spawn failed`,
+              "error",
             );
           }
-        }
+          updateWidget(rec.ctx);
+        };
 
-        // Toast for the human.
-        if (rec.ctx.hasUI) {
-          const toastLabel = (rec.name ?? command).slice(0, 50);
-          rec.ctx.ui.notify(
-            `${exitEmoji} ${toastLabel} → exit ${exitStr}`,
-            exitCode === 0 ? "info" : "error",
-          );
-        }
+        // ── exit handler: record exit, persist done entry, wake, notify, widget ─
+        child.on("exit", async (code, signal) => {
+          const rec = jobs.get(id);
+          if (!rec) return;
+          rec.exitedAt = Date.now();
+          rec.exitCode = code ?? -1;
+          // Set BEFORE the digest await: without it a read-only bgstatus in
+          // that window could append a second done entry.
+          rec.donePersisted = true;
+          delete rec.child; // release the handle reference
 
-        // Update/clear the widget.
-        updateWidget(rec.ctx);
-      });
+          const exitCode = code ?? parseExitFromLogPath(logPath) ?? -1;
+          const exitStr =
+            exitCode >= 0 ? String(exitCode) : `signal ${signal ?? "?"}`;
+          const exitEmoji = exitCode === 0 ? "✅" : "❌";
+          const lastLine = readLastLogLine(logPath);
 
-      child.on("error", (err) => {
-        console.error(`[pi-bgrun] spawn error for job ${id}:`, err.message);
-        jobs.delete(id);
-        updateWidget(ctx);
-      });
+          // Universal stats — duration + log line count. Non-heuristic, always
+          // present, never pattern-based. A missing log contributes no line
+          // count (duration is always known).
+          const logLines = countLogLines(logPath);
+          const statsParts = [formatDuration(rec.exitedAt - rec.started)];
+          if (logLines !== null)
+            statsParts.push(`${logLines.toLocaleString("en-US")} lines`);
 
-      const startedLines = [`started: ${id}`];
-      if (name) startedLines.push(`  name: ${name}`);
-      if (type) startedLines.push(`  type: ${type}`);
-      startedLines.push(
-        `  log: ${logPath}`,
-        `  You'll be woken automatically when it finishes.`,
-      );
-      return {
-        content: [{ type: "text", text: startedLines.join("\n") }],
-        details: { id, name, type, logPath, pid: childPid },
-      };
+          // Persist the done-state entry.
+          pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
+            id,
+            pid: rec.pid,
+            cmd: rec.cmd,
+            name: rec.name,
+            type: rec.type,
+            started: rec.started,
+            logPath,
+            state: "done",
+            exitCode: exitCode >= 0 ? exitCode : undefined,
+            exitedAt: rec.exitedAt,
+          });
+
+          // Opt-in project-config digest (best-effort, silent-fail). rec.ctx is
+          // the ExtensionContext captured at tool-call time and retains
+          // everything resolveConfig needs (cwd + isProjectTrusted), so the
+          // digest config is resolved here at exit — config edits made while the
+          // job ran are picked up, and trust is evaluated against the same
+          // session that spawned the job. No spawn-time capture needed. When a
+          // digest is configured, the wake is sent only after this bounded
+          // attempt (≤ ~5.25s: 5s timeout + 250ms kill grace) completes; a digest
+          // that fails, times out, or prints
+          // nothing appends nothing, and the exit code / universal part above are
+          // never affected.
+          let digestBlock: { label: string; text: string } | undefined;
+          try {
+            // First matching entry wins, in config order. The label defaults to
+            // the entry's label, the entry's type, a matched `match.name`, then
+            // the entry's preset id (or "command").
+            const digestEntries = resolveConfig(rec.ctx).digest;
+            const digestTarget: DigestJobTarget = {
+              name: rec.name,
+              type: rec.type,
+              command: rec.cmd,
+            };
+            const selected = selectDigestEntry(digestEntries, digestTarget);
+            if (selected) {
+              const raw = await runDigestCommand(selected.command, logPath);
+              const text = raw === undefined ? undefined : capDigestOutput(raw);
+              if (text) digestBlock = { label: selected.label, text };
+            } else if (digestEntries?.length) {
+              // Configured but nothing selected — otherwise silent. Surface the
+              // job's type/name plus the configured types, once per distinct
+              // diagnostic (capped), so a type mismatch or dead glob is visible.
+              const warning = digestNoMatchWarning(digestTarget, digestEntries);
+              if (!digestNoMatchWarned.has(warning)) {
+                if (digestNoMatchWarned.size < DIGEST_NO_MATCH_WARN_CAP) {
+                  digestNoMatchWarned.add(warning);
+                  console.error(warning);
+                } else if (!digestNoMatchSuppressed) {
+                  // Don't silently drop further distinct mismatches.
+                  digestNoMatchSuppressed = true;
+                  console.error(
+                    `[pi-bgrun] further digest no-match diagnostics suppressed (cap ${DIGEST_NO_MATCH_WARN_CAP})`,
+                  );
+                }
+              }
+            }
+          } catch (e) {
+            // Silent-fail: a broken digest never breaks a wake (ground rule 3).
+            console.error(
+              `[pi-bgrun] digest failed for job ${id}:`,
+              (e as Error).message,
+            );
+          }
+
+          // Wake the agent.
+          const namePrefix = rec.name ? `"${rec.name}" ` : "";
+          let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
+          wake += `Command: ${command}\n`;
+          wake += `Stats: ${statsParts.join(", ")}\n`;
+          if (lastLine) wake += `Last output: ${lastLine}\n`;
+          if (digestBlock) {
+            wake += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
+          }
+          wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
+          try {
+            if (rec.ctx.isIdle()) {
+              pi.sendUserMessage(wake);
+            } else {
+              pi.sendUserMessage(wake, { deliverAs: "followUp" });
+            }
+          } catch {
+            try {
+              pi.sendUserMessage(wake, { deliverAs: "followUp" });
+            } catch (e2) {
+              console.error(
+                `[pi-bgrun] wake failed for job ${id}:`,
+                (e2 as Error).message,
+              );
+            }
+          }
+
+          // Toast for the human.
+          if (rec.ctx.hasUI) {
+            const toastLabel = (rec.name ?? command).slice(0, 50);
+            rec.ctx.ui.notify(
+              `${exitEmoji} ${toastLabel} → exit ${exitStr}`,
+              exitCode === 0 ? "info" : "error",
+            );
+          }
+
+          // Update/clear the widget.
+          updateWidget(rec.ctx);
+        });
+
+        child.on("error", (err) => {
+          console.error(`[pi-bgrun] spawn error for job ${id}:`, err.message);
+          finishSpawnFailure(err);
+        });
+
+        const startedLines = [`started: ${id}`];
+        if (name) startedLines.push(`  name: ${name}`);
+        if (type) startedLines.push(`  type: ${type}`);
+        startedLines.push(
+          `  log: ${logPath}`,
+          `  You'll be woken automatically when it finishes.`,
+        );
+        return {
+          content: [{ type: "text", text: startedLines.join("\n") }],
+          details: { id, name, type, logPath, pid: childPid },
+        };
+      } finally {
+        if (logFd !== undefined) closeSync(logFd);
+      }
     },
   });
 
@@ -1808,108 +2228,106 @@ export default function (pi: ExtensionAPI) {
     // tool schema, and lines < 1 would corrupt slicing (slice(-0) = whole log).
     const lines = Math.max(1, Math.floor(linesParam));
     if (!id) throw new Error("bgtail: id is required");
+    validateJobId(id, "bgtail");
     // Prefer this session's record: its logPath stays correct even if the
     // config (and thus the resolved jobs dir) changes mid-session — e.g. a
     // user switching to project-local logs right after upgrading.
     const logPath =
       jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
-    try {
-      const content = readFileSync(logPath, "utf8");
-      // Content lines only: the exit marker and blanks are filtered BEFORE the
-      // window is sliced, so "last N lines" means the last N content lines
-      // (matching pre-delta behavior) and bookmarks count content lines.
-      // /\r?\n/ keeps CRLF logs from leaving a stray \r on every line.
-      const rawLines = content
-        .split(/\r?\n/)
-        .filter((l) => !l.startsWith(EXIT_MARKER) && l.trim().length > 0);
-      const total = rawLines.length;
-      const first = rawLines[0]?.slice(0, 200) ?? "";
-      const prev = tailBookmarks.get(id);
-      // Append-only logs never mutate earlier lines, so a changed first
-      // content line means the log was replaced or rotated — reset to a full
-      // tail. Catches same-size replacements the shrink checks cannot see.
-      // (A previously-empty log growing content is growth, not replacement.)
-      const replaced =
-        prev !== undefined && prev.lines > 0 && prev.first !== first;
-      const shrank =
-        prev !== undefined &&
-        (prev.lines > total || prev.bytes > content.length);
-      let window: string[];
-      let header: string | undefined;
-      let newLines: number | undefined;
-      if (raw || prev === undefined || shrank || replaced) {
-        // Full tail: first read, raw mode, or a shrunken/replaced log (reset).
-        window = rawLines.slice(-lines);
-        if (!raw && (shrank || replaced)) {
-          header = shrank
-            ? "log shrank since last read — showing full tail"
-            : "log was replaced since last read — showing full tail";
-        }
-      } else {
-        const fresh = rawLines.slice(prev.lines);
-        newLines = fresh.length;
-        if (fresh.length === 0) {
-          tailBookmarks.set(id, {
-            lines: total,
-            bytes: content.length,
-            first,
-          });
-          return {
-            content: [
-              {
-                type: "text",
-                text: `(no new lines since last read — log at ${total} line${total === 1 ? "" : "s"})`,
-              },
-            ],
-            details: {
-              id,
-              linesShown: 0,
-              logPath,
-              notFound: false,
-              condensed: true,
-              newLines: 0,
-              totalLines: total,
-            },
-          };
-        }
-        window = fresh.length > lines ? fresh.slice(-lines) : fresh;
-        header =
-          `+${fresh.length} new line${fresh.length === 1 ? "" : "s"} since last read — ` +
-          `log at ${total} lines${fresh.length > lines ? ` (showing last ${lines})` : ""}`;
-      }
-      tailBookmarks.set(id, {
-        lines: total,
-        bytes: content.length,
-        first,
-      });
-      const shown = window;
-      const { text, truncated } = condenseLogLines(shown, { raw });
-      // Delta reads early-return above, so an empty window here can only be
-      // a first read of an empty log (full-tail path).
-      const body = shown.length === 0 ? "(empty log)" : text;
-      const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
-      const head = header ? `${header}\n` : "";
+    const slice = readLogSlice(logPath, LOG_READ_BYTES);
+    if (!slice) {
       return {
-        content: [{ type: "text", text: head + body + notes }],
-        details: {
-          id,
-          linesShown: shown.length,
-          logPath,
-          notFound: false,
-          condensed: !raw,
-          ...(newLines === undefined ? {} : { newLines, totalLines: total }),
-          ...(truncated.length > 0 ? { condenserNotes: truncated } : {}),
-        },
-      };
-    } catch {
-      return {
-        content: [
-          { type: "text", text: `No log found for job ${id} at ${logPath}` },
-        ],
-        details: { id, linesShown: 0, logPath, notFound: true },
+        content: [{ type: "text", text: logReadError(id, logPath) }],
+        details: { id, logPath, notFound: !existsSync(logPath) },
         isError: true,
       };
     }
+    const content = slice.content;
+    // Content lines only: the exit marker and blanks are filtered BEFORE the
+    // window is sliced, so "last N lines" means the last N content lines
+    // (matching pre-delta behavior) and bookmarks count content lines.
+    // /\r?\n/ keeps CRLF logs from leaving a stray \r on every line.
+    const rawLines = content
+      .split(/\r?\n/)
+      .filter((l) => !l.startsWith(EXIT_MARKER) && l.trim().length > 0);
+    const total = rawLines.length;
+    const first = rawLines[0]?.slice(0, 200) ?? "";
+    const prev = tailBookmarks.get(id);
+    // Append-only logs never mutate earlier lines, so a changed first
+    // content line means the log was replaced or rotated — reset to a full
+    // tail. Catches same-size replacements the shrink checks cannot see.
+    // (A previously-empty log growing content is growth, not replacement.)
+    const replaced =
+      prev !== undefined && prev.lines > 0 && prev.first !== first;
+    const shrank =
+      prev !== undefined && (prev.lines > total || prev.bytes > slice.size);
+    let window: string[];
+    let header: string | undefined;
+    let newLines: number | undefined;
+    if (raw || prev === undefined || shrank || replaced) {
+      // Full tail: first read, raw mode, or a shrunken/replaced log (reset).
+      window = rawLines.slice(-lines);
+      if (!raw && (shrank || replaced)) {
+        header = shrank
+          ? "log shrank since last read — showing full tail"
+          : "log was replaced since last read — showing full tail";
+      }
+    } else {
+      const fresh = rawLines.slice(prev.lines);
+      newLines = fresh.length;
+      if (fresh.length === 0) {
+        tailBookmarks.set(id, {
+          lines: total,
+          bytes: slice.size,
+          first,
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `(no new lines since last read — log at ${total} line${total === 1 ? "" : "s"})`,
+            },
+          ],
+          details: {
+            id,
+            linesShown: 0,
+            logPath,
+            notFound: false,
+            condensed: true,
+            newLines: 0,
+            totalLines: total,
+          },
+        };
+      }
+      window = fresh.length > lines ? fresh.slice(-lines) : fresh;
+      header =
+        `+${fresh.length} new line${fresh.length === 1 ? "" : "s"} since last read — ` +
+        `log at ${total} lines${fresh.length > lines ? ` (showing last ${lines})` : ""}`;
+    }
+    tailBookmarks.set(id, {
+      lines: total,
+      bytes: slice.size,
+      first,
+    });
+    const shown = window;
+    const { text, truncated } = condenseLogLines(shown, { raw });
+    // Delta reads early-return above, so an empty window here can only be
+    // a first read of an empty log (full-tail path).
+    const body = shown.length === 0 ? "(empty log)" : text;
+    const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
+    const head = header ? `${header}\n` : "";
+    return {
+      content: [{ type: "text", text: head + body + notes }],
+      details: {
+        id,
+        linesShown: shown.length,
+        logPath,
+        notFound: false,
+        condensed: !raw,
+        ...(newLines === undefined ? {} : { newLines, totalLines: total }),
+        ...(truncated.length > 0 ? { condenserNotes: truncated } : {}),
+      },
+    };
   }
 
   pi.registerTool({
@@ -1964,40 +2382,73 @@ export default function (pi: ExtensionAPI) {
     // themselves from the context windows (lo > hi no-ops the inner loop).
     const context = Math.max(0, Math.floor(contextParam));
     if (!id) throw new Error("bggrep: id is required");
+    validateJobId(id, "bggrep");
     // Record-first, same as bgtail — correct across config changes.
     const logPath =
       jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
     const source = pattern ?? DEFAULT_GREP_PATTERN;
-    let re: RegExp;
     try {
-      re = new RegExp(source);
+      // Validate up front so a bad pattern fails immediately, without a worker.
+      void new RegExp(source);
     } catch (err) {
       throw new Error(
         `bggrep: invalid pattern ${JSON.stringify(source)}: ${(err as Error).message}`,
       );
     }
-    let rawLines: string[];
-    try {
-      const content = readFileSync(logPath, "utf8");
-      // /\r?\n/ normalizes CRLF (a trailing \r would break $-anchored patterns
-      // and leak into output); blank lines are KEPT so L<n> numbers match the
-      // file. A trailing empty split element is dropped; "" yields zero lines.
-      const split = content === "" ? [] : content.split(/\r?\n/);
-      if (split.length > 0 && split[split.length - 1] === "") split.pop();
-      rawLines = split.filter((l) => !l.startsWith(EXIT_MARKER));
-    } catch {
+    const slice = readLogSlice(logPath, LOG_READ_BYTES);
+    if (!slice) {
       return {
-        content: [
-          { type: "text", text: `No log found for job ${id} at ${logPath}` },
-        ],
-        details: { id, matches: 0, logPath, notFound: true },
+        content: [{ type: "text", text: logReadError(id, logPath) }],
+        details: { id, matches: 0, logPath, notFound: !existsSync(logPath) },
         isError: true,
       };
     }
-    const matchIdx: number[] = [];
-    for (let i = 0; i < rawLines.length; i++) {
-      if (re.test(rawLines[i])) matchIdx.push(i);
+    const content = slice.content;
+    // /\r?\n/ normalizes CRLF (a trailing \r would break $-anchored patterns
+    // and leak into output); blank lines are KEPT so L<n> numbers match the
+    // file. A trailing empty split element is dropped; "" yields zero lines.
+    const split = content === "" ? [] : content.split(/\r?\n/);
+    if (split.length > 0 && split[split.length - 1] === "") split.pop();
+    const rawLines = split.filter((l) => !l.startsWith(EXIT_MARKER));
+    // Match under a wall-clock budget in a worker: a caller-supplied regex can
+    // backtrack catastrophically and would otherwise hang the main thread with
+    // no way to interrupt it.
+    const budgetMs = bggrepTimeoutMs();
+    const outcome = await matchLinesWithBudget(
+      source,
+      rawLines,
+      BGGREP_LINE_CAP,
+      budgetMs,
+    );
+    if (outcome.kind === "invalid") {
+      throw new Error(
+        `bggrep: invalid pattern ${JSON.stringify(source)}: ${outcome.message}`,
+      );
     }
+    if (outcome.kind === "timeout") {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `bggrep: /${source}/ exceeded the ${budgetMs}ms match budget across ` +
+              `${rawLines.length} line${rawLines.length === 1 ? "" : "s"} — likely ` +
+              `catastrophic backtracking; no results computed.`,
+          },
+        ],
+        details: {
+          id,
+          matches: 0,
+          linesSearched: rawLines.length,
+          logPath,
+          notFound: false,
+          pattern: source,
+          timedOut: true,
+        },
+        isError: true,
+      };
+    }
+    const matchIdx = outcome.matchIdx;
     const header =
       `${matchIdx.length} match${matchIdx.length === 1 ? "" : "es"} for /${source}/ ` +
       `in ${rawLines.length} line${rawLines.length === 1 ? "" : "s"}`;
@@ -2056,7 +2507,7 @@ export default function (pi: ExtensionAPI) {
     name: "bggrep",
     label: "Grep Background Log",
     description:
-      "Search a background job's log with a regex; returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Runs inside the extension, so it reaches the configured jobs dir (including a global one) that project-sandboxed tools (ctx_execute_file) cannot reach. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+      "Search the last 2 MB of a background job's log with a regex (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Runs inside the extension, so it reaches the configured jobs dir (including a global one) that project-sandboxed tools (ctx_execute_file) cannot reach. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
     promptSnippet: "Search a bgrun job's log for a pattern",
     promptGuidelines: [
       "Never search a bgrun log with the bash tool — uncapped output can flood context, and it needs manual log-path reconstruction and regex shell-quoting; bggrep is bounded by design.",
@@ -2102,11 +2553,26 @@ export default function (pi: ExtensionAPI) {
     const cfg = resolveConfig(ctx);
     const jobsDir = cfg.jobsDir;
     if (id) {
+      validateJobId(id, "bgstatus");
       const rec = jobs.get(id);
       if (rec) {
-        const state = rec.exitCode === undefined ? "running" : "done";
-        const exit = rec.exitCode === undefined ? "" : ` exit=${rec.exitCode}`;
-        const lines = [`${id}: ${state}${exit}`];
+        // Read-only reconciliation: an in-memory record whose exit event never
+        // fired (or one reconstructed on restart) can lag its log. Derive the
+        // real state from the marker / pid liveness WITHOUT mutating or
+        // persisting — the list path and the 30s poller own persistence. This
+        // keeps by-id and list from disagreeing for up to a poll interval.
+        let exit = rec.exitCode;
+        if (exit === undefined && !rec.child) {
+          // No live handle (reconstructed/adopted) — derive from the log or a
+          // dead pid. A live child is authoritative: a running job whose own
+          // output contains a spurious __BGRUN_EXIT__ line must not read done.
+          const fromLog = parseExitFromLogPath(rec.logPath);
+          if (fromLog !== null) exit = fromLog;
+          else if (rec.pid <= 0 || !isRunningPid(rec.pid)) exit = -1;
+        }
+        const state = exit === undefined ? "running" : "done";
+        const exitStr = exit === undefined ? "" : ` exit=${exit}`;
+        const lines = [`${id}: ${state}${exitStr}`];
         if (rec.name) lines.push(`  name: ${rec.name}`);
         if (rec.type) lines.push(`  type: ${rec.type}`);
         lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
@@ -2115,7 +2581,7 @@ export default function (pi: ExtensionAPI) {
           details: {
             id,
             state,
-            exitCode: rec.exitCode ?? undefined,
+            exitCode: exit ?? undefined,
             cmd: rec.cmd,
             name: rec.name,
             type: rec.type,
@@ -2124,30 +2590,33 @@ export default function (pi: ExtensionAPI) {
         };
       }
       const logPath = join(jobsDir, `${id}.log`);
-      try {
-        const exit = parseExitFromLog(logPath);
-        const state = exit === null ? "running" : "done";
-        return {
-          content: [
-            {
-              type: "text",
-              text: `${id}: ${state}${exit === null ? "" : ` exit=${exit}`} (recovered from log)\n  log: ${logPath}`,
-            },
-          ],
-          details: {
-            id,
-            state,
-            exitCode: exit ?? undefined,
-            recovered: true,
-          },
-        };
-      } catch {
+      if (!existsSync(logPath)) {
         return {
           content: [{ type: "text", text: `No job found with id ${id}` }],
           details: { id, state: "unknown" },
           isError: true,
         };
       }
+      let exit = parseExitFromLogPath(logPath);
+      if (exit === null) {
+        const pid = pidFromId(id);
+        if (pid !== null && (pid <= 0 || !isRunningPid(pid))) exit = -1;
+      }
+      const state = exit === null ? "running" : "done";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${id}: ${state}${exit === null ? "" : ` exit=${exit}`} (recovered from log)\n  log: ${logPath}`,
+          },
+        ],
+        details: {
+          id,
+          state,
+          exitCode: exit ?? undefined,
+          recovered: true,
+        },
+      };
     }
     // List: this session's jobs (running by default; finished only when
     // includeDone / showCompletedJobs is set). Other sessions' RUNNING jobs
@@ -2155,8 +2624,10 @@ export default function (pi: ExtensionAPI) {
     // from the shared dir can also appear when finished jobs are included.
     // Hidden disk logs get a one-line count instead of spamming the listing.
     const showDone = params.includeDone ?? cfg.showCompletedJobs;
-    revalidateStaleJobs();
-    updateWidget(ctx);
+    // Read-only: asking for status must not append transcript cards. The stale
+    // poller (when a job is unsupervised) persists independently.
+    revalidateStaleJobs({ persist: false });
+    updateWidget(ctx, { persistRevalidate: false });
     const lines: string[] = [];
     const seen = new Set<string>();
     for (const [jid, rec] of jobs) {
@@ -2170,30 +2641,33 @@ export default function (pi: ExtensionAPI) {
       }
     }
     let hiddenOnDisk = 0;
-    try {
-      for (const name of readdirSync(jobsDir)) {
-        if (!name.endsWith(".log")) continue;
-        const jid = name.slice(0, -".log".length);
-        if (seen.has(jid)) continue;
-        const logPath = join(jobsDir, name);
-        const exit = parseExitFromLog(logPath);
-        if (exit !== null) {
+    if (!showDone && !cfg.adoptForeignJobs) {
+      // Default listing: every on-disk log is just a hidden count. Skip the
+      // exit-marker parse (a 256 KB tail read per file) — the cheap scan's
+      // names are all we need.
+      for (const entry of scanLogFiles(jobsDir)) {
+        if (!seen.has(entry.id)) hiddenOnDisk++;
+      }
+    } else {
+      for (const entry of scanJobsDir(jobsDir)) {
+        if (seen.has(entry.id)) continue;
+        if (entry.exit !== null) {
           // finished log on disk (other or older session)
           if (showDone) {
-            lines.push(`  ${jid}: done exit=${exit} (from log)`);
+            lines.push(`  ${entry.id}: done exit=${entry.exit} (from log)`);
           } else {
             hiddenOnDisk++;
           }
-        } else if (cfg.adoptForeignJobs) {
-          // running foreign job — only surfaced when adoption is enabled
-          lines.push(`  ${jid}: running (from log)`);
+        } else if (cfg.adoptForeignJobs && entry.alive) {
+          lines.push(`  ${entry.id}: running (from log)`);
         } else {
           hiddenOnDisk++;
         }
       }
-    } catch {
-      // jobs dir doesn't exist — nothing to scan.
     }
+    // Count jobs, not display lines: capture before appending the "(N more…)"
+    // footer, which is a note rather than a job.
+    const jobCount = lines.length;
     if (hiddenOnDisk > 0) {
       lines.push(
         `  (${hiddenOnDisk} more job log(s) on disk — pass includeDone to list, bgclean all to prune)`,
@@ -2207,7 +2681,7 @@ export default function (pi: ExtensionAPI) {
     }
     return {
       content: [{ type: "text", text: `bgrun jobs:\n${lines.join("\n")}` }],
-      details: { count: lines.length },
+      details: { count: jobCount },
     };
   }
 
@@ -2238,8 +2712,6 @@ export default function (pi: ExtensionAPI) {
 
   // ── bgclean: remove old job logs ───────────────────────────────────────────
 
-  // ── bgclean: remove old job logs ──────────────────────────────────────
-
   // Shared by the bgclean tool (agent-facing) and the /bgclean slash command
   // (human-facing).
   async function bgcleanCore(
@@ -2260,7 +2732,9 @@ export default function (pi: ExtensionAPI) {
       // "all" spans every shared jobs dir — the current project's plus the
       // machine-global default (so pre-project-local logs are still reachable).
       for (const dir of sharedJobsDirs(cfg.jobsDir, cfg.jobsDirProjectLocal)) {
-        const r = cleanOldJobs(days, dir, ctx);
+        // An explicit `bgclean all` is the user's direct intent — bypass the
+        // ownership marker gate so it always works.
+        const r = cleanOldJobs(days, dir, ctx, { requireOwnership: false });
         result.removed += r.removed;
         result.kept += r.kept;
         result.skippedRunning += r.skippedRunning;
