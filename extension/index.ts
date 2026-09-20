@@ -37,6 +37,7 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  fstatSync,
   readSync,
   mkdirSync,
   openSync,
@@ -67,13 +68,33 @@ const EXIT_MARKER = "__BGRUN_EXIT__=";
 const JOBS_DIR_MARKER = ".bgrun-jobs";
 // Tail-read caps — avoid whole-file readFileSync on runaway logs.
 const LOG_TAIL_BYTES = 256 * 1024; // exit marker + last line
-const LOG_READ_BYTES = 2 * 1024 * 1024; // bgtail / bggrep
+const LOG_READ_BYTES = 2 * 1024 * 1024; // bgtail / bggrep default window
 const BGGREP_LINE_CAP = 10_000; // per-line match length cap
+
+// Cap on the bytes a job may write to its log (stdout+stderr). Enforced inside
+// the detached process tree, so it holds after pi exits. 0 = unlimited.
+const DEFAULT_MAX_LOG_BYTES = 64 * 1024 * 1024;
+// Upper bound for an explicit search window (bgtail/bggrep `bytes`). A job can
+// never have written more than the ceiling, and the window is scanned in-process
+// (bggrep ships the lines to a worker), so widening it costs CPU and memory — but
+// NOT context: the returned text stays capped by the condenser (~8 KB).
+const LOG_READ_BYTES_MAX = DEFAULT_MAX_LOG_BYTES;
+// The wrapper appends this line (with a leading newline) when it had to drop
+// output. Readers filter it exactly like EXIT_MARKER: wrapper bookkeeping, not
+// job output, so it must not be counted as a content line or reported as the
+// job's last line.
+const TRUNC_NOTICE_PREFIX = "[pi-bgrun] output truncated";
 
 const DEFAULT_CLEANUP_DAYS = 7;
 const STALE_POLL_MS = 30_000; // re-check interval for jobs with no live child handle
 /** Default jobs dir inside a recognizable project root (`.git` or `.pi`). */
 const PROJECT_LOCAL_JOBS_REL = ".pi-bgrun/jobs";
+
+// Files a spawn stages in the jobs dir under one shared
+// `.tmp-<slug>-<ts>-<hex>` stem: the log itself (renamed to `<id>.log` once the
+// child pid is known) plus the wrapper's exit-code, fifo and byte-count files.
+// Only these exact suffixes are ours — an unrelated `.tmp-*` is not.
+const STAGING_SUFFIXES = [".log", ".ec", ".fifo", ".cnt"];
 
 // Machine-global jobs dir. Resolved per call (not a module constant) so
 // PI_BGRUN_GLOBAL_DIR can redirect it — used by tests to stay off the real
@@ -111,6 +132,16 @@ try {
   parentPort.postMessage({ ok: false, message: String((err && err.message) || err) });
 }
 `;
+
+// Clamp a caller-supplied log search window: absent/garbage/non-positive →
+// the default, anything wider than the ceiling → the ceiling (searching past
+// what a job could have written is pure cost).
+export function clampReadWindow(bytes: unknown): number {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) {
+    return LOG_READ_BYTES;
+  }
+  return Math.min(Math.floor(bytes), LOG_READ_BYTES_MAX);
+}
 
 // Read at call time so tests (and users) can lower the budget; a non-positive
 // or non-numeric value falls back to the default.
@@ -269,6 +300,48 @@ export function parseExitFromLogPath(logPath: string): number | null {
   return parseExitFromContent(slice.content);
 }
 
+// Wrapper bookkeeping lines — never job output. Every reader filters them, so a
+// capped log's last line, line count, tail window and grep results still
+// describe the COMMAND's output rather than the wrapper's own bookkeeping.
+export function isWrapperLine(line: string): boolean {
+  return (
+    line.startsWith(EXIT_MARKER) || line.startsWith(TRUNC_NOTICE_PREFIX)
+  );
+}
+
+// The byte ceiling a log actually hit, or null when it was not capped. Exact by
+// construction: the notice only counts when it is the line immediately before
+// the exit marker, which is the order the wrapper writes them in (marker last).
+// A command that merely prints the phrase is not evidence of truncation.
+export function parseTruncationFromContent(content: string): number | null {
+  const lines = content.split("\n");
+  let i = lines.length - 1;
+  while (i >= 0 && lines[i].trim().length === 0) i--;
+  if (i < 0 || !lines[i].startsWith(EXIT_MARKER)) return null;
+  i--;
+  while (i >= 0 && lines[i].trim().length === 0) i--;
+  if (i < 0 || !lines[i].startsWith(TRUNC_NOTICE_PREFIX)) return null;
+  const match = lines[i].match(/ at (\d+) bytes \(first /);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+// The notice is written within the last few hundred bytes of the log (it
+// precedes the exit marker), so the standard tail slice decides it — no full
+// read, even for a log at the ceiling.
+function readTruncationBytes(logPath: string): number | null {
+  const slice = readLogSlice(logPath, LOG_TAIL_BYTES);
+  if (!slice) return null;
+  return parseTruncationFromContent(slice.content);
+}
+
+// Compact byte size for the wake and reader notes ("64 MiB", "1.5 KiB",
+// "900 bytes"). One decimal is enough: this labels a ceiling, not a quantity.
+export function formatBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${Math.round((n / (1024 * 1024)) * 10) / 10} MiB`;
+  if (n >= 1024) return `${Math.round((n / 1024) * 10) / 10} KiB`;
+  return `${n} bytes`;
+}
+
 function readLastLogLine(logPath: string, maxLen = 200): string | null {
   const slice = readLogSlice(logPath, LOG_TAIL_BYTES);
   if (!slice) return null;
@@ -278,7 +351,7 @@ function readLastLogLine(logPath: string, maxLen = 200): string | null {
 function readLastLineFromContent(content: string, maxLen = 200): string | null {
   const lines = content.split("\n").filter((l) => l.trim().length > 0);
   if (lines.length === 0) return null;
-  const real = lines.filter((l) => !l.startsWith(EXIT_MARKER));
+  const real = lines.filter((l) => !isWrapperLine(l));
   // No content lines (a marker-only log) → nothing to show. Never fall back to
   // the exit-marker line — that leaks "__BGRUN_EXIT__=N" into the wake.
   if (real.length === 0) return null;
@@ -482,6 +555,11 @@ interface BgrunConfig {
   showCompletedJobs: boolean;
   // Log retention for cleanup (auto-sweeps and the bgclean default).
   cleanupDays: number;
+  // Byte ceiling for a job's log (stdout+stderr). A runaway job (`yes`, a spew
+  // loop) would otherwise fill the disk. The cap keeps the FIRST maxLogBytes
+  // bytes and appends a truncation notice; the job itself runs to completion
+  // with its real exit code. 0 = unlimited. Read per job at spawn time.
+  maxLogBytes: number;
   // Auto-sweep the shared jobs dirs at session boundaries for orphans —
   // finished (exit marker or dead pid) logs older than cleanupDays from
   // sessions that crashed or are never resumed again. Both the machine-global
@@ -510,6 +588,7 @@ interface BgrunConfigFile {
   adoptForeignJobs?: unknown;
   showCompletedJobs?: unknown;
   cleanupDays?: unknown;
+  maxLogBytes?: unknown;
   globalAutoClean?: unknown;
   digest?: unknown;
 }
@@ -542,6 +621,51 @@ function readConfigFile(path: string): BgrunConfigFile {
     );
   }
   return {};
+}
+
+// ── Job wrapper ─────────────────────────────────────────────────────────────
+//
+// Every job runs inside a detached `sh -c` tree, so the log ceiling has to live
+// there too — it must hold after pi exits. The command is passed as argv ($1),
+// never interpolated, or `#`, quotes and heredocs would break.
+//
+// Capped shape: the command's output is tee'd into a byte counter and piped
+// through `head -c` into the log, with `cat >/dev/null` draining the rest so the
+// producer never gets SIGPIPE — the job runs to completion and keeps its real
+// exit code. That code travels through a file, not the pipe, because a
+// pipeline's `$?` is the reader's.
+//
+// Why the count comes from a tee'd copy instead of "what head left behind":
+// `head -c` reads into a buffer and discards the excess, so the remainder
+// under-reports (measured on macOS: a 1500-byte stream capped at 1000 leaves 0,
+// not 500). Sizing the log fd directly is no better — it is opened O_WRONLY, so
+// reopening /dev/fd/1 fails with EACCES. `wc -c` on an uncapped copy is exact.
+//
+// If `mkfifo` fails, fall back to the uncapped path: losing output is worse
+// than losing the ceiling.
+//
+// argv: $1 command, $2 ecfile, $3 fifo, $4 countfile.
+export function cappedWrapper(maxBytes: number): string {
+  const cap = String(maxBytes);
+  return [
+    `if mkfifo "$3" 2>/dev/null; then`,
+    `  rm -f "$4"; ( wc -c <"$3" >"$4" ) & ctr=$!`,
+    `  { sh -c "$1" 2>&1; ec=$?; printf '%d' "$ec" >"$2"; } | tee "$3" | { head -c ${cap}; cat >/dev/null; }`,
+    `  wait "$ctr"`,
+    `  total=$(tr -d '[:space:]' <"$4" 2>/dev/null)`,
+    `  rm -f "$3" "$4"`,
+    `  if [ "\${total:-0}" -gt ${cap} ]; then`,
+    `    printf '\\n${TRUNC_NOTICE_PREFIX} at %s bytes (first %s bytes kept)\\n' ${cap} ${cap}`,
+    `  fi`,
+    `  ec=$(cat "$2" 2>/dev/null)`,
+    `else`,
+    `  sh -c "$1" 2>&1`,
+    `  ec=$?`,
+    `fi`,
+    `rm -f "$2"`,
+    `[ -n "$ec" ] || ec=-1`,
+    `printf '\\n${EXIT_MARKER}%d\\n' "$ec"; exit "$ec"`,
+  ].join("\n");
 }
 
 // ── Project-local jobs dir ──────────────────────────────────────────────────
@@ -955,6 +1079,24 @@ export function resolveConfig(ctx?: {
       : undefined;
   const envDays = Number(process.env.PI_BGRUN_CLEANUP_DAYS);
   const daysEnv = Number.isFinite(envDays) && envDays > 0 ? envDays : undefined;
+  // Byte ceiling: unlike cleanupDays, 0 is meaningful ("unlimited"), so it is
+  // accepted — but a BLANK env var is not, or an empty
+  // PI_BGRUN_MAX_LOG_BYTES= would silently disable the cap.
+  const maxBytesFile =
+    typeof merged.maxLogBytes === "number" &&
+    Number.isFinite(merged.maxLogBytes) &&
+    merged.maxLogBytes >= 0
+      ? Math.floor(merged.maxLogBytes)
+      : undefined;
+  const maxBytesRaw = process.env.PI_BGRUN_MAX_LOG_BYTES;
+  const maxBytesEnvValue =
+    maxBytesRaw === undefined || maxBytesRaw.trim() === ""
+      ? NaN
+      : Number(maxBytesRaw);
+  const maxBytesEnv =
+    Number.isFinite(maxBytesEnvValue) && maxBytesEnvValue >= 0
+      ? Math.floor(maxBytesEnvValue)
+      : undefined;
   const { dir: jobsDir, projectLocal: jobsDirProjectLocal } =
     resolveJobsDirPath(process.env.PI_BGRUN_DIR || dirFile, ctx);
   // Digest section: accept either the legacy single-object form (normalized to
@@ -1001,6 +1143,7 @@ export function resolveConfig(ctx?: {
       completedFile ??
       false,
     cleanupDays: daysEnv ?? daysFile ?? DEFAULT_CLEANUP_DAYS,
+    maxLogBytes: maxBytesEnv ?? maxBytesFile ?? DEFAULT_MAX_LOG_BYTES,
     globalAutoClean:
       parseBoolEnv(process.env.PI_BGRUN_GLOBAL_AUTO_CLEAN) ??
       globalCleanFile ??
@@ -1089,6 +1232,23 @@ interface BgStatusDetails {
 
 export default function (pi: ExtensionAPI) {
   const jobs = new Map<string, JobRecord>();
+  // bgtail's delta-tailing bookmarks: one entry per job id ever tailed, holding
+  // the high-water mark of what the caller has already had the opportunity to
+  // see. Declared here, ahead of the cleanup helpers, so removing a log can
+  // evict its bookmark. TAIL_BOOKMARK_CAP bounds the rest — cleanup only evicts
+  // jobs whose log it removed, and a long session that tails many job ids
+  // (foreign ones are never cleaned here) would otherwise grow it forever.
+  const TAIL_BOOKMARK_CAP = 1_000;
+  // A bookmark is the high-water mark of what the caller has seen PLUS the
+  // search window it was seen through: the same log read through a wider window
+  // is a different view, not newly appended output.
+  type TailBookmark = {
+    lines: number;
+    bytes: number;
+    first: string;
+    window: number;
+  };
+  const tailBookmarks = new Map<string, TailBookmark>();
   // Poller for stale job records — anything running with no live ChildProcess
   // handle (adopted foreign jobs + jobs reconstructed from transcript entries
   // after a restart). No exit event exists for those, so their logs/pids are
@@ -1127,6 +1287,12 @@ export default function (pi: ExtensionAPI) {
     return normalizeType(type);
   }
 
+  // Hard read bound for the line-count scan. The ceiling normally keeps logs
+  // small, but `maxLogBytes: 0` (unlimited) and logs from a run with a higher
+  // ceiling still reach here, and this runs on the main thread at every job
+  // exit. Past the bound the count is omitted rather than reported wrong.
+  const COUNT_SCAN_MAX_BYTES = 64 * 1024 * 1024;
+
   // Count the log's total lines with a bounded-memory streaming scan (one
   // fixed-size buffer, no full-file read). Missing/unreadable file → null:
   // the Stats line then just omits the line count — best-effort, never
@@ -1139,19 +1305,26 @@ export default function (pi: ExtensionAPI) {
       return null;
     }
     try {
+      // fstat, not the scan's own progress: the tail pread below is positioned
+      // by the REAL file size, so bounding the scan can never misplace it.
+      const size = fstatSync(fd).size;
+      if (size === 0) return 0;
+      if (size > COUNT_SCAN_MAX_BYTES) return null;
       const buf = Buffer.alloc(64 * 1024);
       let newlines = 0;
-      let size = 0;
+      let seen = 0;
       let bytesRead = 0;
       do {
         bytesRead = readSync(fd, buf, 0, buf.length, null);
         if (bytesRead <= 0) break;
-        size += bytesRead;
+        seen += bytesRead;
         for (let i = 0; i < bytesRead; i++) {
           if (buf[i] === 0x0a) newlines++;
         }
       } while (bytesRead === buf.length);
-      if (size === 0) return 0;
+      // A log that changed size mid-scan (rotated, or appended by a resumed
+      // job) would produce a count that matches neither state.
+      if (seen !== size) return null;
       // One bounded pread of the tail for the final-byte + exit-marker check.
       const tailLen = Math.min(size, 512);
       const tail = Buffer.alloc(tailLen);
@@ -1159,20 +1332,25 @@ export default function (pi: ExtensionAPI) {
       const tailText = tail.toString("latin1");
       const endsWithNewline = tailText.charCodeAt(tailText.length - 1) === 0x0a;
       let count = newlines + (endsWithNewline ? 0 : 1);
-      // The wrapper appends "\n<EXIT_MARKER><ec>\n" — those newlines are not
-      // command output. Drop the marker line, plus the blank separator when the
-      // output already ended in a newline.
+      // The wrapper appends "\n<EXIT_MARKER><ec>\n" — and, when it had to drop
+      // output, "\n<TRUNC_NOTICE>\n" before that. Those newlines are not command
+      // output. Drop the whole trailing wrapper block, including its leading
+      // separator when the output already ended in a newline.
       const markerAt = tailText.lastIndexOf("\n" + EXIT_MARKER);
       if (markerAt === 0) {
         // The file is only the wrapper's "\n<marker>\n" — no command output.
         return 0;
       }
       if (markerAt !== -1) {
+        const noticeAt = tailText.lastIndexOf("\n" + TRUNC_NOTICE_PREFIX);
+        const blockStart =
+          noticeAt !== -1 && noticeAt < markerAt ? noticeAt : markerAt;
         let extra = 0;
-        for (let i = markerAt + 1; i < tailText.length; i++) {
+        for (let i = blockStart + 1; i < tailText.length; i++) {
           if (tailText.charCodeAt(i) === 0x0a) extra++;
         }
-        if (markerAt > 0 && tailText.charCodeAt(markerAt - 1) === 0x0a) extra++;
+        if (blockStart > 0 && tailText.charCodeAt(blockStart - 1) === 0x0a)
+          extra++;
         count = Math.max(0, count - extra);
       }
       return count;
@@ -1228,9 +1406,12 @@ export default function (pi: ExtensionAPI) {
       if (
         !name.startsWith(".bgrun-used-") &&
         !name.startsWith(".digest-nudge-") &&
-        // Only OUR staging files (`.tmp-<slug>-<ts>-<hex>.log`), never an
-        // unrelated `.tmp-*` that happens to live in the dir.
-        !(name.startsWith(".tmp-") && name.endsWith(".log"))
+        // Only OUR staging files (`.tmp-<slug>-<ts>-<hex>.log|.ec|.fifo|.cnt`),
+        // never an unrelated `.tmp-*` that happens to live in the dir.
+        !(
+          name.startsWith(".tmp-") &&
+          STAGING_SUFFIXES.some((suffix) => name.endsWith(suffix))
+        )
       )
         continue;
       try {
@@ -1287,6 +1468,9 @@ export default function (pi: ExtensionAPI) {
       try {
         unlinkSync(entry.logPath);
         result.removed++;
+        // The log is gone: its delta bookmark would otherwise pin a stale
+        // high-water mark (and a Map slot) for the life of the session.
+        tailBookmarks.delete(entry.id);
       } catch {
         // ignore
       }
@@ -1326,6 +1510,7 @@ export default function (pi: ExtensionAPI) {
         // (and its ExtensionContext) for the life of the process.
         if (rec.exitedAt !== undefined && rec.exitedAt < cutoff) {
           jobs.delete(rec.id);
+          tailBookmarks.delete(rec.id);
         }
         continue;
       }
@@ -1337,6 +1522,7 @@ export default function (pi: ExtensionAPI) {
         unlinkSync(rec.logPath);
         result.removed++;
         jobs.delete(rec.id);
+        tailBookmarks.delete(rec.id);
       } catch {
         // ignore
       }
@@ -1745,10 +1931,8 @@ export default function (pi: ExtensionAPI) {
       // log fd must exist before spawn. Create at a temp path, rename after spawn.
       // randomBytes (not Math.random) plus O_EXCL: the temp name is not
       // guessable and a pre-planted symlink cannot be truncated through.
-      const tmpPath = join(
-        jobsDir,
-        `.tmp-${slug}-${ts}-${randomBytes(4).toString("hex")}.log`,
-      );
+      const stem = `.tmp-${slug}-${ts}-${randomBytes(4).toString("hex")}`;
+      const tmpPath = join(jobsDir, `${stem}.log`);
       let logFd: number | undefined;
       let logPath = tmpPath;
       try {
@@ -1761,11 +1945,31 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         // Pass command as argv — interpolation breaks on #, quotes, heredocs.
-        const wrapper = `sh -c "$1"; ec=$?; printf '\\n${EXIT_MARKER}%d\\n' "$ec"; exit "$ec"`;
-        const child = spawn("sh", ["-c", wrapper, "bgrun", command], {
-          stdio: ["ignore", logFd, logFd],
-          detached: true,
-        });
+        // maxLogBytes 0 means "unlimited": keep the pre-ceiling wrapper exactly
+        // (head -c 0 is a hard error, not a no-op, so it cannot be routed
+        // through the capped path).
+        const capped = cfg.maxLogBytes > 0;
+        const wrapper = capped
+          ? cappedWrapper(cfg.maxLogBytes)
+          : `sh -c "$1"; ec=$?; printf '\\n${EXIT_MARKER}%d\\n' "$ec"; exit "$ec"`;
+        const child = spawn(
+          "sh",
+          capped
+            ? [
+                "-c",
+                wrapper,
+                "bgrun",
+                command,
+                join(jobsDir, `${stem}.ec`),
+                join(jobsDir, `${stem}.fifo`),
+                join(jobsDir, `${stem}.cnt`),
+              ]
+            : ["-c", wrapper, "bgrun", command],
+          {
+            stdio: ["ignore", logFd, logFd],
+            detached: true,
+          },
+        );
         child.unref();
 
         const childPid = child.pid ?? -1;
@@ -1887,6 +2091,12 @@ export default function (pi: ExtensionAPI) {
           const statsParts = [formatDuration(rec.exitedAt - rec.started)];
           if (logLines !== null)
             statsParts.push(`${logLines.toLocaleString("en-US")} lines`);
+          // The cap is the one fact that changes what the others MEAN: the line
+          // count, the last line and any digest describe only the bytes that
+          // were kept. Say so in the line the agent reads first.
+          const truncatedAt = readTruncationBytes(logPath);
+          if (truncatedAt !== null)
+            statsParts.push(`log truncated at ${formatBytes(truncatedAt)}`);
 
           // Persist the done-state entry.
           pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
@@ -1926,9 +2136,21 @@ export default function (pi: ExtensionAPI) {
             };
             const selected = selectDigestEntry(digestEntries, digestTarget);
             if (selected) {
-              const raw = await runDigestCommand(selected.command, logPath);
-              const text = raw === undefined ? undefined : capDigestOutput(raw);
-              if (text) digestBlock = { label: selected.label, text };
+              if (truncatedAt !== null) {
+                // A scorecard reads the log's END (summary lines, failure
+                // lists) — exactly what a head cap drops. Its numbers would be
+                // confidently wrong, so report why it was skipped instead.
+                digestBlock = {
+                  label: selected.label,
+                  text:
+                    `skipped — the log was truncated at ${formatBytes(truncatedAt)} ` +
+                    "and this scorecard reads the log's end, which the cap dropped",
+                };
+              } else {
+                const raw = await runDigestCommand(selected.command, logPath);
+                const text = raw === undefined ? undefined : capDigestOutput(raw);
+                if (text) digestBlock = { label: selected.label, text };
+              }
             } else if (digestEntries?.length) {
               // Configured but nothing selected — otherwise silent. Surface the
               // job's type/name plus the configured types, once per distinct
@@ -2249,13 +2471,17 @@ export default function (pi: ExtensionAPI) {
   // for lines already seen. Deliberately-skipped prefix lines are never
   // replayed as "new". raw: true keeps the verbatim last-N window (no delta
   // header) but still advances the bookmark. A shrunken log (rotated/replaced)
-  // resets to a full tail. Bookmarks are in-memory only — a session restart
-  // starts fresh with a full tail.
+  // resets to a full tail. Bookmarks are in-memory only (see tailBookmarks
+  // above) — a session restart starts fresh with a full tail.
 
-  const tailBookmarks = new Map<
-    string,
-    { lines: number; bytes: number; first: string }
-  >();
+  // Record a bookmark, evicting the oldest entry once the map is full. Cleanup
+  // drops bookmarks when it removes a log; this bounds the rest.
+  function rememberTail(id: string, bookmark: TailBookmark): void {
+    tailBookmarks.set(id, bookmark);
+    if (tailBookmarks.size <= TAIL_BOOKMARK_CAP) return;
+    const oldest = tailBookmarks.keys().next().value;
+    if (oldest !== undefined && oldest !== id) tailBookmarks.delete(oldest);
+  }
 
   // Resolve a job's log path and read its bounded slice, single-sourcing the
   // "in-memory record first, then the configured jobs dir" rule shared by
@@ -2265,14 +2491,15 @@ export default function (pi: ExtensionAPI) {
   function resolveLogForJob(
     id: string,
     tool: string,
-    ctx?: ExtensionContext,
+    ctx: ExtensionContext | undefined,
+    window: number,
   ):
     | { logPath: string; content: string; size: number }
     | { logPath: string; errorText: string; notFound: boolean } {
     validateJobId(id, tool);
     const logPath =
       jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
-    const slice = readLogSlice(logPath, LOG_READ_BYTES);
+    const slice = readLogSlice(logPath, window);
     if (!slice) {
       return {
         logPath,
@@ -2286,7 +2513,7 @@ export default function (pi: ExtensionAPI) {
   // Shared by the bgtail tool (agent-facing) and the /bgtail slash command
   // (human-facing).
   async function bgtailCore(
-    params: { id: string; lines?: number; raw?: boolean },
+    params: { id: string; lines?: number; raw?: boolean; bytes?: number },
     ctx?: ExtensionContext,
   ): Promise<{
     content: { type: "text"; text: string }[];
@@ -2298,7 +2525,8 @@ export default function (pi: ExtensionAPI) {
     // tool schema, and lines < 1 would corrupt slicing (slice(-0) = whole log).
     const lines = Math.max(1, Math.floor(linesParam));
     if (!id) throw new Error("bgtail: id is required");
-    const resolved = resolveLogForJob(id, "bgtail", ctx);
+    const readWindow = clampReadWindow(params.bytes);
+    const resolved = resolveLogForJob(id, "bgtail", ctx, readWindow);
     if ("errorText" in resolved) {
       return {
         content: [{ type: "text", text: resolved.errorText }],
@@ -2311,49 +2539,82 @@ export default function (pi: ExtensionAPI) {
       };
     }
     const { logPath, content, size } = resolved;
-    // Content lines only: the exit marker and blanks are filtered BEFORE the
-    // window is sliced, so "last N lines" means the last N content lines
-    // (matching pre-delta behavior) and bookmarks count content lines.
+    // The cap dropped bytes off the END, so every "last N lines" view below is
+    // the end of what was KEPT. Flag it in the output, or a mid-run line reads
+    // as the job's final word — and in the details, for callers that parse them.
+    const truncatedAt = parseTruncationFromContent(content);
+    const capNote =
+      truncatedAt === null
+        ? ""
+        : `\n\n(log truncated at ${formatBytes(truncatedAt)} — lines past the cap were never written, so this is not the run's real end)`;
+    const truncDetails =
+      truncatedAt === null ? {} : { truncatedAtBytes: truncatedAt };
+    // Tail reads are bounded at LOG_READ_BYTES, so on a log past that window
+    // every view above is the end of a 2 MB slice — say so, or "not in the
+    // output" reads as "not in the log".
+    const windowNote =
+      size > readWindow
+        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(LOG_READ_BYTES_MAX)}) or use ctx_execute_file on the log path)`
+        : "";
+    // Content lines only: wrapper bookkeeping (exit marker, truncation notice)
+    // and blanks are filtered BEFORE the window is sliced, so "last N lines"
+    // means the last N content lines (matching pre-delta behavior) and
+    // bookmarks count content lines.
     // /\r?\n/ keeps CRLF logs from leaving a stray \r on every line.
     const rawLines = content
       .split(/\r?\n/)
-      .filter((l) => !l.startsWith(EXIT_MARKER) && l.trim().length > 0);
+      .filter((l) => !isWrapperLine(l) && l.trim().length > 0);
     const total = rawLines.length;
     const first = rawLines[0]?.slice(0, 200) ?? "";
     const prev = tailBookmarks.get(id);
+    // Same log, different window: a wider view would look like pages of "new"
+    // lines that were only never looked at before, so reset the delta. It also
+    // moves the window's first line, so it must be tested BEFORE the
+    // replacement heuristic below — otherwise a widened read misreports the log
+    // as replaced.
+    const windowChanged = prev !== undefined && prev.window !== readWindow;
     // Append-only logs never mutate earlier lines, so a changed first
     // content line means the log was replaced or rotated — reset to a full
     // tail. Catches same-size replacements the shrink checks cannot see.
     // (A previously-empty log growing content is growth, not replacement.)
     const replaced =
-      prev !== undefined && prev.lines > 0 && prev.first !== first;
+      prev !== undefined &&
+      !windowChanged &&
+      prev.lines > 0 &&
+      prev.first !== first;
     const shrank =
       prev !== undefined && (prev.lines > total || prev.bytes > size);
     let window: string[];
     let header: string | undefined;
     let newLines: number | undefined;
-    if (raw || prev === undefined || shrank || replaced) {
-      // Full tail: first read, raw mode, or a shrunken/replaced log (reset).
+    if (raw || prev === undefined || shrank || replaced || windowChanged) {
+      // Full tail: first read, raw mode, a shrunken/replaced log, or a changed
+      // search window (all resets).
       window = rawLines.slice(-lines);
-      if (!raw && (shrank || replaced)) {
+      if (!raw) {
         header = shrank
           ? "log shrank since last read — showing full tail"
-          : "log was replaced since last read — showing full tail";
+          : replaced
+            ? "log was replaced since last read — showing full tail"
+            : windowChanged
+              ? "search window changed since last read — showing full tail"
+              : undefined;
       }
     } else {
       const fresh = rawLines.slice(prev.lines);
       newLines = fresh.length;
       if (fresh.length === 0) {
-        tailBookmarks.set(id, {
+        rememberTail(id, {
           lines: total,
           bytes: size,
           first,
+          window: readWindow,
         });
         return {
           content: [
             {
               type: "text",
-              text: `(no new lines since last read — log at ${total} line${total === 1 ? "" : "s"})`,
+              text: `(no new lines since last read — log at ${total} line${total === 1 ? "" : "s"})${capNote}${windowNote}`,
             },
           ],
           details: {
@@ -2364,6 +2625,8 @@ export default function (pi: ExtensionAPI) {
             condensed: true,
             newLines: 0,
             totalLines: total,
+            windowBytes: readWindow,
+            ...truncDetails,
           },
         };
       }
@@ -2372,10 +2635,11 @@ export default function (pi: ExtensionAPI) {
         `+${fresh.length} new line${fresh.length === 1 ? "" : "s"} since last read — ` +
         `log at ${total} lines${fresh.length > lines ? ` (showing last ${lines})` : ""}`;
     }
-    tailBookmarks.set(id, {
+    rememberTail(id, {
       lines: total,
       bytes: size,
       first,
+      window: readWindow,
     });
     const shown = window;
     const { text, truncated } = condenseLogLines(shown, { raw });
@@ -2385,7 +2649,12 @@ export default function (pi: ExtensionAPI) {
     const notes = truncated.length > 0 ? `\n\n(${truncated.join("; ")})` : "";
     const head = header ? `${header}\n` : "";
     return {
-      content: [{ type: "text", text: head + body + notes }],
+      content: [
+        {
+          type: "text",
+          text: head + body + notes + capNote + windowNote,
+        },
+      ],
       details: {
         id,
         linesShown: shown.length,
@@ -2394,6 +2663,8 @@ export default function (pi: ExtensionAPI) {
         condensed: !raw,
         ...(newLines === undefined ? {} : { newLines, totalLines: total }),
         ...(truncated.length > 0 ? { condenserNotes: truncated } : {}),
+        windowBytes: readWindow,
+        ...truncDetails,
       },
     };
   }
@@ -2402,7 +2673,7 @@ export default function (pi: ExtensionAPI) {
     name: "bgtail",
     label: "Tail Background Log",
     description:
-      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. A shrunken or replaced log resets to a full tail. For pattern search use bggrep; for whole-log analysis, ctx_execute_file on the log path.",
+      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. A shrunken, replaced, or differently-windowed log resets to a full tail. Reads only the log's last 2 MiB by default (`bytes` widens it, max 64 MiB) and says so when the log is bigger. For pattern search use bggrep; for whole-log analysis, ctx_execute_file on the log path.",
     promptSnippet: "Read the last N lines of a bgrun job's log",
     parameters: Type.Object({
       id: Type.String({
@@ -2420,6 +2691,13 @@ export default function (pi: ExtensionAPI) {
             "Skip condensing (ANSI strip, collapse, caps) and return raw text",
         }),
       ),
+      bytes: Type.Optional(
+        Type.Number({
+          description:
+            "Search window in bytes (default 2097152 = 2 MiB, max 67108864 = 64 MiB). Widening only affects how much is SCANNED — the returned text stays capped.",
+          minimum: 1,
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       return bgtailCore(params, ctx);
@@ -2428,18 +2706,19 @@ export default function (pi: ExtensionAPI) {
 
   // ── bggrep: pattern search over a job's log, capped for context ───────────
   //
-  // The sandboxed whole-log path (ctx_execute_file) is confined to the
-  // project root, which a global jobs dir sits outside of — bggrep runs
-  // inside the extension with native fs access, so it reaches the configured
-  // jobs dir (including a global one). Matches are line-numbered (grep -n style),
+  // bggrep runs inside the extension, so it resolves the job id to the
+  // configured jobs dir itself (no path to reconstruct) and needs no shell
+  // quoting for the regex; ctx_execute_file can read the same file, but you
+  // must hand it the absolute path. Matches are line-numbered (grep -n style),
   // optionally with context lines, capped at MAX_GREP_MATCHES, and run
   // through the same condenser as bgtail so a search can never flood context.
 
   const MAX_GREP_MATCHES = 50;
 
   async function bggrepCore(
-    params: { id: string; pattern?: string; context?: number },
+    params: { id: string; pattern?: string; context?: number; bytes?: number },
     ctx?: ExtensionContext,
+  
   ): Promise<{
     content: { type: "text"; text: string }[];
     details: Record<string, unknown>;
@@ -2461,7 +2740,8 @@ export default function (pi: ExtensionAPI) {
       );
     }
     // Record-first, same as bgtail — correct across config changes.
-    const resolved = resolveLogForJob(id, "bggrep", ctx);
+    const readWindow = clampReadWindow(params.bytes);
+    const resolved = resolveLogForJob(id, "bggrep", ctx, readWindow);
     if ("errorText" in resolved) {
       return {
         content: [{ type: "text", text: resolved.errorText }],
@@ -2474,13 +2754,29 @@ export default function (pi: ExtensionAPI) {
         isError: true,
       };
     }
-    const { logPath, content } = resolved;
+    const { logPath, content, size } = resolved;
+    // A capped log is missing its END, and "no matches" is exactly what a
+    // failure pattern looks like when the failures were past the cap — so the
+    // note belongs next to the count, not just in the details.
+    const truncatedAt = parseTruncationFromContent(content);
+    const truncNote =
+      truncatedAt === null
+        ? ""
+        : `\n\n(log truncated at ${formatBytes(truncatedAt)} — output past the cap was never written and was not searched)`;
+    const truncDetails =
+      truncatedAt === null ? {} : { truncatedAtBytes: truncatedAt };
+    // Same window caveat as bgtail: the search covers only the last `window`
+    // bytes, so a miss on a bigger log means "not in the searched slice".
+    const windowNote =
+      size > readWindow
+        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(LOG_READ_BYTES_MAX)}) or use ctx_execute_file on the log path)`
+        : "";
     // /\r?\n/ normalizes CRLF (a trailing \r would break $-anchored patterns
     // and leak into output); blank lines are KEPT so L<n> numbers match the
     // file. A trailing empty split element is dropped; "" yields zero lines.
     const split = content === "" ? [] : content.split(/\r?\n/);
     if (split.length > 0 && split[split.length - 1] === "") split.pop();
-    const rawLines = split.filter((l) => !l.startsWith(EXIT_MARKER));
+    const rawLines = split.filter((l) => !isWrapperLine(l));
     // Match under a wall-clock budget in a worker: a caller-supplied regex can
     // backtrack catastrophically and would otherwise hang the main thread with
     // no way to interrupt it.
@@ -2515,6 +2811,8 @@ export default function (pi: ExtensionAPI) {
           notFound: false,
           pattern: source,
           timedOut: true,
+          windowBytes: readWindow,
+          ...truncDetails,
         },
         isError: true,
       };
@@ -2525,13 +2823,17 @@ export default function (pi: ExtensionAPI) {
       `in ${rawLines.length} line${rawLines.length === 1 ? "" : "s"}`;
     if (matchIdx.length === 0) {
       return {
-        content: [{ type: "text", text: `${header} — none` }],
+        content: [
+          { type: "text", text: `${header} — none${truncNote}${windowNote}` },
+        ],
         details: {
           id,
           matches: 0,
           linesSearched: rawLines.length,
           logPath,
           notFound: false,
+          windowBytes: readWindow,
+          ...truncDetails,
         },
       };
     }
@@ -2561,7 +2863,12 @@ export default function (pi: ExtensionAPI) {
       ? ` — showing first ${MAX_GREP_MATCHES}; ${matchIdx.length - MAX_GREP_MATCHES} more not shown`
       : "";
     return {
-      content: [{ type: "text", text: `${header}${capNote}\n${text}${notes}` }],
+      content: [
+        {
+          type: "text",
+          text: `${header}${capNote}\n${text}${notes}${truncNote}${windowNote}`,
+        },
+      ],
       details: {
         id,
         matches: matchIdx.length,
@@ -2570,6 +2877,8 @@ export default function (pi: ExtensionAPI) {
         notFound: false,
         pattern: source,
         capped,
+        windowBytes: readWindow,
+        ...truncDetails,
       },
     };
   }
@@ -2578,7 +2887,7 @@ export default function (pi: ExtensionAPI) {
     name: "bggrep",
     label: "Grep Background Log",
     description:
-      "Search the last 2 MB of a background job's log with a regex (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Runs inside the extension, so it reaches the configured jobs dir (including a global one) that project-sandboxed tools (ctx_execute_file) cannot reach. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; ctx_execute_file can read the same file, but needs the absolute path. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
     promptSnippet: "Search a bgrun job's log for a pattern",
     promptGuidelines: [
       "Never search a bgrun log with the bash tool — uncapped output can flood context, and it needs manual log-path reconstruction and regex shell-quoting; bggrep is bounded by design.",
@@ -2600,6 +2909,13 @@ export default function (pi: ExtensionAPI) {
           description:
             "Context lines around each match (default 0, grep -C style)",
           minimum: 0,
+        }),
+      ),
+      bytes: Type.Optional(
+        Type.Number({
+          description:
+            "Search window in bytes (default 2097152 = 2 MiB, max 67108864 = 64 MiB). Widening only affects how much is SCANNED — the returned matches stay capped (~50 matches, ~8KB).",
+          minimum: 1,
         }),
       ),
     }),

@@ -50,7 +50,8 @@ no polling.
    - `done exit=<non-zero>` → failure; analyze the log.
    - `running` but the job should have finished long ago → likely crashed (the
      process died without writing the exit marker). Analyze the log with
-     `bggrep` (any jobs dir) or `ctx_execute_file` (project-local logs only).
+     `bggrep` (any jobs dir, last 2 MB) or `ctx_execute_file` on the absolute path
+     (whole file — needed for logs bigger than 2 MB).
 
 ### Reading results without flooding context
 
@@ -62,15 +63,18 @@ usually answers "what failed" without any follow-up read. `bgtail` stays the
 positional-peek tool for everything else.
 
 - **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing) — polling a running job is nearly free.
-- **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Reaches the configured jobs dir (including a global one) that project-sandboxed `ctx_execute_file` cannot (it runs inside the extension). Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
-- **Whole-log failure analysis:** `ctx_execute_file` on the log path — **project-local
-  `jobsDir` only** (e.g. `.pi-bgrun/jobs` in `pi-bgrun.json`). The default global
-  dir (`~/.pi-bgrun/jobs`) is outside the project sandbox; use `bggrep` there instead.
-  Copy the `log:` path from `bgrun`'s `started:` line (do not use `~` — it may not expand).
+- **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Resolves the job id to the configured jobs dir itself — no path to reconstruct. (`ctx_execute_file` can read the same file given its absolute path.) Searches the last 2 MiB by default; `bytes: 67108864` widens it to the whole capped log — more scanning costs latency and memory, **not context**, since the returned matches stay capped. Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
+- **Whole-log failure analysis:** `ctx_execute_file` on the log's **absolute
+  path**. Unlike `bgtail`/`bggrep` (bounded to the last 2 MB), this reads the
+  whole file — the only way to cover a log bigger than 2 MB, e.g. one that hit
+  the size ceiling. Copy the `log:` path from `bgrun`'s `started:` line and
+  expand `~` yourself (it is not expanded for you; the tool takes an absolute
+  path or one relative to the project root). Otherwise it is an ordinary tool
+  call: your normal Read-deny rules still apply.
 
   ```javascript
   ctx_execute_file(
-    path: "<project>/.pi-bgrun/jobs/<JOB>.log",
+    path: "/Users/me/project/.pi-bgrun/jobs/<JOB>.log",
     language: "javascript",
     code: "const L=FILE_CONTENT.split('\\n'); \
            const fails=L.filter(l=>/(--- FAIL|FAIL|panic:|Error:)/.test(l)); \
@@ -90,8 +94,7 @@ positional-peek tool for everything else.
   ~8KB, plus a wall-clock match budget so a runaway regex errors instead of
   hanging).
 - It takes the job id — no log-path reconstruction, no shell-quoting of the
-  regex — and reaches the configured jobs dir (including a global one) that
-  project-sandboxed `ctx_execute_file` cannot.
+  regex, and no reliance on the agent getting `~` expansion right.
 - Output is self-describing: match count, line numbers, `…[N skipped]…` gap
   markers, `— none` for no-match.
 
@@ -99,6 +102,24 @@ Plain `grep` via bash is fine only for a one-off search you know is tiny.
 
 **Never `cat`, `Read`, `bash cat`, or `bash grep` a full bgrun log.** Always
 `bgtail`, `bggrep`, or (for project-local logs) `ctx_execute_file`.
+
+**Order of preference, cheapest first: `bgtail` → `bggrep` → `ctx_execute_file`.**
+Reach for the sandbox only when you need something a regex over lines cannot
+express — totals, dedup, grouping, joining the log against another file.
+
+`ctx_execute_file` is not itself a context dump: the file's bytes never enter
+context, only your script's **stdout** does ("raw content never leaves"). So the
+cost is exactly what you print — which makes `console.log(FILE_CONTENT)` (or
+`print(open(path).read())`, or a big unbounded slice) the one way a whole-log
+analysis turns into a context dump, and a capped-by-default 64 MiB log makes
+that expensive rather than merely rude. Aggregate, then cap what you print:
+
+- print counts / grouped summaries / the first N matches — not the content;
+- keep a `.slice(0, 40)` / `[:40]` on anything you echo;
+- for many different questions about one big log, index it once (`ctx_index`)
+  and `ctx_search` it, instead of re-scanning the file per call;
+- `bgtail` with a larger `lines`, or a tighter `bggrep` pattern, is usually the
+  cheaper answer to "I need to see more".
 
 ## After a pi restart or session switch
 
@@ -116,6 +137,18 @@ Plain `grep` via bash is fine only for a one-off search you know is tiny.
 
 - Call the tools; never hand-roll `nohup … &` inline.
 - One job = one id. Multiple concurrent jobs are fine — each has its own log.
+- Job logs are capped by default (`maxLogBytes` / `PI_BGRUN_MAX_LOG_BYTES`,
+  64 MiB; `0` = unlimited) and the cap keeps the **first** bytes. A log that
+  ends with `[pi-bgrun] output truncated at <N> bytes (first <N> bytes kept)`
+  hit that ceiling: output past it was dropped, not lost to a failure — the job
+  still ran to completion with its real exit code, and readers (`bgtail`,
+  `bggrep`, the wake's line count/last line) filter the notice out. The wake's
+  Stats line, `bgtail` and `bggrep` all say when a log was capped (and report
+  `truncatedAtBytes` in their details), and a configured digest scorecard is
+  skipped rather than scored against an incomplete log — so on a capped job,
+  read a missing digest as "unknown", **not** as "no failures", and do not
+  re-run the command to see the missing tail; raise the ceiling if you need the
+  whole log.
 - Logs default to `<project>/.pi-bgrun/jobs` in a repo (else `~/.pi-bgrun/jobs`;
   override with `PI_BGRUN_DIR` or `jobsDir`). Project-local dirs are
   auto-ignored via `.git/info/exclude`, which keeps `git status` clean; the

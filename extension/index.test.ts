@@ -3518,9 +3518,11 @@ test("wake message: Stats line (duration + line count) sits between Command: and
     );
     await waitForWakes(wakes, 1);
     const wake = wakes[0].text;
-    // Duration (0.0s for an instant job) + the command's OWN line count — the
-    // appended exit marker and its blank separator are excluded.
-    assert.match(wake, /Stats: 0\.0s, 1 lines/);
+    // Stats carries the command's OWN line count — the appended exit marker,
+    // its blank separator and (when capped) the truncation notice are excluded.
+    // The duration is asserted by SHAPE only: it depends on machine speed and on
+    // how many processes the wrapper spawns, so pinning "0.0s" pins the host.
+    assert.match(wake, /Stats: \d+\.\d+s, 1 lines/);
     const cmdIdx = wake.indexOf("Command: ");
     const statsIdx = wake.indexOf("Stats: ");
     const lastIdx = wake.indexOf("Last output: ");
@@ -6028,4 +6030,664 @@ test("bgclean all: a TERMINAL exit marker reclaims a finished log despite a reus
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── log size ceiling (maxLogBytes) ─────────────────────────────────────────
+//
+// A job that writes well past the caps used below: 200 numbered lines
+// (~6.6 KB) plus a non-zero exit code, so the marker and the exit code are
+// exercised through the capped pipeline too.
+
+const SPEW_LINES =
+  'i=0; while [ $i -lt 200 ]; do echo "line-$i-aaaaaaaaaaaaaaaaaaaaaa"; i=$((i+1)); done; exit 3';
+
+function startedId(res: { content: { text: string }[] }): string {
+  return (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+}
+
+test("bgrun: maxLogBytes keeps the first N bytes, notes the truncation, preserves the exit code", async () => {
+  await withEnv("PI_BGRUN_MAX_LOG_BYTES", "1000", async () => {
+    await withJobsDir(async (dir, h) => {
+      const { wakes, tools, ctx } = h;
+      const res = await tools.get("bgrun")!.execute(
+        "call-cap-sn",
+        { command: SPEW_LINES, name: "spew" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const id = startedId(res);
+      await waitForWakes(wakes, 1);
+
+      const log = readFileSync(join(dir, `${id}.log`), "utf8");
+      // The wrapped log fd is written by ONE writer at a time, so the notice
+      // starts exactly at the cap: 1000 bytes of command output, then "\n".
+      const noticeAt = log.indexOf(
+        "\n[pi-bgrun] output truncated at 1000 bytes (first 1000 bytes kept)\n",
+      );
+      assert.equal(noticeAt, 1000, "notice follows exactly the capped bytes");
+      assert.ok(log.startsWith("line-0-"), "the first bytes are kept");
+      assert.ok(!log.includes("line-199-"), "output past the cap was dropped");
+      // Marker still last, and the real exit code survived the pipeline.
+      const nonBlank = log.split("\n").filter((l) => l.trim().length > 0);
+      assert.equal(nonBlank[nonBlank.length - 1], "__BGRUN_EXIT__=3");
+      assert.match(wakes[0].text, /finished \(exit 3\)/);
+    });
+  });
+});
+
+test("bgrun: the truncation notice is not job output — not counted, not the last line", async () => {
+  await withEnv("PI_BGRUN_MAX_LOG_BYTES", "1000", async () => {
+    await withJobsDir(async (dir, h) => {
+      const { wakes, tools, ctx } = h;
+      const res = await tools.get("bgrun")!.execute(
+        "call-cap-stats",
+        { command: SPEW_LINES, name: "spew" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const id = startedId(res);
+      await waitForWakes(wakes, 1);
+
+      const log = readFileSync(join(dir, `${id}.log`), "utf8");
+      // Lines the caller can still READ: the capped region. Counting from the
+      // file (not from the implementation) keeps this honest — a trailing
+      // partial line is a line, exactly as the counter treats it.
+      const regionLines = log.slice(0, 1000).split("\n").length;
+      assert.match(wakes[0].text, new RegExp(`, ${regionLines} lines`));
+      assert.match(wakes[0].text, /Last output: line-\d+-a+$/m);
+      assert.ok(
+        !wakes[0].text.includes("Last output: [pi-bgrun]"),
+        "the notice is never reported as the job's last line",
+      );
+    });
+  });
+});
+
+test("bgrun: a job that outruns the cap by megabytes still finishes with its own exit code", async () => {
+  await withEnv("PI_BGRUN_MAX_LOG_BYTES", "1000", async () => {
+    await withJobsDir(async (dir, h) => {
+      const { wakes, tools, ctx } = h;
+      // ~1.3 MB, far more than the pipe buffers between producer and reader —
+      // the drain must keep the producer alive (no SIGPIPE/141) and the job's
+      // own exit code must survive the pipeline.
+      const res = await tools.get("bgrun")!.execute(
+        "call-cap-flood",
+        { command: "seq 1 200000; exit 0", name: "flood" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const id = startedId(res);
+      await waitForWakes(wakes, 1);
+
+      const log = readFileSync(join(dir, `${id}.log`), "utf8");
+      assert.equal(log.indexOf("\n[pi-bgrun] output truncated"), 1000);
+      assert.match(log, /__BGRUN_EXIT__=0\n$/);
+      assert.match(wakes[0].text, /finished \(exit 0\)/);
+    });
+  });
+});
+
+test("bgrun: a log at exactly the cap is not called truncated; one byte over is", async () => {
+  await withEnv("PI_BGRUN_MAX_LOG_BYTES", "4", async () => {
+    await withJobsDir(async (dir, h) => {
+      const { wakes, tools, ctx } = h;
+      const run = async (command: string) => {
+        const res = await tools.get("bgrun")!.execute(
+          command,
+          { command },
+          undefined,
+          undefined,
+          ctx,
+        );
+        return startedId(res);
+      };
+
+      // "abc\n" is exactly 4 bytes — nothing was dropped.
+      const atCap = await run("printf 'abc\\n'");
+      // "abcd\n" is 5 — the trailing newline is the byte that had to go.
+      const overCap = await run("printf 'abcd\\n'");
+      await waitForWakes(wakes, 2);
+
+      const exact = readFileSync(join(dir, `${atCap}.log`), "utf8");
+      assert.equal(exact, "abc\n\n__BGRUN_EXIT__=0\n");
+      assert.ok(!exact.includes("truncated"), "no notice at the boundary");
+
+      const over = readFileSync(join(dir, `${overCap}.log`), "utf8");
+      assert.ok(
+        over.includes(
+          "\n[pi-bgrun] output truncated at 4 bytes (first 4 bytes kept)\n",
+        ),
+        "one byte past the cap is truncated",
+      );
+      assert.ok(over.startsWith("abcd"), "kept the first 4 bytes");
+    });
+  });
+});
+
+test("bgrun: maxLogBytes 0 leaves the log uncapped", async () => {
+  await withEnv("PI_BGRUN_MAX_LOG_BYTES", "0", async () => {
+    await withJobsDir(async (dir, h) => {
+      const { wakes, tools, ctx } = h;
+      const res = await tools.get("bgrun")!.execute(
+        "call-cap-off",
+        { command: SPEW_LINES, name: "spew" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const id = startedId(res);
+      await waitForWakes(wakes, 1);
+
+      const log = readFileSync(join(dir, `${id}.log`), "utf8");
+      assert.ok(log.includes("line-199-"), "the whole output is kept");
+      assert.ok(!log.includes("truncated"), "no notice when uncapped");
+      assert.match(log, /__BGRUN_EXIT__=3\n$/);
+    });
+  });
+});
+
+test("bgrun: a capped job leaves no staging files behind", async () => {
+  await withEnv("PI_BGRUN_MAX_LOG_BYTES", "1000", async () => {
+    await withJobsDir(async (dir, h) => {
+      const { wakes, tools, ctx } = h;
+      await tools.get("bgrun")!.execute(
+        "call-cap-staging",
+        { command: SPEW_LINES, name: "spew" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      await waitForWakes(wakes, 1);
+
+      // The exit-code file, the count fifo and the count file are the
+      // wrapper's own scratch — it removes them before printing the marker, so
+      // a wake never leaves a `.tmp-*` in the jobs dir.
+      const strays = readdirSync(dir).filter((n) => n.startsWith(".tmp-"));
+      assert.deepEqual(strays, []);
+    });
+  });
+});
+
+test("bgclean: stale staging files (.ec/.fifo/.cnt) are reclaimed, unrelated .tmp-* are not", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const stale = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const ours = [
+      ".tmp-spew-1-abcd.ec",
+      ".tmp-spew-1-abcd.fifo",
+      ".tmp-spew-1-abcd.cnt",
+      ".tmp-spew-1-abcd.log",
+    ];
+    const foreign = ".tmp-someone-else.txt";
+    for (const name of [foreign, ...ours]) {
+      writeFileSync(join(dir, name), "");
+      utimesSync(join(dir, name), new Date(stale), new Date(stale));
+    }
+
+    await h.tools
+      .get("bgclean")!
+      .execute("call-cap-sweep", { days: 7, all: true }, undefined, undefined, h.ctx);
+
+    for (const name of ours) {
+      assert.ok(!existsSync(join(dir, name)), `${name} reclaimed`);
+    }
+    assert.ok(existsSync(join(dir, foreign)), "an unrelated .tmp-* is left alone");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgtail/bggrep work on a capped log and only see what was kept", async () => {
+  await withEnv("PI_BGRUN_MAX_LOG_BYTES", "1000", async () => {
+    await withJobsDir(async (_dir, h) => {
+      const { wakes, tools, ctx } = h;
+      const bgrun = tools.get("bgrun")!;
+      const bgtail = tools.get("bgtail")!;
+      const bggrep = tools.get("bggrep")!;
+
+      // "seq 1 400" fills the 1000-byte window exactly through line 277.
+      const res = await bgrun.execute(
+        "call-cap-read",
+        { command: "seq 1 400", name: "seq" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const id = startedId(res);
+      await waitForWakes(wakes, 1);
+
+      const grep1 = await bggrep.execute(
+        "call-cap-read",
+        { id, pattern: "^1$" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(grep1.content[0].text as string, /L1: 1/);
+
+      const grep400 = await bggrep.execute(
+        "call-cap-read",
+        { id, pattern: "^400$" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.ok(
+        !/L\d+: 400/.test(grep400.content[0].text as string),
+        "output past the cap is not searchable — it was never written",
+      );
+
+      const tail = await bgtail.execute(
+        "call-cap-read",
+        { id, lines: 3 },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const tailText = tail.content[0].text as string;
+      // The last 3 lines of what was KEPT (277 is the cap boundary), followed
+      // by the truncation label — the wrapper's raw notice line stays filtered.
+      assert.match(
+        tailText,
+        /275\n276\n277\n\n\(log truncated at 1000 bytes/,
+      );
+      assert.ok(
+        !tailText.includes("[pi-bgrun] output truncated"),
+        "the raw notice line is not shown as content",
+      );
+    });
+  });
+});
+
+test("resolveConfig: maxLogBytes accepts 0 (unlimited) and ignores blank or invalid values", async () => {
+  const mod = await loadModule();
+  const envCases: [string | undefined, unknown][] = [
+    [undefined, 67108864],
+    ["0", 0],
+    ["2048", 2048],
+    ["", 67108864], // a blank env var must not silently disable the cap
+    ["nonsense", 67108864],
+    ["-5", 67108864],
+  ];
+  for (const [value, expected] of envCases) {
+    await withEnv("PI_BGRUN_MAX_LOG_BYTES", value, () => {
+      assert.equal(
+        mod.resolveConfig({ isProjectTrusted: () => false }).maxLogBytes,
+        expected,
+        `PI_BGRUN_MAX_LOG_BYTES=${JSON.stringify(value)}`,
+      );
+    });
+  }
+
+  // The config-file layer: a non-negative number wins over the default; a
+  // negative one or a string is ignored rather than trusted.
+  const cfgFile = join(mkdtempSync(join(tmpdir(), "pi-bgrun-test-")), "user.json");
+  try {
+    for (const [value, expected] of [
+      [4096, 4096],
+      [-1, 67108864],
+      ["4096", 67108864],
+    ] as const) {
+      writeFileSync(cfgFile, JSON.stringify({ maxLogBytes: value }));
+      await withEnv("PI_BGRUN_USER_CONFIG", cfgFile, () => {
+        assert.equal(
+          mod.resolveConfig({ isProjectTrusted: () => false }).maxLogBytes,
+          expected,
+          `config maxLogBytes=${JSON.stringify(value)}`,
+        );
+      });
+    }
+  } finally {
+    rmSync(dirname(cfgFile), { recursive: true, force: true });
+  }
+});
+
+// ── truncation is visible to the agent, not just on disk ───────────────────
+
+test("formatBytes / parseTruncationFromContent: the notice counts only as the wrapper's own line", async () => {
+  const mod = await loadModule();
+  assert.equal(mod.formatBytes(900), "900 bytes");
+  assert.equal(mod.formatBytes(1000), "1000 bytes");
+  assert.equal(mod.formatBytes(1536), "1.5 KiB");
+  assert.equal(mod.formatBytes(67108864), "64 MiB");
+
+  // Real wrapper order: notice, then marker last.
+  assert.equal(
+    mod.parseTruncationFromContent("out\n\n[pi-bgrun] output truncated at 1000 bytes (first 1000 bytes kept)\n\n__BGRUN_EXIT__=0\n"),
+    1000,
+  );
+  // A running log (no marker yet) and a command that merely PRINTS the phrase
+  // are not evidence of truncation.
+  assert.equal(
+    mod.parseTruncationFromContent("[pi-bgrun] output truncated at 1000 bytes (first 1000 bytes kept)\n"),
+    null,
+  );
+  assert.equal(
+    mod.parseTruncationFromContent("boom\n__BGRUN_EXIT__=1\n"),
+    null,
+  );
+});
+
+test("wake: a capped job says so in the Stats line; an uncapped one does not", async () => {
+  const run = async (cap: string, command: string) => {
+    let wake = "";
+    await withEnv("PI_BGRUN_MAX_LOG_BYTES", cap, async () => {
+      await withJobsDir(async (_dir, h) => {
+        await h.tools
+          .get("bgrun")!
+          .execute("call-wake-cap", { command, name: "j" }, undefined, undefined, h.ctx);
+        await waitForWakes(h.wakes, 1);
+        wake = h.wakes[0].text;
+      });
+    });
+    return wake;
+  };
+
+  const capped = await run("1000", SPEW_LINES);
+  assert.match(capped, /Stats: [\d.]+s, [\d,]+ lines, log truncated at 1000 bytes/);
+
+  const plain = await run("1000000", "printf 'hello\\n'");
+  assert.ok(
+    !plain.includes("log truncated"),
+    "no truncation claim for a log inside the cap",
+  );
+  assert.match(plain, /Stats: [\d.]+s, 1 lines/);
+});
+
+test("wake digest: a scorecard is skipped, not misreported, when the log was capped", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ label: "cap", command: "echo digest-ran" }],
+    });
+
+    await withEnv("PI_BGRUN_MAX_LOG_BYTES", "1000", async () => {
+      const capped = await runDigestJob(proj, {
+        command: SPEW_LINES,
+        type: "test",
+      });
+      const line = digestLineOf(capped);
+      assert.ok(line, "the digest line is still present");
+      assert.match(line!, /^digest \(cap\): skipped — the log was truncated at 1000 bytes/);
+      assert.ok(
+        !capped.includes("digest-ran"),
+        "the scorecard never ran against a truncated log",
+      );
+    });
+
+    // Under the cap the scorecard runs exactly as before.
+    const plain = await runDigestJob(proj, {
+      command: "printf 'hello\\n'",
+      type: "test",
+    });
+    assert.match(digestLineOf(plain)!, /^digest \(cap\): digest-ran$/);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("bgtail/bggrep: a capped log is labelled, and carries truncatedAtBytes", async () => {
+  await withEnv("PI_BGRUN_MAX_LOG_BYTES", "1000", async () => {
+    await withJobsDir(async (_dir, h) => {
+      const { wakes, tools, ctx } = h;
+      const bgrun = tools.get("bgrun")!;
+      const bgtail = tools.get("bgtail")!;
+      const bggrep = tools.get("bggrep")!;
+
+      const res = await bgrun.execute(
+        "call-read-cap",
+        { command: "seq 1 400", name: "seq" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const id = startedId(res);
+      await waitForWakes(wakes, 1);
+
+      const tail = await bgtail.execute(
+        "call-read-cap",
+        { id, lines: 3 },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(
+        tail.content[0].text as string,
+        /log truncated at 1000 bytes .*not the run's real end/,
+      );
+      assert.equal(tail.details.truncatedAtBytes, 1000);
+
+      // The dangerous case: failures past the cap look like "no failures".
+      const none = await bggrep.execute(
+        "call-read-cap",
+        { id, pattern: "^400$" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(none.content[0].text as string, /— none/);
+      assert.match(
+        none.content[0].text as string,
+        /output past the cap was never written and was not searched/,
+      );
+      assert.equal(none.details.truncatedAtBytes, 1000);
+    });
+  });
+});
+
+test("bgtail/bggrep: no truncation label on an uncapped log", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const bggrep = tools.get("bggrep")!;
+
+    const res = await bgrun.execute(
+      "call-read-plain",
+      { command: "printf 'line1\\nline2\\n'", name: "plain" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = startedId(res);
+    await waitForWakes(wakes, 1);
+
+    const tail = await bgtail.execute(
+      "call-read-plain",
+      { id, lines: 2 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!(tail.content[0].text as string).includes("truncated"));
+    assert.equal(tail.details.truncatedAtBytes, undefined);
+
+    const grep = await bggrep.execute(
+      "call-read-plain",
+      { id, pattern: "line1" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!(grep.content[0].text as string).includes("truncated"));
+    assert.equal(grep.details.truncatedAtBytes, undefined);
+  });
+});
+
+test("bgtail/bggrep: a log bigger than the 2 MB read window says it was only partly searched", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const bggrep = tools.get("bggrep")!;
+
+    // ~2.7 MB — past LOG_READ_BYTES, so both readers see only the tail of it.
+    const res = await bgrun.execute(
+      "call-window",
+      { command: "seq 1 400000", name: "big" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = startedId(res);
+    await waitForWakes(wakes, 1);
+
+    const tail = await bgtail.execute(
+      "call-window",
+      { id, lines: 3 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      tail.content[0].text as string,
+      /searched the last 2 MiB of [\d.]+ MiB — the earlier bytes were not searched/,
+    );
+
+    // "— none" on a >2 MB log must not read as "no failures anywhere".
+    const grep = await bggrep.execute(
+      "call-window",
+      { id, pattern: "^1$" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(grep.content[0].text as string, /— none/);
+    assert.match(
+      grep.content[0].text as string,
+      /the earlier bytes were not searched/,
+    );
+  });
+});
+
+test("bgtail/bggrep: no window caveat on a small log", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const res = await bgrun.execute(
+      "call-window-small",
+      { command: "printf 'a\\nb\\n'", name: "small" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = startedId(res);
+    await waitForWakes(wakes, 1);
+
+    for (const tool of ["bgtail", "bggrep"] as const) {
+      const out = await tools.get(tool)!.execute(
+        "call-window-small",
+        tool === "bgtail" ? { id, lines: 2 } : { id, pattern: "a" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.ok(
+        !(out.content[0].text as string).includes("searched the last"),
+        `${tool}: no window caveat under the read bound`,
+      );
+    }
+  });
+});
+
+test("bggrep/bgtail: `bytes` widens the search window without widening the output", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bggrep = tools.get("bggrep")!;
+    const bgtail = tools.get("bgtail")!;
+
+    // The marker is written FIRST, then ~2.7 MB of lines — so the default
+    // 2 MiB window cannot see it, and a widened window can.
+    const res = await bgrun.execute(
+      "call-bytes",
+      { command: "echo EARLY-MARKER; seq 1 400000", name: "wide" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = startedId(res);
+    await waitForWakes(wakes, 1);
+
+    const narrow = await bggrep.execute(
+      "call-bytes",
+      { id, pattern: "EARLY-MARKER" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(narrow.content[0].text as string, /— none/);
+    assert.match(narrow.content[0].text as string, /pass a larger `bytes`/);
+    assert.equal(narrow.details.windowBytes, 2 * 1024 * 1024);
+
+    const wide = await bggrep.execute(
+      "call-bytes",
+      { id, pattern: "EARLY-MARKER", bytes: 8 * 1024 * 1024 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(wide.content[0].text as string, /L1: EARLY-MARKER/);
+    assert.equal(wide.details.windowBytes, 8 * 1024 * 1024);
+    // The claim that matters: scanning more does NOT mean returning more.
+    assert.ok(
+      (wide.content[0].text as string).length < 9000,
+      "output stays under the condenser cap",
+    );
+
+    // A window bigger than any job could write is clamped to the ceiling.
+    const huge = await bggrep.execute(
+      "call-bytes",
+      { id, pattern: "EARLY-MARKER", bytes: 1e15 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(huge.details.windowBytes, 67108864);
+
+    // bgtail: changing the window is a different VIEW, not appended output —
+    // it must reset to a full tail instead of claiming "+N new lines".
+    const first = await bgtail.execute(
+      "call-bytes",
+      { id, lines: 3 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(first.content[0].text as string, /400000/);
+    const rewidened = await bgtail.execute(
+      "call-bytes",
+      { id, lines: 3, bytes: 8 * 1024 * 1024 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      rewidened.content[0].text as string,
+      /search window changed since last read/,
+    );
+    assert.ok(
+      !rewidened.content[0].text.includes("new lines since last read"),
+      "no bogus delta after a window change",
+    );
+  });
+});
+
+test("clampReadWindow: default, explicit, garbage, and ceiling", async () => {
+  const mod = await loadModule();
+  assert.equal(mod.clampReadWindow(undefined), 2097152);
+  assert.equal(mod.clampReadWindow(0), 2097152);
+  assert.equal(mod.clampReadWindow(-1), 2097152);
+  assert.equal(mod.clampReadWindow(Number.NaN), 2097152);
+  assert.equal(mod.clampReadWindow("8192"), 2097152);
+  assert.equal(mod.clampReadWindow(65536), 65536);
+  assert.equal(mod.clampReadWindow(65536.7), 65536);
+  assert.equal(mod.clampReadWindow(1e12), 67108864);
 });

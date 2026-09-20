@@ -35,8 +35,8 @@ Restart pi after install so the extension loads.
 | ------ | --------- |
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
-| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB**), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
-| `bggrep` | Regex search over the **last 2 MB** of a job's log: line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Runs inside the extension, so it reaches the configured jobs dir (including a global one) that project-sandboxed tools (`ctx_execute_file`) cannot. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
+| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
+| `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days); `days` must be a positive number (`days: 0` is rejected rather than purging everything). Never removes a running job's log. |
 
 ## Slash commands
@@ -85,8 +85,9 @@ exit code even after a restart.
 
 ## Reading results without flooding context
 
-Two-tier read model — the log file stays complete on disk for deep analysis;
-only bounded digests ever enter the conversation:
+Two-tier read model — the log file itself stays on disk, capped (see
+[log size ceiling](#log-size-ceiling)), for deep analysis; only bounded digests
+ever enter the conversation:
 
 - **Quick peek:** `bgtail <id>` — condensed newest lines (ANSI stripped, repeats
   collapsed, ~2KB/line and ~8KB caps). The first read is the last-40-lines tail; each later
@@ -94,21 +95,29 @@ only bounded digests ever enter the conversation:
   free. The wake message itself already carries the exit code and the log's
   last line, so many turns need no follow-up read at all.
 - **Pattern search:** `bggrep <id> [pattern] [context]` — line-numbered matches,
-  capped and condensed (~50 matches, ~2KB/line, ~8KB); works on global jobs dirs that `ctx_execute_file`
-  cannot reach. Pass your own pattern when you know the log's format.
+  capped and condensed (~50 matches, ~2KB/line, ~8KB); takes the job id, so
+  there is no log path to reconstruct. Searches the **last 2 MB** by default —
+  pass `bytes` to widen (max 64 MiB), or use `ctx_execute_file` on the path for
+  whole-file code-based analysis. Pass your own pattern when you know the log's
+  format. A **wider window costs latency and memory, not context**: the returned
+  matches stay capped either way.
 - **Whole-log analysis:** `ctx_execute_file` on the job's log path (reachable
   when logs are project-local) to extract only failure lines. Never `cat` or
-  `Read` a full bgrun log.
+  `Read` a full bgrun log. The sandbox keeps the file's bytes out of context —
+  only your script's **stdout** enters it — so print aggregates and capped
+  slices (`fails.slice(0, 40)`), never the content. With a 64 MiB-ceiling log,
+  an unsliced `console.log(FILE_CONTENT)` is the one way this path becomes the
+  dump it exists to avoid; use `bgtail`/`bggrep` first, and this third.
 
 **Why `bggrep` instead of `bash grep` on the log?** A bash grep's output is
 uncapped — a retry-storm log can dump thousands of matching lines straight
 into context, and safety depends on remembering `| head` on every call.
-`bggrep` is bounded by design (last 2 MB of the log, per-line 10 000-char
-pre-truncation before matching, ~50 matches, ~8KB), takes the job id instead of
-a reconstructed log path (no shell-quoting of the regex), reaches the
-configured jobs dir (including a global one) that project-sandboxed tools like
-`ctx_execute_file` cannot, and reports match counts, line numbers, and
-skip markers. Plain `grep` is fine only for a one-off search you know is tiny.
+`bggrep` is bounded by design (last 2 MB of the log by default — `bytes` widens
+it, max 64 MiB — per-line 10 000-char pre-truncation before matching, ~50
+matches, ~8KB), takes the job id instead of
+a reconstructed log path (no shell-quoting of the regex), resolves the job id to the
+configured jobs dir itself (no path to reconstruct), and reports match counts,
+line numbers, and skip markers. Plain `grep` is fine only for a one-off search you know is tiny.
 
 ### Bounded matching
 
@@ -120,6 +129,36 @@ worker with a wall-clock budget (default `2000ms`, override with
 and `bggrep` returns an error — **a runaway pattern fails, it never hangs the
 session.** Normal patterns and logs finish far inside the budget; worker
 startup adds a few tens of milliseconds per call.
+
+### Log size ceiling
+
+stdout+stderr used to go straight to the log file with no write bound, so a
+runaway job (`yes`, a spew loop, a pathological build) could fill the disk and
+take the machine down. Job logs are now capped (`maxLogBytes` / `PI_BGRUN_MAX_LOG_BYTES`,
+default **64 MiB**, `0` = unlimited):
+
+- The cap keeps the **first** N bytes. There is no portable in-tree way to keep
+  the tail — a ring buffer needs a helper binary, and rewriting the file breaks
+  the readers that depend on the exit marker staying last. A job past 64 MiB is
+  almost always a runaway, so the head is the useful part.
+- The ceiling lives **inside the detached process tree**, so it still holds
+  after pi exits or crashes — it is not a pi-side watchdog.
+- The job is **not** killed, and its real exit code is preserved: bytes past the
+  cap are drained and discarded instead of SIGPIPE'ing the producer into `141`.
+- It is **not silent**. The log carries
+  `[pi-bgrun] output truncated at <N> bytes (first <N> bytes kept)` on the line
+  before the exit marker — filtered out of content readers exactly like the exit
+  marker — and every surface the agent reads is labelled instead: the wake's
+  Stats line gains `log truncated at 64 MiB`, `bgtail` and `bggrep` append a
+  note and report `truncatedAtBytes` in their details, and a configured digest
+  scorecard is **skipped** rather than run against a log that lost its end —
+  summaries and failure lists live at the end, so its numbers would be
+  confidently wrong. Treat a skipped digest on a capped job as "unknown", not
+  "no failures".
+- Cost: a capped job runs through a few extra processes (`tee`, `head`, `wc`) —
+  a few tens of milliseconds of job startup, no steady-state overhead.
+- Configure `maxLogBytes: 0` for the previous uncapped behavior, e.g. when the
+  whole log must survive for `ctx_execute_file`.
 
 ## Configuration
 
@@ -150,6 +189,7 @@ config file (trusted projects only) ← environment variables**.
   "adoptForeignJobs": false,
   "showCompletedJobs": false,
   "cleanupDays": 7,
+  "maxLogBytes": 67108864,
   "globalAutoClean": true,
   "jobsDir": "/some/other/dir"
 }
@@ -213,6 +253,7 @@ Environment variables (same knobs, handy for one-off overrides):
 | `PI_BGRUN_FOREIGN_JOBS` | `false` | Adopt other sessions' running jobs into this session's widget and job list. Adopted jobs are polled so they leave the widget when they finish. |
 | `PI_BGRUN_SHOW_COMPLETED` | `false` | Include finished jobs in `bgstatus` listings by default. |
 | `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |
+| `PI_BGRUN_MAX_LOG_BYTES` | `67108864` (64 MiB) | Byte ceiling for a job's log (stdout+stderr). `0` disables it (unlimited). See [Log size ceiling](#log-size-ceiling). |
 | `PI_BGRUN_GLOBAL_AUTO_CLEAN` | `true` | Set `0`/`false` to disable the automatic orphan sweep (see below). |
 | `PI_BGRUN_GREP_TIMEOUT_MS` | `2000` | Wall-clock budget for a `bggrep` match. A caller-supplied regex that exceeds it is aborted (its worker terminated) and reported as an error instead of hanging — see [Bounded matching](#bounded-matching). |
 | `PI_BGRUN_USER_CONFIG` | `~/.pi/agent/pi-bgrun.json` | Override the user-level config file path (see [Configuration](#configuration)). |
