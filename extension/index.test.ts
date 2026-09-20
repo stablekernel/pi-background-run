@@ -5925,16 +5925,24 @@ test("bggrep: a pathological regex returns within the budget instead of hanging"
     const { pi, tools, ctx } = makeFakePi();
     await loadExtension(pi);
     const id = `patho-${Math.floor(Date.now() / 1000)}-${process.pid}`;
-    // A long run of `a` then `b` is the classic catastrophic-backtracking input
-    // for `^(a+)+$`. Under Node/V8 this would lock the thread; the worker must
-    // abort at the 2s budget. Under Bun's engine it completes quickly.
-    writeFileSync(join(dir, `${id}.log`), "a".repeat(60_000) + "b\n");
+    // Classic catastrophic-backtracking input for `^(a+)+$` — and the failing
+    // character has to sit INSIDE the per-line cap (BGGREP_LINE_CAP = 10 000),
+    // or the pre-match truncation removes it and the pattern matches instantly
+    // (measured: a 60 000-char line whose `!` lands past the cap matches in 0ms
+    // on BOTH engines, which made this test vacuous).
+    writeFileSync(
+      join(dir, `${id}.log`),
+      "a".repeat(9_000) + "!" + "a".repeat(50_000) + "\n",
+    );
     const t0 = Date.now();
     const res = await tools
       .get("bggrep")!
       .execute("c", { id, pattern: "^(a+)+$" }, undefined, undefined, ctx);
     const elapsed = Date.now() - t0;
     assert.ok(elapsed < 5_000, `bounded by the budget (${elapsed}ms)`);
+    // Engine-dependent by nature: V8 backtracks here and the budget must trip
+    // (see the abort-path test for that branch); JSC answers in ~250ms without
+    // backtracking. Both are acceptable — hanging is not.
     assert.ok(
       res.isError === true || typeof res.content[0].text === "string",
       "returns a result (no hang, no throw)",
@@ -6699,4 +6707,26 @@ test("clampReadWindow: default, explicit, garbage, and ceiling", async () => {
   assert.equal(mod.clampReadWindow(65536), 65536);
   assert.equal(mod.clampReadWindow(65536.7), 65536);
   assert.equal(mod.clampReadWindow(1e12), 67108864);
+});
+
+test("bggrep: the budget terminates a worker that is stuck mid-match (abort path)", async () => {
+  const mod: any = await loadModule();
+  // An input-driven catastrophic pattern cannot test this portably: V8
+  // backtracks exponentially where JSC answers in constant time (measured:
+  // `^(a+)+$` over 100 "a"s + "!" hangs Node past 10s and returns on Bun in
+  // ~250ms). So the stall is injected instead — a worker body that never
+  // returns — and the only assertion is that the budget still ends it. That is
+  // exactly what a runaway regex looks like to the parent thread.
+  const stall = 'require("node:worker_threads"); for (;;) {}';
+  const t0 = Date.now();
+  const outcome = await mod.matchLinesWithBudget(
+    "a",
+    ["a".repeat(50)],
+    10,
+    300,
+    stall,
+  );
+  const elapsed = Date.now() - t0;
+  assert.equal(outcome.kind, "timeout", "a stuck worker is reported as a timeout");
+  assert.ok(elapsed < 3_000, `terminated promptly (${elapsed}ms)`);
 });

@@ -181,11 +181,17 @@ function matchLinesSyncBounded(
   return { kind: "ok", matchIdx: out };
 }
 
-async function matchLinesWithBudget(
+// Exported, and workerSource-injectable, so a test can prove the ABORT path on
+// any engine: pass a worker body that never returns and the budget must still
+// yield `{kind: "timeout"}`. Input-driven catastrophic patterns cannot test it
+// — engines differ (V8 backtracks exponentially where JSC does not), so the
+// only portable assertion is that termination works.
+export async function matchLinesWithBudget(
   source: string,
   lines: string[],
   cap: number,
   budgetMs: number,
+  workerSource: string = BGGREP_WORKER_SOURCE,
 ): Promise<GrepMatchOutcome> {
   let WorkerCtor: typeof import("node:worker_threads").Worker;
   try {
@@ -195,7 +201,7 @@ async function matchLinesWithBudget(
   }
   let worker: import("node:worker_threads").Worker;
   try {
-    worker = new WorkerCtor(BGGREP_WORKER_SOURCE, {
+    worker = new WorkerCtor(workerSource, {
       eval: true,
       workerData: { source, lines, cap },
     });
