@@ -11,3 +11,8 @@ dist/
 
 # Transient agent working files — never committed.
 .pi/wip/
+
+# Local pi-bgrun project config (jobsDir / showCompletedJobs / digest) — per
+# contributor, not repo policy: it changes what every bgrun job in this checkout
+# does, and a digest command is shell run at wake time. See docs/dogfooding.md.
+.pi/pi-bgrun.json

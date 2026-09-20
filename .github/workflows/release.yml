@@ -47,6 +47,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # npm (Node) on purpose, unlike ci.yml which is bun-only: `bun publish`
+      # has no OIDC trusted-publishing or provenance support — it authenticates
+      # with a long-lived NPM_CONFIG_TOKEN — so switching would trade a
+      # tokenless, attested release for a stored bearer credential. Revisit only
+      # if Bun ships trusted publishing.
       - name: Set up Node 24
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
