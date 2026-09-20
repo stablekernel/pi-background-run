@@ -148,16 +148,29 @@ default **64 MiB**, `0` = unlimited):
   cap are drained and discarded instead of SIGPIPE'ing the producer into `141`.
 - It is **not silent**. The log carries
   `[pi-bgrun] output truncated at <N> bytes (first <N> bytes kept)` on the line
-  before the exit marker — filtered out of content readers exactly like the exit
-  marker — and every surface the agent reads is labelled instead: the wake's
-  Stats line gains `log truncated at 64 MiB`, `bgtail` and `bggrep` append a
-  note and report `truncatedAtBytes` in their details, and a configured digest
-  scorecard is **skipped** rather than run against a log that lost its end —
-  summaries and failure lists live at the end, so its numbers would be
-  confidently wrong. Treat a skipped digest on a capped job as "unknown", not
-  "no failures".
-- Cost: a capped job runs through a few extra processes (`tee`, `head`, `wc`) —
-  a few tens of milliseconds of job startup, no steady-state overhead.
+  before the exit marker, and the marker line itself carries the flag
+  (`__BGRUN_EXIT__=0 truncated=67108864`) — readers trust that marker, never
+  printable text, so a command that echoes something that looks like the notice
+  cannot make its own log look capped. The notice is filtered out of content
+  readers exactly like the exit marker, and every surface the agent reads is
+  labelled instead: the wake's Stats line gains `log truncated at 64 MiB`,
+  `bgtail` and `bggrep` append a note and report `truncatedAtBytes` in their
+  details, and a configured digest scorecard is **skipped** rather than run
+  against a log that lost its end — summaries and failure lists live at the end,
+  so its numbers would be confidently wrong. Treat a skipped digest on a capped
+  job as "unknown", not "no failures".
+- Reading a capped log stays readable-whole: the widest `bytes` window is the
+  ceiling **plus 4 KiB** (not the ceiling itself, which a capped log always
+  exceeds by its notices and marker), so `bytes: 67108864` still spans the whole
+  kept log. Windows are additionally limited to their last 500 000 lines —
+  materializing a 64 MiB window of one-character lines would cost gigabytes of
+  strings — and when that line bound trims a window, `bgtail`/`bggrep` say so in
+  the same labelled way instead of silently answering from a subset.
+- Cost: a capped job runs through one copier process (`perl` where available,
+  else `dd`/`head`) reading the job through a fifo, plus a bounded drain wait —
+  a few tens of milliseconds of job startup, no steady-state overhead. The
+  copier is also what drains the stream past the cap, so the producer is never
+  SIGPIPE'd.
 - Configure `maxLogBytes: 0` for the previous uncapped behavior, e.g. when the
   whole log must survive for `ctx_execute_file`.
 

@@ -148,7 +148,11 @@ that expensive rather than merely rude. Aggregate, then cap what you print:
   skipped rather than scored against an incomplete log — so on a capped job,
   read a missing digest as "unknown", **not** as "no failures", and do not
   re-run the command to see the missing tail; raise the ceiling if you need the
-  whole log.
+  whole log. The flag lives in the exit marker (`__BGRUN_EXIT__=0
+  truncated=<N>`), so treat a notice-looking line printed by the command itself
+  as content, not as a cap signal. A search window is also limited to its last
+  500 000 lines: when that bites, `bgtail`/`bggrep` say so — a "none" from a
+  trimmed window means the head was not searched.
 - Logs default to `<project>/.pi-bgrun/jobs` in a repo — project-scoped is the
   model (`~/.pi-bgrun/jobs` is a deprecated fallback for a cwd with no project
   root; an absolute `PI_BGRUN_DIR`/`jobsDir` still works but is legacy). Project-local dirs are
