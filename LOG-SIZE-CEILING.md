@@ -1,10 +1,14 @@
 # bgrun: child stdout size ceiling (Option A) — implementation brief
 
 Status: IMPLEMENTED and COMMITTED on `lloydsk/log-size-ceiling`, base
-`8cba8d9`. Every commit verified green on its own tree (`tsc --noEmit` + 183/183
-under bun); HEAD also verified under `node --test` (183/183).
+`8cba8d9`. Every commit verified green on its own tree (`tsc --noEmit` + 193/193
+under bun); HEAD also verified under `node --test` (193/193, Node 24.15, ~20s).
 
 ```
+e72b9aa docs: add the log-size-ceiling implementation brief
+e39fb13 docs: state the ceiling's reader contract (marker flag, window and line bounds)
+73a8327 ci: check the publish allowlist with npm pack
+8e27f03 fix: close the log-ceiling review defects (shell parsing, hang, bounds)
 f137a9f ci(release): document why publishing stays on npm, not bun publish
 63a1c15 test: cover the bggrep sync fallback (the path without worker_threads)
 c2f4207 test: verify the bggrep worker abort path, and fix a vacuous pathological test
