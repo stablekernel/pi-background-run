@@ -157,7 +157,7 @@ type GrepMatchOutcome =
 
 // Bounded between lines only — a single pathological line can still stall.
 // Used solely when worker_threads is unavailable (never on Node or Bun).
-function matchLinesSyncBounded(
+export function matchLinesSyncBounded(
   source: string,
   lines: string[],
   cap: number,

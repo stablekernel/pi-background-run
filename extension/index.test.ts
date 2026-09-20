@@ -6730,3 +6730,58 @@ test("bggrep: the budget terminates a worker that is stuck mid-match (abort path
   assert.equal(outcome.kind, "timeout", "a stuck worker is reported as a timeout");
   assert.ok(elapsed < 3_000, `terminated promptly (${elapsed}ms)`);
 });
+
+// ── the sync fallback (bggrep without worker_threads) ──────────────────────
+//
+// Unreachable on Node and Bun, which is exactly why it needs direct tests: the
+// path only runs where worker_threads is missing, so a regression would ship
+// silently and surface as "bggrep behaves differently in that environment".
+
+test("bggrep sync fallback: same results as the worker path, including the line cap", async () => {
+  const mod: any = await loadModule();
+  const lines = [
+    "pass ok",
+    "--- FAIL: TestA",
+    "x".repeat(50) + "NEEDLE", // the only NEEDLE sits past the per-line cap
+    "--- FAIL: TestB",
+    "",
+  ];
+  for (const pattern of ["^--- FAIL:", "NEEDLE", "^pass", "nothing-matches"]) {
+    const sync = mod.matchLinesSyncBounded(pattern, lines, 10, 1_000);
+    const worker = await mod.matchLinesWithBudget(pattern, lines, 10, 2_000);
+    assert.deepEqual(
+      sync,
+      worker,
+      `fallback and worker disagree for /${pattern}/`,
+    );
+    if (pattern === "NEEDLE") {
+      assert.deepEqual(sync, { kind: "ok", matchIdx: [] }, "cap applies to both");
+    }
+  }
+  // An invalid pattern must fail the same way on both paths.
+  assert.equal(mod.matchLinesSyncBounded("(", lines, 10, 1_000).kind, "invalid");
+  assert.equal(
+    (await mod.matchLinesWithBudget("(", lines, 10, 2_000)).kind,
+    "invalid",
+  );
+});
+
+test("bggrep sync fallback: a spent budget stops the scan before the first line", async () => {
+  const mod: any = await loadModule();
+  // A negative budget is the deterministic spelling of "the clock says stop".
+  // If the guard did not fire up front, this fallback would happily scan an
+  // entire log on the main thread — the scenario the worker exists to avoid.
+  assert.equal(
+    mod.matchLinesSyncBounded("a", ["a", "a", "a"], 10, -1).kind,
+    "timeout",
+  );
+  // And the mid-scan check: a budget spent while a real corpus is being scanned
+  // must abort too (the loop re-checks every 0x3ff lines). 300 000 lines of a
+  // simple pattern takes several ms, so a 0ms budget is provably exceeded.
+  const many = Array.from({ length: 300_000 }, (_, i) => `line ${i}`);
+  assert.equal(
+    mod.matchLinesSyncBounded("line", many, 100, 0).kind,
+    "timeout",
+    "a budget spent mid-scan aborts instead of finishing the corpus",
+  );
+});
