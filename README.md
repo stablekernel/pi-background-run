@@ -208,6 +208,12 @@ config file (trusted projects only) ← environment variables**.
 - User: `~/.pi/agent/pi-bgrun.json`
 - Project: `<project>/.pi/pi-bgrun.json`
 
+The project file is per-contributor state, not shared policy: it is read only for
+a trusted project, it changes what every `bgrun` job in that checkout does, and a
+digest entry runs a shell command at wake time. This repo therefore gitignores
+its own; [`docs/dogfooding.md`](docs/dogfooding.md) has the setup its maintainers
+run locally (completed jobs visible, a scorecard on `bun test` runs).
+
 ```json
 {
   "adoptForeignJobs": false,
