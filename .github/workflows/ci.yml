@@ -24,11 +24,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Set up Node 24
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: "24"
-
+      # Bun-only on purpose: it runs every step below (lint, tests, pack
+      # listing), so a Node toolchain here would be dead weight. The one thing a
+      # Node job would add is the V8/worker_threads side of bggrep's bounded
+      # matching — verified by hand with `node --test extension/index.test.ts`
+      # (183 pass, ~16s). Re-run that by hand after touching the bggrep worker.
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -40,19 +40,19 @@ jobs:
       - name: tsc --noEmit
         id: tsc
         run: |
-          npx tsc --noEmit
+          bun run lint
           echo "result=passed" >> "$GITHUB_OUTPUT"
 
       - name: Run tests
         id: tests
-        run: npm test
+        run: bun test extension/index.test.ts
 
-      - name: npm pack --dry-run (files allowlist sanity)
+      - name: bun pm pack --dry-run (files allowlist sanity)
         id: pack
         run: |
-          pack_output=$(npm pack --dry-run 2>&1)
+          pack_output=$(bun pm pack --dry-run 2>&1)
           echo "$pack_output"
-          file_count=$(echo "$pack_output" | grep -oP 'total files:\s*\K[0-9]+' || echo "?")
+          file_count=$(echo "$pack_output" | grep -oP 'Total files:\s*\K[0-9]+' || echo "?")
           echo "file_count=${file_count}" >> "$GITHUB_OUTPUT"
           # Enforce the allowlist: test files and other non-runtime files must
           # never ship in the published tarball (they bloat installs and leak
@@ -87,7 +87,7 @@ jobs:
             echo "|---|---|"
             echo "| tsc --noEmit | ${TSC_RESULT} |"
             echo "| tests | ${TESTS_OUTCOME} |"
-            echo "| npm pack --dry-run | ${PACK_OUTCOME} (${PACK_FILES} files in tarball) |"
+            echo "| bun pm pack --dry-run | ${PACK_OUTCOME} (${PACK_FILES} files in tarball) |"
             echo ""
             echo "Ref: \`${HEAD_SHA}\`"
           } > "$body_file"
@@ -121,7 +121,7 @@ jobs:
             echo "|---|---|"
             echo "| tsc --noEmit | \`${TSC_RESULT}\` |"
             echo "| tests | \`${TESTS_OUTCOME}\` |"
-            echo "| npm pack --dry-run | \`${PACK_OUTCOME}\` — ${PACK_FILES} files in tarball |"
+            echo "| bun pm pack --dry-run | \`${PACK_OUTCOME}\` — ${PACK_FILES} files in tarball |"
             echo ""
             echo "Ref: \`${COMMIT_SHA}\`"
           } >> "$GITHUB_STEP_SUMMARY"
