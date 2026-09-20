@@ -66,8 +66,11 @@ wake messages) is the agent's workflow.
 ```text
 agent calls bgrun(command: "make test-short", name: "unit-tests")
   → extension resolves log path: <jobsDir>/<slug>-<ts>-<pid>.log (default <project>/.pi-bgrun/jobs/ in a repo, else ~/.pi-bgrun/jobs/)
-  → spawn('sh', ['-c', 'sh -c "$1"; ec=$?; printf "\\n__BGRUN_EXIT__=%d\\n" "$ec"; exit "$ec"', 'bgrun', '<cmd>'],
+  → spawn('sh', ['-c', <wrapper>, 'bgrun', '<cmd>'],
           { stdio: ['ignore', logFd, logFd], detached: true }).unref()
+       <wrapper> = the output-ceiling pipeline (see "Log size ceiling"), or the
+       uncapped one-liner 'sh -c "$1"; ec=$?; printf "\\n__BGRUN_EXIT__=%d\\n" "$ec"; exit "$ec"'
+       when the ceiling is disabled (maxLogBytes: 0)
   → records job in-memory + appends a bgrun-job entry to the session
   → returns "started: <job-id>"
 
@@ -147,13 +150,18 @@ default **64 MiB**, `0` = unlimited):
 - The job is **not** killed, and its real exit code is preserved: bytes past the
   cap are drained and discarded instead of SIGPIPE'ing the producer into `141`.
 - It is **not silent**. The log carries
-  `[pi-bgrun] output truncated at <N> bytes (first <N> bytes kept)` on the line
+  `__BGRUN_TRUNC__ output truncated: kept the first <N> bytes` on the line
   before the exit marker, and the marker line itself carries the flag
-  (`__BGRUN_EXIT__=0 truncated=67108864`) — readers trust that marker, never
-  printable text, so a command that echoes something that looks like the notice
-  cannot make its own log look capped. The notice is filtered out of content
-  readers exactly like the exit marker, and every surface the agent reads is
-  labelled instead: the wake's Stats line gains `log truncated at 64 MiB`,
+  (`__BGRUN_EXIT__=0 truncated=67108864`). Both are reserved `__BGRUN_*__` lines
+  that content readers filter exactly like the exit marker, and readers classify
+  the notice by that **marker flag**, never by matching text — a command that
+  echoes a notice-shaped line cannot make its own log look capped, and cannot
+  get its own output discounted as wrapper bookkeeping either. If the ceiling
+  could not be installed at all (`mkfifo` unavailable, so the job ran uncapped)
+  the log says that too — `__BGRUN_NOCAP__ log ceiling unavailable`, with
+  `nocap=1` in the marker — so "uncapped" is never indistinguishable from
+  "output was that small". Every surface the agent reads is labelled: the wake's
+  Stats line gains `log truncated at 64 MiB`,
   `bgtail` and `bggrep` append a note and report `truncatedAtBytes` in their
   details, and a configured digest scorecard is **skipped** rather than run
   against a log that lost its end — summaries and failure lists live at the end,
@@ -166,6 +174,8 @@ default **64 MiB**, `0` = unlimited):
   materializing a 64 MiB window of one-character lines would cost gigabytes of
   strings — and when that line bound trims a window, `bgtail`/`bggrep` say so in
   the same labelled way instead of silently answering from a subset.
+- Maintainer rationale — why a fifo, why the *first* bytes, which alternatives
+  were measured and rejected: [`docs/log-size-ceiling.md`](docs/log-size-ceiling.md).
 - Cost: a capped job runs through one copier process (`perl` where available,
   else `dd`/`head`) reading the job through a fifo, plus a bounded drain wait —
   a few tens of milliseconds of job startup, no steady-state overhead. The

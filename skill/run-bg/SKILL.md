@@ -139,8 +139,9 @@ that expensive rather than merely rude. Aggregate, then cap what you print:
 - One job = one id. Multiple concurrent jobs are fine — each has its own log.
 - Job logs are capped by default (`maxLogBytes` / `PI_BGRUN_MAX_LOG_BYTES`,
   64 MiB; `0` = unlimited) and the cap keeps the **first** bytes. A log that
-  ends with `[pi-bgrun] output truncated at <N> bytes (first <N> bytes kept)`
-  hit that ceiling: output past it was dropped, not lost to a failure — the job
+  ends with `__BGRUN_TRUNC__ output truncated: kept the first <N> bytes` (or
+  `__BGRUN_NOCAP__ log ceiling unavailable`, when the ceiling could not be
+  installed and the job ran uncapped) hit that ceiling: output past it was dropped, not lost to a failure — the job
   still ran to completion with its real exit code, and readers (`bgtail`,
   `bggrep`, the wake's line count/last line) filter the notice out. The wake's
   Stats line, `bgtail` and `bggrep` all say when a log was capped (and report
@@ -149,8 +150,9 @@ that expensive rather than merely rude. Aggregate, then cap what you print:
   read a missing digest as "unknown", **not** as "no failures", and do not
   re-run the command to see the missing tail; raise the ceiling if you need the
   whole log. The flag lives in the exit marker (`__BGRUN_EXIT__=0
-  truncated=<N>`), so treat a notice-looking line printed by the command itself
-  as content, not as a cap signal. A search window is also limited to its last
+  truncated=<N>`, or `nocap=1`), never in printable text — the `__BGRUN_*__`
+  lines are reserved, so a notice-looking line printed by the command itself is
+  content, not a signal. A search window is also limited to its last
   500 000 lines: when that bites, `bgtail`/`bggrep` say so — a "none" from a
   trimmed window means the head was not searched.
 - Logs default to `<project>/.pi-bgrun/jobs` in a repo — project-scoped is the
