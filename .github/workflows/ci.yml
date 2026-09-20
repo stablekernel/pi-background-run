@@ -28,7 +28,7 @@ jobs:
       # listing), so a Node toolchain here would be dead weight. The one thing a
       # Node job would add is the V8/worker_threads side of bggrep's bounded
       # matching — verified by hand with `node --test extension/index.test.ts`
-      # (183 pass, ~16s). Re-run that by hand after touching the bggrep worker.
+      # (193 pass, ~20s). Re-run that by hand after touching the bggrep worker.
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -47,12 +47,28 @@ jobs:
         id: tests
         run: bun test extension/index.test.ts
 
-      - name: bun pm pack --dry-run (files allowlist sanity)
+      # npm, not bun, for THIS step only: the tarball that ships is built by
+      # `npm publish` (release.yml, OIDC trusted publishing), so the allowlist
+      # must be checked with the packer that actually produces it. npm is
+      # preinstalled on the runner — no setup-node, no second toolchain — and
+      # today both packers emit the same 7 files; that agreement is what this
+      # step is here to keep true.
+      - name: npm pack --dry-run (files allowlist sanity)
         id: pack
         run: |
-          pack_output=$(bun pm pack --dry-run 2>&1)
+          pack_status=0
+          pack_output=$(npm pack --dry-run 2>&1) || pack_status=$?
           echo "$pack_output"
-          file_count=$(echo "$pack_output" | grep -oP 'Total files:\s*\K[0-9]+' || echo "?")
+          # sed, not grep -oP: no GNU/BusyBox difference to trip over, and the
+          # casing differs between packers ("total files:" vs "Total files:").
+          file_count=$(echo "$pack_output" | sed -n 's/.*[Tt]otal files:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
+          # npm pack failing, or printing no file count, means the allowlist was
+          # never actually checked — the greps below cannot fail on it. Treat
+          # that as a failure instead of a green step reporting "? files".
+          if [ "$pack_status" -ne 0 ] || [ -z "$file_count" ]; then
+            echo "::error::npm pack --dry-run failed (exit ${pack_status}) or printed no file count — allowlist NOT verified"
+            exit 1
+          fi
           echo "file_count=${file_count}" >> "$GITHUB_OUTPUT"
           # Enforce the allowlist: test files and other non-runtime files must
           # never ship in the published tarball (they bloat installs and leak
@@ -87,7 +103,7 @@ jobs:
             echo "|---|---|"
             echo "| tsc --noEmit | ${TSC_RESULT} |"
             echo "| tests | ${TESTS_OUTCOME} |"
-            echo "| bun pm pack --dry-run | ${PACK_OUTCOME} (${PACK_FILES} files in tarball) |"
+            echo "| npm pack --dry-run | ${PACK_OUTCOME} (${PACK_FILES} files in tarball) |"
             echo ""
             echo "Ref: \`${HEAD_SHA}\`"
           } > "$body_file"
@@ -121,7 +137,7 @@ jobs:
             echo "|---|---|"
             echo "| tsc --noEmit | \`${TSC_RESULT}\` |"
             echo "| tests | \`${TESTS_OUTCOME}\` |"
-            echo "| bun pm pack --dry-run | \`${PACK_OUTCOME}\` — ${PACK_FILES} files in tarball |"
+            echo "| npm pack --dry-run | \`${PACK_OUTCOME}\` — ${PACK_FILES} files in tarball |"
             echo ""
             echo "Ref: \`${COMMIT_SHA}\`"
           } >> "$GITHUB_STEP_SUMMARY"
