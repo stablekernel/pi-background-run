@@ -70,9 +70,18 @@ after(() => {
 });
 
 // Isolate the machine-global jobs dir for the whole file so tests never read
-// from or delete the real ~/.pi-bgrun/jobs. globalJobsDir() reads this per call.
-const TEST_GLOBAL_JOBS_DIR = mkTmp("pi-bgrun-global-");
-process.env.PI_BGRUN_GLOBAL_DIR = TEST_GLOBAL_JOBS_DIR;
+// from or delete the real ~/.pi-bgrun/jobs. A fake HOME is enough: the extension
+// resolves home through its own HOME-first homeDir(), because Bun's
+// os.homedir() ignores $HOME. PI_BGRUN_GLOBAL_DIR is left unset so a stray real
+// one cannot point tests out of the sandbox.
+// The extension resolves home HOME-first (Bun's os.homedir() ignores $HOME), so
+// assertions must use the same rule production does — otherwise a suite that
+// pins HOME compares against the developer's real home.
+const homeDir = () => process.env.HOME || homedir();
+const TEST_FAKE_HOME = mkTmp("pi-bgrun-home-");
+process.env.HOME = TEST_FAKE_HOME;
+delete process.env.PI_BGRUN_GLOBAL_DIR;
+const TEST_GLOBAL_JOBS_DIR = join(TEST_FAKE_HOME, ".pi-bgrun", "jobs");
 
 // Isolate the user config too: a real ~/.pi/agent/pi-bgrun.json could carry
 // adoptForeignJobs / digest / globalAutoClean settings that change results.
@@ -2317,7 +2326,7 @@ test("resolveJobsDirPath: expands a leading ~ to the home dir (not project-local
   const scratch = mkTmp("pi-bgrun-scratch-");
   try {
     const r = mod.resolveJobsDirPath("~/.pi-bgrun/jobs", { cwd: scratch });
-    assert.equal(r.dir, join(homedir(), ".pi-bgrun", "jobs"));
+    assert.equal(r.dir, join(homeDir(), ".pi-bgrun", "jobs"));
     assert.equal(r.projectLocal, false);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
@@ -2331,11 +2340,11 @@ test("resolveJobsDirPath: expands only a leading ~ (or ~/) — ~user and embedde
     mkdirSync(join(proj, ".git"), { recursive: true });
     // Bare ~ → home dir (absolute, not project-local).
     const bare = mod.resolveJobsDirPath("~", { cwd: proj });
-    assert.equal(bare.dir, homedir());
+    assert.equal(bare.dir, homeDir());
     assert.equal(bare.projectLocal, false);
     // ~/x → join(home, "x").
     const sub = mod.resolveJobsDirPath("~/x", { cwd: proj });
-    assert.equal(sub.dir, join(homedir(), "x"));
+    assert.equal(sub.dir, join(homeDir(), "x"));
     assert.equal(sub.projectLocal, false);
     // ~user/x is NOT expanded — treated as a relative path under the root.
     const user = mod.resolveJobsDirPath("~user/x", { cwd: proj });
@@ -2356,7 +2365,7 @@ test("resolveJobsDirPath: PI_BGRUN_GLOBAL_DIR is tilde-expanded", async () => {
   try {
     await withEnv("PI_BGRUN_GLOBAL_DIR", "~/.pi-bgrun/jobs", () => {
       const r = mod.resolveJobsDirPath(undefined, { cwd: scratch });
-      assert.equal(r.dir, join(homedir(), ".pi-bgrun", "jobs"));
+      assert.equal(r.dir, join(homeDir(), ".pi-bgrun", "jobs"));
       assert.equal(r.projectLocal, false);
     });
   } finally {
@@ -2370,7 +2379,7 @@ test("resolveJobsDirPath: without PI_BGRUN_GLOBAL_DIR the global default is ~/.p
   try {
     await withEnv("PI_BGRUN_GLOBAL_DIR", undefined, () => {
       const r = mod.resolveJobsDirPath(undefined, { cwd: scratch });
-      assert.equal(r.dir, join(homedir(), ".pi-bgrun", "jobs"));
+      assert.equal(r.dir, join(homeDir(), ".pi-bgrun", "jobs"));
       assert.equal(r.projectLocal, false);
     });
   } finally {

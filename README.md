@@ -57,6 +57,7 @@ wake messages) is the agent's workflow.
 
 ## Roadmap / not provided
 
+- Deprecated: the machine-global jobs dir (`PI_BGRUN_GLOBAL_DIR`, `~/.pi-bgrun/jobs`) — see [deprecation](#deprecated-machine-global-jobs-dir). Supported until a future major.
 - `bgkill` — not implemented; to stop a running job, use `kill -- -<pid>` (kill the process group — the child is spawned detached). The pid is the last `--`-separated segment of the job id (e.g. `unit-tests-1726680000-12345` → pid `12345`); it is not shown as a separate field in `bgstatus` output.
 - `bgwait` — not implemented; the wake mechanism makes blocking on a job unnecessary in the normal flow.
 
@@ -244,12 +245,47 @@ Rules and migration notes:
   sweep and `bgclean all` both cover `~/.pi-bgrun/jobs` in addition to the
   current project's dir.
 
+### Deprecated: machine-global jobs dir
+
+**Project-scoped logs are the model.** A single shared `~/.pi-bgrun/jobs` was
+the old default; it is now **deprecated** and is no longer what any of the docs
+lead with. Retirement is staged — nothing breaks today:
+
+- `PI_BGRUN_GLOBAL_DIR` and the `~/.pi-bgrun/jobs` **default are deprecated**;
+  they will be removed in a future major.
+- **Supported for now:** an existing absolute `jobsDir` / `PI_BGRUN_DIR` keeps
+  working exactly as before, and a cwd with no project root still falls back to
+  `~/.pi-bgrun/jobs` (there is nowhere project-scoped to put it, and the
+  alternative — scattering logs into an arbitrary cwd — is worse).
+
+Why project-scoped won:
+
+- **Each checkout owns its logs** — no cross-project clutter, no ambiguous
+  `bgstatus` scope, and `bgclean` can't reach into another project's runs.
+- **Reachable by project-sandboxed analysis** (`ctx_execute_file`,
+  `ctx_index`): logs live inside the workspace, so whole-log analysis no longer
+  needs a path outside it.
+- **Disposable with the workspace** — delete the checkout, lose its logs.
+
+What changes for you, if you set a global dir on purpose:
+
+1. Drop the absolute `jobsDir` / `PI_BGRUN_DIR` from your config to get
+   `<project>/.pi-bgrun/jobs`.
+2. Planned sharing across projects is what you lose: jobs started in one
+   checkout are no longer visible to a session in another, and
+   `adoptForeignJobs` only adopts within the same jobs dir. If you need that,
+   keep the absolute dir — it is supported, merely no longer the recommended
+   default — and say so upstream if it is load-bearing for you.
+3. Old logs in `~/.pi-bgrun/jobs` keep being swept (the orphan sweep and
+   `bgclean all` cover both dirs under the project-local default). Delete the
+   dir by hand once its logs are past retention.
+
 Environment variables (same knobs, handy for one-off overrides):
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PI_BGRUN_DIR` | `<project>/.pi-bgrun/jobs` in repos; else `~/.pi-bgrun/jobs` | Override where job logs are stored. An absolute path is used as-is; a **relative** path resolves against the project root (see [project-local logs](#project-local-logs-default-in-repos)), falling back to `~/.pi-bgrun/jobs` when there is no project root. |
-| `PI_BGRUN_GLOBAL_DIR` | `~/.pi-bgrun/jobs` | Override the machine-global jobs base — the no-project-root fallback. It is also swept under the project-local default (and is the `jobsDir` itself in the no-project-root fallback); an explicit absolute `jobsDir` is swept alone. A leading `~` or `~/` is expanded to the home dir; `~user` is not. |
+| `PI_BGRUN_GLOBAL_DIR` | `~/.pi-bgrun/jobs` | **Deprecated.** Overrides the machine-global jobs base — the fallback used only when the cwd has no project root (see [deprecation](#deprecated-machine-global-jobs-dir)). A leading `~` or `~/` is expanded to the home dir; `~user` is not. |
 | `PI_BGRUN_FOREIGN_JOBS` | `false` | Adopt other sessions' running jobs into this session's widget and job list. Adopted jobs are polled so they leave the widget when they finish. |
 | `PI_BGRUN_SHOW_COMPLETED` | `false` | Include finished jobs in `bgstatus` listings by default. |
 | `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |

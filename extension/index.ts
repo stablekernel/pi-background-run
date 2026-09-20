@@ -101,7 +101,7 @@ const STAGING_SUFFIXES = [".log", ".ec", ".fifo", ".cnt"];
 // ~/.pi-bgrun, and available for setups with a custom home or shared scratch.
 function globalJobsDir(): string {
   return expandTilde(
-    process.env.PI_BGRUN_GLOBAL_DIR || join(homedir(), ".pi-bgrun", "jobs"),
+    process.env.PI_BGRUN_GLOBAL_DIR || join(homeDir(), ".pi-bgrun", "jobs"),
   );
 }
 
@@ -703,7 +703,7 @@ function safeRealpath(p: string): string {
 // to $HOME. Paths are canonicalized so a symlinked $HOME is still recognized.
 function findProjectRoot(
   start: string,
-  home: string = homedir(),
+  home: string = homeDir(),
 ): string | undefined {
   const homeReal = safeRealpath(home);
   let cur = start;
@@ -715,12 +715,20 @@ function findProjectRoot(
   }
 }
 
+// The user's home directory, HOME-first. Node's os.homedir() already resolves
+// HOME before falling back to the passwd entry, but Bun's ignores HOME — so
+// deriving it here keeps `~`, the machine-global jobs dir and the project-root
+// exclusion identical under both runtimes (and lets tests pin HOME).
+function homeDir(): string {
+  return process.env.HOME || homedir();
+}
+
 // Expand a leading `~` (bare or `~/...`) to the user's home directory so a
 // config/env path like `~/.pi-bgrun/jobs` is absolute rather than a relative
 // path interpreted project-locally.
 function expandTilde(p: string): string {
-  if (p === "~") return homedir();
-  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  if (p === "~") return homeDir();
+  if (p.startsWith("~/")) return join(homeDir(), p.slice(2));
   return p;
 }
 
@@ -1028,17 +1036,18 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
 export function resolveConfig(ctx?: {
   cwd?: string;
   isProjectTrusted?: () => boolean;
-  // Test seam: os.homedir() caches in some runtimes, so tests inject the user
-  // config path instead of mutating HOME.
+  // Test seam: an explicit path, immutable for the process. Tests may also
+  // simply pin HOME — homeDir() honors it under every runtime, unlike Bun's
+  // os.homedir().
   userConfigPath?: string;
 }): BgrunConfig {
   // User config: $HOME/.pi/agent/pi-bgrun.json. Overridable by an explicit
   // test seam (ctx.userConfigPath) and by PI_BGRUN_USER_CONFIG (mirrors the
-  // PI_BGRUN_DIR escape hatch — mainly for tests, which cannot swap home).
+  // PI_BGRUN_DIR escape hatch).
   const user = readConfigFile(
     ctx?.userConfigPath ??
       process.env.PI_BGRUN_USER_CONFIG ??
-      join(homedir(), ".pi", "agent", "pi-bgrun.json"),
+      join(homeDir(), ".pi", "agent", "pi-bgrun.json"),
   );
   let project: BgrunConfigFile = {};
   try {

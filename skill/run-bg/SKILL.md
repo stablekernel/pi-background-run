@@ -149,8 +149,9 @@ that expensive rather than merely rude. Aggregate, then cap what you print:
   read a missing digest as "unknown", **not** as "no failures", and do not
   re-run the command to see the missing tail; raise the ceiling if you need the
   whole log.
-- Logs default to `<project>/.pi-bgrun/jobs` in a repo (else `~/.pi-bgrun/jobs`;
-  override with `PI_BGRUN_DIR` or `jobsDir`). Project-local dirs are
+- Logs default to `<project>/.pi-bgrun/jobs` in a repo — project-scoped is the
+  model (`~/.pi-bgrun/jobs` is a deprecated fallback for a cwd with no project
+  root; an absolute `PI_BGRUN_DIR`/`jobsDir` still works but is legacy). Project-local dirs are
   auto-ignored via `.git/info/exclude`, which keeps `git status` clean; the
   logs stay reachable for project-sandboxed analysis tools like
   `ctx_execute_file` because they live inside the project.
