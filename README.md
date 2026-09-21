@@ -586,7 +586,7 @@ Every merge to `main` updates a single open **Release PR** holding the `package.
 bump and `CHANGELOG.md` entry. Nothing is published until that PR is merged —
 ordinary merges only update it.
 
-Process, the required repository settings, and the one secret:
+Process, the required repository settings, and the two manual steps per release:
 [`docs/releasing.md`](docs/releasing.md).
 
 ## Status

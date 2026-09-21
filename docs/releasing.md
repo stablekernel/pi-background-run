@@ -109,36 +109,52 @@ why a refactor-heavy release still reads as a short list of features and fixes.
 `CHANGELOG.md` is deliberately **not** in `package.json` `files[]`, so it does not ship
 in the npm tarball — the allowlist still emits 7 files.
 
-## The one secret
+## Releasing by hand — no token, no secret
 
-`release-please.yml` uses `secrets.RELEASE_PLEASE_TOKEN`, falling back to
-`GITHUB_TOKEN` if unset. It should be a **fine-grained PAT scoped to this repository
-only**, with:
+`release-please.yml` runs on `GITHUB_TOKEN` and needs **no secret at all**. That is
+possible because GitHub exempts `pull_request` events with the `opened`,
+`synchronize`, or `reopened` activity types: when `GITHUB_TOKEN` creates a pull
+request, the resulting runs are started in an **approval-required** state instead of
+being suppressed outright. Approving them restores the required check, so branch
+protection is satisfied normally rather than bypassed.
 
-- **Contents: Read and write** — pushes the changelog commit, creates the tag and Release
-- **Pull requests: Read and write** — opens and updates the Release PR
+The full flow, and the two places a human is involved:
 
-Why it is needed at all: `main` requires the `lint-test` status check and
-`enforce_admins` is `true`, so there is no bypass. Checks only report from a real
-workflow run, and `GITHUB_TOKEN`-created events start none — so a `GITHUB_TOKEN`
-Release PR can never report `lint-test` and can never be merged.
+1. Merge a `feat:`/`fix:` to `main` → release-please opens or updates the Release PR.
+2. On that PR, click **Approve workflows to run** in the merge box. `ci.yml` and
+   `pr-title.yml` then execute, `lint-test` reports, and the PR becomes mergeable like
+   any other. (Nothing is skipped — the runs are held, not allowed through.)
+3. Merge the Release PR → release-please tags the commit, writes the `CHANGELOG.md`
+   entry, and creates the GitHub Release with generated notes.
+4. Publish, because the Release cannot do it for you:
 
-It also removes a whole class of machinery. Because a PAT-created Release carries a
-*user* identity, `release: published` fires normally and **`release.yml` needs no
-changes**; under `GITHUB_TOKEN` that event is suppressed, which would otherwise
-require chaining `release.yml` as a reusable workflow — and, since npm validates a
-`workflow_call` publish against the *calling* workflow's filename, registering
-`release-please.yml` as a **second trusted publisher on both packages**.
+   ```
+   gh workflow run release.yml -f dry-run=false
+   ```
 
-So: **npm trusted publishing needs no changes.** `release.yml` remains the publisher
-and stays registered as-is. A fine-grained PAT expires, so it needs periodic rotation
-— the one recurring cost of this design, and the reason a GitHub App token
-(short-lived per run, no expiry) would be strictly better if the org is willing to
-own one. `release-please`'s own docs recommend a PAT for exactly the check-reporting
-reason above.
+**Why step 4 is manual.** GitHub's exemption list covers `workflow_dispatch`,
+`repository_dispatch`, and those three `pull_request` activity types — `release` is
+**not** on it. So the Release that release-please creates with `GITHUB_TOKEN` does not
+fire `release: published`, and npm would silently never be updated. That trigger is
+therefore live only for Releases created by a person, which is how 0.6.0 was published.
 
-Until the secret exists the fallback keeps release-please running, so Release PRs
-still open — they just cannot be merged.
+### Making it automatic again
+
+Give release-please a real token and both manual steps disappear — no approve click,
+no dispatch. Set `RELEASE_PLEASE_TOKEN` and `release-please.yml` picks it up; the chain
+is already `RELEASE_PLEASE_TOKEN || GITHUB_TOKEN`. A token-created Release carries a
+user or App identity, so `release: published` fires and `release.yml` stays untouched.
+
+Scope it to this repository with **Contents: Read and write** and **Pull requests:
+Read and write**. A fine-grained PAT needs org-owner approval (the org default is
+"Require administrator approval"); a classic PAT with `public_repo` does not, and a
+GitHub App needs neither approval nor rotation.
+
+One trap: `||` falls through only on *empty*, so a secret whose value is
+**unauthorised** — a fine-grained PAT still pending approval — short-circuits the
+fallback and makes release-please hard-fail with
+`403 Resource not accessible by personal access token`. Delete it rather than leaving
+it pending; a missing secret is strictly better than a broken one.
 
 ## See also
 
