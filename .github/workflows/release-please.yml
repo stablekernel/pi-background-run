@@ -2,24 +2,29 @@ name: Release Please
 
 # Opens/updates the Release PR (package.json version bump + CHANGELOG.md) on every
 # push to main. Merging that PR is the release: release-please tags the commit and
-# creates the GitHub Release with generated notes, which fires release.yml's
-# existing `release: published` trigger to publish to npm over OIDC.
+# creates the GitHub Release with generated notes.
 #
-# WHY THE TOKEN MATTERS — and why release.yml needs no changes:
+# NO SECRET IS REQUIRED. This runs on GITHUB_TOKEN, and the two things GITHUB_TOKEN
+# normally blocks are handled as follows — see docs/releasing.md for the full flow.
 #
-# `main` requires the `lint-test` status check and enforce_admins is true, so there
-# is no bypass. release-please opens the Release PR, and GITHUB_TOKEN-created events
-# start no workflow run — so with the default token `lint-test` never reports on that
-# PR and it can never be merged.
+# 1. Checks on the Release PR. `main` requires `lint-test` and enforce_admins is true,
+#    so there is no bypass. GitHub exempts `pull_request` events with the `opened`,
+#    `synchronize`, and `reopened` activity types: a PR created by GITHUB_TOKEN gets
+#    its runs started in an APPROVAL-REQUIRED state rather than suppressed. A user
+#    with write access clicks "Approve workflows to run" in the merge box, `lint-test`
+#    reports, and the PR merges normally. Nothing is skipped.
 #
-# A Personal Access Token fixes that, because PAT-created events DO start workflows.
-# It also fixes publishing for free: with a PAT the GitHub Release is created by a
-# user identity, so `release: published` fires normally and release.yml stays
-# untouched. (Under GITHUB_TOKEN that event is suppressed, and avoiding it would
-# otherwise mean chaining release.yml as a reusable workflow — plus registering
-# release-please.yml as a second npm trusted publisher. The PAT removes all of that.)
+# 2. Publishing. `release` is NOT an exempt event, so a Release created here does not
+#    fire release.yml's `release: published` trigger — npm would silently not update.
+#    Publish with:  gh workflow run release.yml -f dry-run=false
+#    (That trigger remains live for Releases created by a person, which is how 0.6.0
+#    was published.)
 #
-# Scope the PAT to this repository only: contents: write + pull_requests: write.
+# To remove both manual steps, set a RELEASE_PLEASE_TOKEN secret — a token-created
+# Release carries a user/App identity, so `release: published` fires and no click is
+# needed. Scope it to this repo: contents: write + pull_requests: write. Note a secret
+# that exists but is UNAUTHORISED (e.g. a fine-grained PAT still pending org approval)
+# short-circuits the `||` fallback below and hard-fails with 403 — delete it instead.
 on:
   push:
     branches: [main]
@@ -44,8 +49,9 @@ jobs:
       - name: Release Please
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          # Falls back to GITHUB_TOKEN until the secret exists, so this degrades to
-          # "Release PRs open but cannot be merged" instead of failing outright.
+          # Defaults to GITHUB_TOKEN, which is a fully supported path — not a
+          # degraded one. It costs one "Approve workflows to run" click on the
+          # Release PR and a manual publish dispatch; see the header above.
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
