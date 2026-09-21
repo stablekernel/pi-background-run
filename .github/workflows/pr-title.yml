@@ -1,0 +1,48 @@
+name: PR Title
+
+# Guards the one message that actually reaches main. This repo squash-merges, so a
+# PR title becomes the commit subject on main — and that subject is what
+# release-please parses to derive the version bump and the changelog. A title it
+# cannot parse is dropped silently: no changelog entry, and no release on its own.
+# This check is what makes that documented contract real instead of aspirational.
+#
+# Deliberately a separate workflow rather than a job in ci.yml, so this check can be
+# made required on its own without also requiring `lint-test`. Requiring `lint-test`
+# would deadlock the Release PR (see docs/releasing.md) because release-please opens
+# that PR with GITHUB_TOKEN, and GitHub suppresses workflow runs for
+# GITHUB_TOKEN-created events — so no check would ever report on it.
+on:
+  pull_request:
+    # `edited` matters: fixing the title must re-run the check so the PR can be
+    # merged. Without it a bad title is a dead end.
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  conventional-title:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # bun, not node: the checker is TypeScript and bun runs it unbuilt, matching
+      # how the rest of this repo's tooling works.
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The title is attacker-controlled on a fork PR, so it is passed through env
+      # and quoted as "$PR_TITLE" — never interpolated into the script body, which
+      # would make this a command-injection sink.
+      - name: Validate PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: bun scripts/check-conventional-commit.ts "$PR_TITLE"

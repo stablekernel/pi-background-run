@@ -557,6 +557,38 @@ by hand:
 | `.bgrun-used-<hash>` | Per-project evidence that bgrun has run here (digest nudge). |
 | `.digest-nudge-<hash>` | Per-project: the one-shot digest nudge was already shown. |
 
+## Releasing
+
+Version numbers and the changelog are derived from commit messages via
+[release-please](https://github.com/googleapis/release-please), so the prefix on a
+squash-merged PR title is load-bearing:
+
+| Prefix | Release |
+| --- | --- |
+| `fix:` / `feat:` / `deps:` | yes — patch / minor / patch |
+| `feat!:` / `fix!:` / `BREAKING CHANGE:` | yes — minor (pre-1.0) |
+| `refactor:` `docs:` `test:` `ci:` `build:` `chore:` `style:` | no |
+| no prefix, e.g. `Address review findings (#11)` | no |
+
+An unprefixed commit is ignored outright: no changelog entry, and it cannot trigger
+a release on its own. `pr-title.yml` enforces the format on every PR
+(`bun run lint:pr-title` locally).
+
+**PRs are squash-merged, and that is structural rather than stylistic:** the squash
+collapses the PR to a single commit whose subject is the *title*, which is the
+message release-please parses. That is why the title — not the branch commits — is
+what CI validates, and why work-in-progress commit messages never surface. Rebase
+and merge-commit methods would put branch subjects on `main` and break that mapping,
+so repository settings must disable both ([`docs/releasing.md`](docs/releasing.md)
+lists the exact toggles).
+
+Every merge to `main` updates a single open **Release PR** holding the `package.json`
+bump and `CHANGELOG.md` entry. Nothing is published until that PR is merged —
+ordinary merges only update it.
+
+Process, the required repository settings, and the one secret:
+[`docs/releasing.md`](docs/releasing.md).
+
 ## Status
 
 Early / pre-release.

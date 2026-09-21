@@ -1,0 +1,51 @@
+name: Release Please
+
+# Opens/updates the Release PR (package.json version bump + CHANGELOG.md) on every
+# push to main. Merging that PR is the release: release-please tags the commit and
+# creates the GitHub Release with generated notes, which fires release.yml's
+# existing `release: published` trigger to publish to npm over OIDC.
+#
+# WHY THE TOKEN MATTERS — and why release.yml needs no changes:
+#
+# `main` requires the `lint-test` status check and enforce_admins is true, so there
+# is no bypass. release-please opens the Release PR, and GITHUB_TOKEN-created events
+# start no workflow run — so with the default token `lint-test` never reports on that
+# PR and it can never be merged.
+#
+# A Personal Access Token fixes that, because PAT-created events DO start workflows.
+# It also fixes publishing for free: with a PAT the GitHub Release is created by a
+# user identity, so `release: published` fires normally and release.yml stays
+# untouched. (Under GITHUB_TOKEN that event is suppressed, and avoiding it would
+# otherwise mean chaining release.yml as a reusable workflow — plus registering
+# release-please.yml as a second npm trusted publisher. The PAT removes all of that.)
+#
+# Scope the PAT to this repository only: contents: write + pull_requests: write.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# Mutating workflow — do NOT cancel in progress. Serializing also stops two runs
+# from rebasing the same open Release PR against each other.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Release Please
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          # Falls back to GITHUB_TOKEN until the secret exists, so this degrades to
+          # "Release PRs open but cannot be merged" instead of failing outright.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
