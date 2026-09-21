@@ -56,14 +56,19 @@ release-please parses. Rebase would land every branch commit individually (WIP
 subjects would enter the changelog and the title check would be irrelevant); a merge
 commit adds a fixed non-conventional subject that release-please ignores.
 
-These settings are **currently wrong for this design** — verified 2026-09-20:
+These settings are required, and **are currently set as required** (applied
+2026-09-21, verified by reading them back from the API):
 
-| Setting | Current | Required |
+| Setting | Required | Why |
 | --- | --- | --- |
-| `allow_merge_commit` | `true` | **`false`** |
-| `allow_rebase_merge` | `true` | **`false`** |
-| `squash_merge_commit_title` | `COMMIT_OR_PR_TITLE` | **`PR_TITLE`** |
-| `squash_merge_commit_message` | `COMMIT_MESSAGES` | **`BLANK`** |
+| `allow_squash_merge` | `true` | the only merge method |
+| `allow_merge_commit` | **`false`** | a merge commit adds a fixed non-conventional subject release-please ignores |
+| `allow_rebase_merge` | **`false`** | rebase lands every branch commit individually, so WIP subjects enter the changelog |
+| `squash_merge_commit_title` | **`PR_TITLE`** | see below — the default does *not* always use the PR title |
+| `squash_merge_commit_message` | **`BLANK`** | the default appends a dump of branch commit messages to the squash body |
+
+If they ever need restoring — a repo transfer, a mistaken revert — this is the
+command, and it is safe to re-run:
 
 ```
 gh api -X PATCH repos/stablekernel/pi-background-run \
