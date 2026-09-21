@@ -1,11 +1,15 @@
 ---
 name: digest-config
-description: Set up the pi-bgrun digest scorecard for this project. Use when the user asks to configure a digest, enable digest heuristics, or when a pi-bgrun nudge points at this skill. Samples the project's real job logs, picks a shipped preset (go-test, jest, pytest, junit-xml) or drafts a custom digest command, validates it against green AND red logs, then writes the digest section into .pi/pi-bgrun.json.
+description: Set up the pi-bgrun digest scorecard for this project. Use when the user asks to configure a digest, enable digest heuristics, or when a pi-bgrun nudge points at this skill. Samples the project's real job logs, picks a shipped preset (go-test, jest, pytest, junit-xml) or drafts a custom digest command, validates it against green AND red logs, then writes the digest section into the project's pi-bgrun.json.
 ---
 
 # Configure a project digest scorecard
 
-Goal: a `digest` section in `<project>/.pi/pi-bgrun.json` whose command turns a
+Project config paths are host-relative: `$CONFIG_DIR` is `.omp` under
+oh-my-pi (`omp`) and `.pi` under pi. Resolve it once from the running host —
+never write the other host's directory.
+
+Goal: a `digest` section in `<project>/$CONFIG_DIR/pi-bgrun.json` whose command turns a
 job log into a short pass/fail scorecard, appended to every `bgrun` wake as
 `digest (<label>): ...`. The scorecard must be reliable on both green and red
 logs — a wrong scorecard is worse than none. Most projects run more than one
@@ -105,7 +109,7 @@ advisory; a preset entry with no `type` still applies to every job.
    has no reliable command, omit that entry (or leave the digest unconfigured)
    rather than shipping a wrong scorecard — say why.
 6. **Write the config, one `type` entry per job type.** Merge the entries into
-   `<project>/.pi/pi-bgrun.json`, preserving any existing keys, giving each
+   `<project>/$CONFIG_DIR/pi-bgrun.json`, preserving any existing keys, giving each
    entry the `type` you identified in step 2, and putting the no-`match`
    default entry **last**. Use `match.name` / `match.command` globs only for
    jobs that will not pass a `type`. Create the file if absent. Tell the user

@@ -1,7 +1,7 @@
 {
   "name": "pi-background-run",
   "version": "0.6.0",
-  "description": "Run long shell commands detached in the background for pi; get woken on completion. Output lands in a file; context stays clean.",
+  "description": "Run long shell commands detached in the background for pi and oh-my-pi (omp); get woken on completion. Output lands in a file; context stays clean.",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -18,8 +18,13 @@
       "./extension/index.ts"
     ],
     "skills": [
-      "./skill/run-bg",
-      "./skill/digest-config"
+      "./skills/run-bg",
+      "./skills/digest-config"
+    ]
+  },
+  "omp": {
+    "extensions": [
+      "./extension/index.ts"
     ]
   },
   "scripts": {
@@ -30,7 +35,7 @@
   "files": [
     "extension/",
     "!extension/index.test.ts",
-    "skill/",
+    "skills/",
     "README.md",
     "LICENSE"
   ],
@@ -46,6 +51,8 @@
     "pi-package",
     "pi",
     "pi-coding-agent",
+    "omp",
+    "oh-my-pi",
     "background",
     "bgrun",
     "ai",

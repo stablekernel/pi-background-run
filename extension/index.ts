@@ -27,6 +27,7 @@
 
 import {
   CONFIG_DIR_NAME,
+  getAgentDir,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -54,12 +55,85 @@ import { homedir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import {
   DIGEST_PRESET_IDS,
+  digestNoMatchWakeLine,
   digestNoMatchWarning,
   selectDigestEntry,
   type DigestEntry,
   type DigestJobTarget,
   type DigestMatch,
 } from "./digestPresets.ts";
+
+// ── Diagnostics ─────────────────────────────────────────────────────────────
+//
+// oh-my-pi (omp) exposes a rotating file logger at `pi.logger` and owns the
+// terminal — a raw stderr write from an extension can corrupt the TUI. Upstream
+// pi exposes no logger at all, so the sink starts on the console and is rebound
+// to the host logger during extension load when one exists (installHostLogger).
+// Module-level config helpers run through the same sink, since they can be
+// reached before/without a factory (unit tests import them directly).
+type WriteLog = (message: string) => void;
+let logWarn: WriteLog = (message) => console.error(message);
+let logError: WriteLog = (message) => console.error(message);
+
+/** Rebind diagnostics to the host's logger. Hosts without one keep the console. */
+export function installHostLogger(logger: {
+  warn: WriteLog;
+  error: WriteLog;
+}): void {
+  logWarn = (message) => logger.warn(message);
+  logError = (message) => logger.error(message);
+}
+
+/**
+ * Extension-API fields that only one of the two hosts declares. oh-my-pi adds a
+ * file logger and composer-shape registration and has no entry-renderer concept;
+ * upstream pi has the entry renderer and the tool-definition prompt fields.
+ * Casting the API object once to this intersection lets the capability probes
+ * read a field the other host's type omits without trusting an unchecked shape
+ * at each access site.
+ */
+interface HostExtensionApi {
+  logger?: { warn: WriteLog; error: WriteLog };
+  registerComposerShape?: (definition: unknown) => void;
+  registerEntryRenderer?: unknown;
+}
+
+/**
+ * Managed-timer surface oh-my-pi adds to ExtensionContext. Its callbacks are
+ * throw-contained (a raw timer's throw is process-fatal there) and are cleared
+ * on session shutdown; upstream pi exposes neither method.
+ */
+interface HostTimers {
+  setInterval?: (callback: () => void, ms: number) => unknown;
+  clearTimer?: (timer: unknown) => void;
+}
+
+/**
+ * Interval timer that prefers the host's managed timers. Falls back to a raw
+ * `setInterval`, `unref`'d so a watch loop never keeps the process alive.
+ * Returns a handle whose `clear()` stops the timer on either path.
+ * Exported for tests, like formatSince.
+ */
+export function scheduleManagedInterval(
+  ctx: ExtensionContext,
+  callback: () => void,
+  ms: number,
+): { clear: () => void } {
+  const timers = ctx as ExtensionContext & HostTimers;
+  const setManaged = timers.setInterval;
+  if (typeof setManaged === "function") {
+    const clearManaged = timers.clearTimer;
+    const handle = setManaged.call(ctx, callback, ms);
+    return {
+      clear: () => {
+        if (typeof clearManaged === "function") clearManaged.call(ctx, handle);
+      },
+    };
+  }
+  const raw = setInterval(callback, ms);
+  raw.unref();
+  return { clear: () => clearInterval(raw) };
+}
 
 // Exit marker appended to every log so the file is self-describing: the exit
 // code survives pi restarting. `;` (not `&&`) ensures the printf runs even when
@@ -718,11 +792,11 @@ function readConfigFile(path: string): BgrunConfigFile {
     const raw = JSON.parse(text);
     if (raw && typeof raw === "object" && !Array.isArray(raw))
       return raw as BgrunConfigFile;
-    console.error(
+    logWarn(
       `[pi-bgrun] config ${path} is not a JSON object — ignoring its contents`,
     );
   } catch (err) {
-    console.error(
+    logWarn(
       `[pi-bgrun] config ${path} is malformed JSON (${(err as Error).message}) — ignoring its contents`,
     );
   }
@@ -1021,7 +1095,7 @@ function appendExcludePattern(
 
 // Digest config validation: invalid values are dropped from the resolved
 // config (best-effort — a malformed digest section must never break a wake or
-// the whole config), but the human gets one console.error per distinct invalid
+// the whole config), but the human gets one warning per distinct invalid
 // field so typos are discoverable without flooding the log. The field set is a
 // fixed, code-defined list (preset / command / match / type / ...), so the
 // dedupe set is naturally bounded.
@@ -1039,7 +1113,7 @@ function warnDigestInvalid(field: string, value: unknown): void {
     " — digest takes an object or an array of { type, match, label, preset, command } entries";
   // field "" means the whole `digest` section was unusable (wrong shape).
   const where = field ? `digest.${field}` : "digest";
-  console.error(
+  logWarn(
     `[pi-bgrun] ignoring invalid ${where} in pi-bgrun.json: ${JSON.stringify(value)}${hint}${shapeHint}`,
   );
 }
@@ -1207,6 +1281,27 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   return out;
 }
 
+// The host's agent directory — `~/.omp/agent` under oh-my-pi (profile-aware),
+// `~/.pi/agent` under upstream pi. Derived from CONFIG_DIR_NAME + HOME when the
+// host package predates the helper (it is exported by pi >= 0.79 and by omp's
+// compat shim), so the config path always follows the running host.
+function defaultUserConfigPath(): string {
+  try {
+    const dir = getAgentDir();
+    if (typeof dir === "string" && dir) return join(dir, "pi-bgrun.json");
+    logWarn(
+      "[pi-bgrun] host getAgentDir() returned no directory — falling back to $HOME",
+    );
+  } catch (err) {
+    // Not silent: the fallback is the DEFAULT profile's agent dir, so a
+    // profile-scoped user config would otherwise be ignored without a trace.
+    logWarn(
+      `[pi-bgrun] host getAgentDir() failed (${(err as Error).message}) — falling back to $HOME`,
+    );
+  }
+  return join(homeDir(), CONFIG_DIR_NAME, "agent", "pi-bgrun.json");
+}
+
 // Resolved per call (cheap: at most two small file reads) so env/config
 // changes are picked up without module reloads — and tests can isolate.
 // Exported for tests, like formatSince.
@@ -1218,19 +1313,20 @@ export function resolveConfig(ctx?: {
   // os.homedir().
   userConfigPath?: string;
 }): BgrunConfig {
-  // User config: $HOME/.pi/agent/pi-bgrun.json. Overridable by an explicit
+  // User config: <host agent dir>/pi-bgrun.json. Overridable by an explicit
   // test seam (ctx.userConfigPath) and by PI_BGRUN_USER_CONFIG (mirrors the
   // PI_BGRUN_DIR escape hatch).
   const user = readConfigFile(
     ctx?.userConfigPath ??
       process.env.PI_BGRUN_USER_CONFIG ??
-      join(homeDir(), ".pi", "agent", "pi-bgrun.json"),
+      defaultUserConfigPath(),
   );
   let project: BgrunConfigFile = {};
   try {
     if (ctx?.isProjectTrusted?.()) {
       // Read the project config from the same root resolveJobsDirPath uses, so
-      // a session started in a subdirectory still picks up <root>/.pi config.
+      // a session started in a subdirectory still picks up <root>/<CONFIG_DIR_NAME>
+      // config.
       const cwd = ctx.cwd ?? process.cwd();
       const projectRoot = projectRootFor(cwd);
       project = readConfigFile(
@@ -1413,6 +1509,62 @@ interface BgStatusDetails {
 }
 
 export default function (pi: ExtensionAPI) {
+  // One widened view of the host API — see HostExtensionApi for why the cast is
+  // needed and which fields each host provides.
+  const hostApi = pi as ExtensionAPI & HostExtensionApi;
+
+  // Route diagnostics to the host's file logger when it has one (oh-my-pi);
+  // upstream pi writes to the console as before.
+  const hostLogger = hostApi.logger;
+  if (
+    hostLogger &&
+    typeof hostLogger.warn === "function" &&
+    typeof hostLogger.error === "function"
+  ) {
+    installHostLogger(hostLogger);
+  }
+
+  // Host identity probe, used only to decide where tool guidance is emitted.
+  //
+  // Two independent signals, OR'd because their failure modes are asymmetric:
+  // mis-detecting pi as omp merely duplicates the bullets (they still appear
+  // in promptGuidelines), while mis-detecting omp as pi drops them silently.
+  //   * `CONFIG_DIR_NAME` is `.omp` on oh-my-pi and `.pi` on upstream pi — a
+  //     constant the extension already depends on for every config path, so a
+  //     host where it lies is already visibly broken rather than quietly so.
+  //   * `registerComposerShape` is an oh-my-pi-only extension surface.
+  const HOST_IS_OMP =
+    CONFIG_DIR_NAME !== ".pi" ||
+    typeof hostApi.registerComposerShape === "function";
+
+  // Does the host render `appendEntry` records in the transcript? Upstream pi
+  // does (via the entry renderer below); oh-my-pi has no entry-renderer concept
+  // — it renders only `custom_message` entries, through registerMessageRenderer.
+  const HOST_HAS_ENTRY_RENDERER =
+    typeof hostApi.registerEntryRenderer === "function";
+
+  // Tool guidance the host will actually surface. omp drops the
+  // `promptSnippet`/`promptGuidelines` fields, so on omp the bullets ride in the
+  // description — emitted once per host, never duplicated.
+  function toolDescription(
+    description: string,
+    guidelines: readonly string[],
+  ): string {
+    if (!HOST_IS_OMP || guidelines.length === 0) return description;
+    return `${description}\n\n${guidelines.map((g) => `- ${g}`).join("\n")}`;
+  }
+
+  // omp unmounts any tool that does not declare `loadMode: "essential"` and
+  // re-exposes it as an `xd://` device — callable, but only through a discovery
+  // `read` plus `write xd://<tool>`. Upstream pi has no such field (and no device
+  // transport), so the property is spread in rather than written literally: a
+  // literal would trip pi's excess-property check against its ToolDefinition.
+  const ESSENTIAL_TOOL = { loadMode: "essential" as const };
+
+  // `<config-dir>/pi-bgrun.json` as the host spells it (`.omp/...` on oh-my-pi,
+  // `.pi/...` on upstream pi), for prose that points the model at the file.
+  const CONFIG_FILE_HINT = `${CONFIG_DIR_NAME}/pi-bgrun.json`;
+
   const jobs = new Map<string, JobRecord>();
   // bgtail's delta-tailing bookmarks: one entry per job id ever tailed, holding
   // the high-water mark of what the caller has already had the opportunity to
@@ -1435,7 +1587,7 @@ export default function (pi: ExtensionAPI) {
   // handle (adopted foreign jobs + jobs reconstructed from transcript entries
   // after a restart). No exit event exists for those, so their logs/pids are
   // re-checked on an interval instead.
-  let stalePoller: ReturnType<typeof setInterval> | undefined;
+  let stalePoller: { clear: () => void } | undefined;
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1554,7 +1706,29 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ── Live status widget ────────────────────────────────────────────────────
+  // ── Live status panel + status line ───────────────────────────────────────
+  //
+  // Two host-neutral surfaces carry what the pi-only transcript card shows, at
+  // zero context cost:
+  //   * the editor widget — running jobs plus the jobs that just finished,
+  //     present only while something is still running (no permanent editor
+  //     space), self-limited to the 10 lines both hosts cap a string[] at;
+  //   * the status line — one always-visible line: the running count while
+  //     jobs are in flight, else how the most recent job ended. This is what
+  //     keeps a job's outcome visible after the panel is gone.
+
+  // Both hosts cap a string[] widget at 10 lines and append their own
+  // "... (widget truncated)" note past that (pi `MAX_WIDGET_LINES`, oh-my-pi
+  // the same). Bounding here keeps the two hosts byte-identical and spends the
+  // budget on the panel's own content instead of the host's truncation line.
+  const WIDGET_LINE_BUDGET = 10;
+  const WIDGET_RECENT_MAX = 4;
+
+  /** Compact one-line label for a job: its name, else the id's slug prefix. */
+  function jobLabel(rec: JobRecord): string {
+    const cmd = rec.cmd.length > 40 ? rec.cmd.slice(0, 37) + "…" : rec.cmd;
+    return rec.name ? `${rec.name} · ${cmd}` : cmd;
+  }
 
   function updateWidget(
     ctx: ExtensionContext,
@@ -1566,20 +1740,72 @@ export default function (pi: ExtensionAPI) {
     for (const rec of jobs.values()) {
       if (rec.exitCode === undefined) running.push(rec);
     }
+    // Newest finished first. Finished jobs stay in the map for the session
+    // (only adopted ones are dropped), so the panel can show what just ran
+    // without any extra bookkeeping.
+    const recent = [...jobs.values()]
+      .filter((rec) => rec.exitCode !== undefined)
+      .sort((a, b) => (b.exitedAt ?? b.started) - (a.exitedAt ?? a.started))
+      .slice(0, WIDGET_RECENT_MAX);
+
+    // The status line is independent of whether the panel shows, so it is set
+    // first: live count while running, else the newest outcome.
+    setStatusLine(ctx, recent[0]);
+
     if (running.length === 0) {
+      // No live activity: the panel goes away (the status line keeps the last
+      // outcome), which is what an idle editor expects.
       ctx.ui.setWidget("bgrun", undefined);
       return;
     }
+
+    // Running rows get priority; the recent section is spent only out of what
+    // is left, and dropped whole rather than truncated, so the panel never
+    // reaches a host's own "... (widget truncated)" note.
     const lines = [`📊 bgrun: ${running.length} running`];
-    for (const rec of running) {
-      const startedAt = formatSince(rec.started);
-      const cmd = rec.cmd.length > 40 ? rec.cmd.slice(0, 37) + "…" : rec.cmd;
-      const label = rec.name ? `${rec.name} · ${cmd}` : cmd;
+    // Reserve the overflow line alongside the header before slicing the rows.
+    const maxRunningRows = WIDGET_LINE_BUDGET - 2;
+    const shownRunning = running.slice(0, maxRunningRows);
+    for (const rec of shownRunning) {
       const tag = rec.adopted ? " (adopted)" : "";
       // Full id (not truncated) so it can be copied straight into /bgtail <id>.
-      lines.push(`  ${rec.id}  ${label}  (since ${startedAt})${tag}`);
+      lines.push(
+        `  ${rec.id}  ${jobLabel(rec)}  (since ${formatSince(rec.started)})${tag}`,
+      );
+    }
+    const hiddenRunning = running.length - shownRunning.length;
+    if (hiddenRunning > 0) lines.push(`  … ${hiddenRunning} more running`);
+
+    const recentRows = recent.map((rec) => {
+      const icon = rec.exitCode === 0 ? "✅" : "❌";
+      return `  ${icon} ${rec.id}  ${jobLabel(rec)}  exit=${rec.exitCode ?? "?"}`;
+    });
+    if (recentRows.length > 0 && WIDGET_LINE_BUDGET - lines.length >= recentRows.length + 1) {
+      lines.push("  ── recent ──", ...recentRows);
     }
     ctx.ui.setWidget("bgrun", lines);
+  }
+
+  /** Always-visible one-liner: live count while running, else the last outcome. */
+  function setStatusLine(ctx: ExtensionContext, lastDone?: JobRecord): void {
+    let running = 0;
+    for (const rec of jobs.values()) {
+      if (rec.exitCode === undefined) running++;
+    }
+    if (running > 0) {
+      ctx.ui.setStatus("bgrun", `⏳ ${running} running`);
+      return;
+    }
+    if (!lastDone) {
+      ctx.ui.setStatus("bgrun", undefined);
+      return;
+    }
+    const icon = lastDone.exitCode === 0 ? "✅" : "❌";
+    const label = (lastDone.name ?? jobLabel(lastDone)).slice(0, 30);
+    ctx.ui.setStatus(
+      "bgrun",
+      `${icon} ${label} exit=${lastDone.exitCode ?? "?"}`,
+    );
   }
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
@@ -1906,76 +2132,95 @@ export default function (pi: ExtensionAPI) {
 
   function ensureStalePoller(ctx: ExtensionContext): void {
     if (stalePoller !== undefined || !hasUnsupervisedRunning()) return;
-    stalePoller = setInterval(() => {
-      revalidateStaleJobs();
-      updateWidget(ctx);
-      if (!hasUnsupervisedRunning()) stopStalePoller();
-    }, STALE_POLL_MS);
-    stalePoller.unref();
+    // The callback runs outside handler dispatch. oh-my-pi treats an uncaught
+    // throw there as process-fatal (it tears the whole session down), so it is
+    // wrapped, and the timer itself is scheduled through the host's managed
+    // timers when they exist (omp contains the throw and unrefs automatically).
+    const tick = () => {
+      try {
+        revalidateStaleJobs();
+        updateWidget(ctx);
+        if (!hasUnsupervisedRunning()) stopStalePoller();
+      } catch (err) {
+        logWarn(
+          `[pi-bgrun] stale-job poll failed: ${(err as Error).message}`,
+        );
+      }
+    };
+    stalePoller = scheduleManagedInterval(ctx, tick, STALE_POLL_MS);
   }
 
   function stopStalePoller(): void {
     if (stalePoller !== undefined) {
-      clearInterval(stalePoller);
+      stalePoller.clear();
       stalePoller = undefined;
     }
   }
 
   // ── Entry renderer: job cards in the transcript ───────────────────────────
+  //
+  // Upstream pi only. oh-my-pi has no entry renderer at all — it renders
+  // `custom_message` entries (pi.sendMessage) through registerMessageRenderer,
+  // never the `custom` records pi.appendEntry writes. The job entries are still
+  // persisted and replayed by session_start on both hosts; only the transcript
+  // card is pi-only. Calling the missing method would throw and abort the whole
+  // extension load on omp, so it is registered conditionally.
 
-  pi.registerEntryRenderer<BgrunJobEntryData>(
-    "bgrun-job",
-    (entry, { expanded }, theme) => {
-      const d =
-        entry.data ??
-        ({
-          id: "?",
-          cmd: "",
-          started: 0,
-          logPath: "",
-          state: "running",
-        } as BgrunJobEntryData);
-      const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-      const icon = d.state === "done" ? (d.exitCode === 0 ? "✅" : "❌") : "🔄";
-      const exitStr = d.state === "done" ? ` exit=${d.exitCode ?? "?"}` : "";
-      const namePrefix = d.name ? `"${d.name}" ` : "";
-      box.addChild(
-        new Text(
-          `${icon} ${theme.fg("accent", "bgrun")} ${namePrefix}${d.id}${exitStr}`,
-          0,
-          0,
-        ),
-      );
-      const cmdPreview = d.cmd.length > 60 ? d.cmd.slice(0, 57) + "…" : d.cmd;
-      box.addChild(new Text(theme.fg("dim", `  $ ${cmdPreview}`), 0, 0));
-      if (expanded) {
-        box.addChild(new Text(theme.fg("dim", `  log: ${d.logPath}`), 0, 0));
+  if (HOST_HAS_ENTRY_RENDERER) {
+    pi.registerEntryRenderer<BgrunJobEntryData>(
+      "bgrun-job",
+      (entry, { expanded }, theme) => {
+        const d =
+          entry.data ??
+          ({
+            id: "?",
+            cmd: "",
+            started: 0,
+            logPath: "",
+            state: "running",
+          } as BgrunJobEntryData);
+        const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+        const icon = d.state === "done" ? (d.exitCode === 0 ? "✅" : "❌") : "🔄";
+        const exitStr = d.state === "done" ? ` exit=${d.exitCode ?? "?"}` : "";
+        const namePrefix = d.name ? `"${d.name}" ` : "";
         box.addChild(
           new Text(
-            theme.fg(
-              "dim",
-              `  started: ${new Date(d.started).toLocaleString()}`,
-            ),
+            `${icon} ${theme.fg("accent", "bgrun")} ${namePrefix}${d.id}${exitStr}`,
             0,
             0,
           ),
         );
-        if (d.exitedAt) {
+        const cmdPreview = d.cmd.length > 60 ? d.cmd.slice(0, 57) + "…" : d.cmd;
+        box.addChild(new Text(theme.fg("dim", `  $ ${cmdPreview}`), 0, 0));
+        if (expanded) {
+          box.addChild(new Text(theme.fg("dim", `  log: ${d.logPath}`), 0, 0));
           box.addChild(
             new Text(
               theme.fg(
                 "dim",
-                `  finished: ${new Date(d.exitedAt).toLocaleString()}`,
+                `  started: ${new Date(d.started).toLocaleString()}`,
               ),
               0,
               0,
             ),
           );
+          if (d.exitedAt) {
+            box.addChild(
+              new Text(
+                theme.fg(
+                  "dim",
+                  `  finished: ${new Date(d.exitedAt).toLocaleString()}`,
+                ),
+                0,
+                0,
+              ),
+            );
+          }
         }
-      }
-      return box;
-    },
-  );
+        return box;
+      },
+    );
+  }
 
   // ── session_start: reconstruct Map from entries + auto-cleanup ────────────
 
@@ -2018,9 +2263,8 @@ export default function (pi: ExtensionAPI) {
         });
       }
     } catch (err) {
-      console.error(
-        "[pi-bgrun] session_start reconstruction failed:",
-        (err as Error).message,
+      logError(
+        `[pi-bgrun] session_start reconstruction failed: ${(err as Error).message}`,
       );
     }
 
@@ -2078,24 +2322,32 @@ export default function (pi: ExtensionAPI) {
 
   // ── bgrun tool ────────────────────────────────────────────────────────────
 
+  // Guidance the model needs before it reaches for the wrong tool. Read by
+  // upstream pi from `promptGuidelines`; on oh-my-pi it is folded into the
+  // description (see toolDescription).
+  const BGRUN_GUIDELINES = [
+    "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
+    "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
+    `When the project's digest config defines \`type\` entries, pass the matching \`type\` (e.g. type: 'test') so the wake selects the right scorecard; the vocabulary comes from the project's \`${CONFIG_FILE_HINT}\` digest entries.`,
+    "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
+    "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search or ctx_execute_file on the log path for whole-log analysis.",
+  ];
+
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bgrun",
     label: "Run in Background",
-    description:
+    description: toolDescription(
       "Run a long shell command detached in the background. Returns 'started: <job-id>' immediately. " +
-      "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
-      "expected to run >30s or emit >100 lines (tests, builds, linters). Optionally pass `name` for a " +
-      "short human-readable label used in the job id, status output, and wake messages, and `type` to " +
-      "select the project's digest scorecard.",
+        "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
+        "expected to run >30s or emit >100 lines (tests, builds, linters). Optionally pass `name` for a " +
+        "short human-readable label used in the job id, status output, and wake messages, and `type` to " +
+        "select the project's digest scorecard.",
+      BGRUN_GUIDELINES,
+    ),
     promptSnippet:
       "Run a long command detached in the background; get woken on completion",
-    promptGuidelines: [
-      "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
-      "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
-      "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard; the vocabulary comes from the project's `.pi/pi-bgrun.json` digest entries.",
-      "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
-      "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search or ctx_execute_file on the log path for whole-log analysis.",
-    ],
+    promptGuidelines: BGRUN_GUIDELINES,
     parameters: Type.Object({
       command: Type.String({
         description:
@@ -2113,7 +2365,7 @@ export default function (pi: ExtensionAPI) {
           description:
             "Optional job type used to select the project's digest scorecard (e.g. 'test', 'build', 'lint'). " +
             "The vocabulary comes from the `type` fields in the project's `digest` config entries in " +
-            "`.pi/pi-bgrun.json`; when the project's digest config defines types, prefer passing the matching one.",
+            `\`${CONFIG_FILE_HINT}\`; when the project's digest config defines types, prefer passing the matching one.`,
         }),
       ),
     }),
@@ -2203,9 +2455,8 @@ export default function (pi: ExtensionAPI) {
           renameSync(tmpPath, finalLogPath);
           logPath = finalLogPath;
         } catch (err) {
-          console.error(
-            `[pi-bgrun] rename to final log path failed:`,
-            (err as Error).message,
+          logWarn(
+            `[pi-bgrun] rename to final log path failed: ${(err as Error).message}`,
           );
         }
 
@@ -2273,9 +2524,8 @@ export default function (pi: ExtensionAPI) {
             try {
               pi.sendUserMessage(wake, { deliverAs: "followUp" });
             } catch (e2) {
-              console.error(
-                `[pi-bgrun] wake failed for job ${id}:`,
-                (e2 as Error).message,
+              logError(
+                `[pi-bgrun] wake failed for job ${id}: ${(e2 as Error).message}`,
               );
             }
           }
@@ -2354,6 +2604,11 @@ export default function (pi: ExtensionAPI) {
           // nothing appends nothing, and the exit code / universal part above are
           // never affected.
           let digestBlock: { label: string; text: string } | undefined;
+          // Set when a NEW distinct mismatch is recorded (bounded by
+          // DIGEST_NO_MATCH_WARN_CAP): the same fact has to reach the agent, who
+          // is the only party that can fix a wrong `type`. The host log alone is
+          // not enough — oh-my-pi routes it to a file the agent never reads.
+          let digestNoMatchNote: string | undefined;
           try {
             // First matching entry wins, in config order. The label defaults to
             // the entry's label, the entry's type, a matched `match.name`, then
@@ -2389,11 +2644,17 @@ export default function (pi: ExtensionAPI) {
               if (!digestNoMatchWarned.has(warning)) {
                 if (digestNoMatchWarned.size < DIGEST_NO_MATCH_WARN_CAP) {
                   digestNoMatchWarned.add(warning);
-                  console.error(warning);
+                  logWarn(warning);
+                  // Same facts, phrased for the model, on the wake it reads.
+                  // One occurrence per distinct mismatch keeps this bounded.
+                  digestNoMatchNote = digestNoMatchWakeLine(
+                    digestTarget,
+                    digestEntries,
+                  );
                 } else if (!digestNoMatchSuppressed) {
                   // Don't silently drop further distinct mismatches.
                   digestNoMatchSuppressed = true;
-                  console.error(
+                  logWarn(
                     `[pi-bgrun] further digest no-match diagnostics suppressed (cap ${DIGEST_NO_MATCH_WARN_CAP})`,
                   );
                 }
@@ -2401,9 +2662,8 @@ export default function (pi: ExtensionAPI) {
             }
           } catch (e) {
             // Silent-fail: a broken digest never breaks a wake (ground rule 3).
-            console.error(
-              `[pi-bgrun] digest failed for job ${id}:`,
-              (e as Error).message,
+            logWarn(
+              `[pi-bgrun] digest failed for job ${id}: ${(e as Error).message}`,
             );
           }
 
@@ -2415,6 +2675,8 @@ export default function (pi: ExtensionAPI) {
           if (lastLine) wake += `Last output: ${lastLine}\n`;
           if (digestBlock) {
             wake += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
+          } else if (digestNoMatchNote) {
+            wake += `${digestNoMatchNote}\n`;
           }
           wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
           try {
@@ -2427,9 +2689,8 @@ export default function (pi: ExtensionAPI) {
             try {
               pi.sendUserMessage(wake, { deliverAs: "followUp" });
             } catch (e2) {
-              console.error(
-                `[pi-bgrun] wake failed for job ${id}:`,
-                (e2 as Error).message,
+              logError(
+                `[pi-bgrun] wake failed for job ${id}: ${(e2 as Error).message}`,
               );
             }
           }
@@ -2448,7 +2709,7 @@ export default function (pi: ExtensionAPI) {
         });
 
         child.on("error", (err) => {
-          console.error(`[pi-bgrun] spawn error for job ${id}:`, err.message);
+          logError(`[pi-bgrun] spawn error for job ${id}: ${err.message}`);
           finishSpawnFailure(err);
         });
 
@@ -2630,7 +2891,7 @@ export default function (pi: ExtensionAPI) {
         // best-effort — a marker write failure must never break session_start
       }
     } catch (err) {
-      console.error("[pi-bgrun] digest nudge failed:", (err as Error).message);
+      logWarn(`[pi-bgrun] digest nudge failed: ${(err as Error).message}`);
     }
   }
 
@@ -2909,6 +3170,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bgtail",
     label: "Tail Background Log",
     description:
@@ -3132,17 +3394,22 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  const BGGREP_GUIDELINES = [
+    "Never search a bgrun log with the bash tool — uncapped output can flood context, and it needs manual log-path reconstruction and regex shell-quoting; bggrep is bounded by design.",
+    "Prefer bggrep over bash grep or reading a bgrun log — matches are line-numbered, capped, and condensed.",
+    "Pass an explicit pattern when you know the tool's output format; the default only catches common failure signatures.",
+  ];
+
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bggrep",
     label: "Grep Background Log",
-    description:
+    description: toolDescription(
       "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; ctx_execute_file can read the same file, but needs the absolute path. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+      BGGREP_GUIDELINES,
+    ),
     promptSnippet: "Search a bgrun job's log for a pattern",
-    promptGuidelines: [
-      "Never search a bgrun log with the bash tool — uncapped output can flood context, and it needs manual log-path reconstruction and regex shell-quoting; bggrep is bounded by design.",
-      "Prefer bggrep over bash grep or reading a bgrun log — matches are line-numbered, capped, and condensed.",
-      "Pass an explicit pattern when you know the tool's output format; the default only catches common failure signatures.",
-    ],
+    promptGuidelines: BGGREP_GUIDELINES,
     parameters: Type.Object({
       id: Type.String({
         description: "Job id (from bgrun's 'started: <id>' response)",
@@ -3322,6 +3589,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bgstatus",
     label: "Background Job Status",
     description:
@@ -3406,6 +3674,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bgclean",
     label: "Clean Old Background Jobs",
     description:

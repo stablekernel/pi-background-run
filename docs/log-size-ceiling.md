@@ -20,8 +20,9 @@ machine down. A secondary effect: `countLogLines` streams the whole file at exit
 
 Any fix has to respect these; most of the wrapper's odd shape is one of them.
 
-1. The cap must live **inside the detached process tree** — pi can exit at any
-   time, so no parent-side streaming. A watchdog that dies with pi does not keep
+1. The cap must live **inside the detached process tree** — the agent can exit at
+   any time, so no parent-side streaming. A watchdog that dies with the agent does
+   not keep
    the promise.
 2. The `__BGRUN_EXIT__` marker must remain the **last non-empty line**.
    Completion evidence is the *last* non-blank line only, so a marker that ends
@@ -168,9 +169,9 @@ They are listed because they explain why the wrapper is not simpler.
 
 - **`head -c` without a drain**: producer dies on SIGPIPE (`141`) — hostile to
   legitimately verbose builds.
-- **pi-side watchdog** (stat running logs, kill and truncate the tail): a soft
-  bound only while pi lives; the overshoot is write-rate × poll interval, and it
-  is unbounded if pi died. Keeps the tail, loses the promise.
+- **agent-side watchdog** (stat running logs, kill and truncate the tail): a soft
+  bound only while the agent lives; the overshoot is write-rate × poll interval, and it
+  is unbounded if the agent died. Keeps the tail, loses the promise.
 - **`ulimit -f`**: caps *every* file the job writes (artifacts, downloads) and
   kills it (`SIGXFSZ`/`153`). Opt-in material, not a default.
 - **Document-and-trim-finished-logs**: no bound at all while the job runs.

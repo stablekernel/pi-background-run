@@ -129,6 +129,10 @@ type FakeTool = Pick<
   ToolDefinition<any, any, any>,
   "name" | "label" | "description" | "parameters" | "promptSnippet"
 > & {
+  /** pi-only guidance field — read by pi, absent (and folded into `description`) on omp. */
+  promptGuidelines?: string[];
+  /** omp-only presentation field — keeps the tool out of the `xd://` device mount. */
+  loadMode?: "essential" | "discoverable";
   execute(
     toolCallId: string,
     params: any,
@@ -180,6 +184,21 @@ interface FakePiHandles {
   handlers: Map<string, FakeHandler[]>;
   fireSessionStart: () => Promise<void>;
   fireSessionShutdown: () => Promise<void>;
+  /** Messages the extension routed to the host logger (omp path). */
+  hostLogs: string[];
+}
+
+/**
+ * Which host shape the fake presents. `pi` exposes `registerEntryRenderer` and
+ * reads `promptSnippet`/`promptGuidelines`; `omp` (oh-my-pi) has neither, and
+ * instead injects `zod` plus a `logger` — the two differences the extension
+ * probes for at load time.
+ */
+type FakeHostKind = "pi" | "omp";
+
+interface FakeHostExtras {
+  registerComposerShape?: (definition: unknown) => void;
+  logger?: { warn(message: string): void; error(message: string): void };
 }
 
 function makeFakePi(
@@ -187,8 +206,10 @@ function makeFakePi(
     idle?: boolean;
     priorEntries?: CapturedEntry[];
     ctxFields?: Record<string, unknown>;
+    host?: FakeHostKind;
   } = {},
 ): FakePiHandles {
+  const host = opts.host ?? "pi";
   const wakes: CapturedWake[] = [];
   const entries: CapturedEntry[] = opts.priorEntries
     ? [...opts.priorEntries]
@@ -197,6 +218,7 @@ function makeFakePi(
   const commands = new Map<string, FakeCommand>();
   const entryRenderers = new Map<string, FakeRenderer>();
   const handlers = new Map<string, FakeHandler[]>();
+  const hostLogs: string[] = [];
   const idle = opts.idle ?? true;
   const ctx = {
     isIdle: () => idle,
@@ -209,7 +231,8 @@ function makeFakePi(
   // Typed against the real ExtensionAPI members the extension uses — the
   // compile-time drift guard. `as ExtensionAPI` below is the unavoidable seam
   // (the fake is deliberately partial); the *shapes* here are the real ones.
-  const used: UsedExtensionAPI = {
+  // `Partial` because the omp shape legitimately omits the pi-only members.
+  const used: Partial<UsedExtensionAPI> & FakeHostExtras = {
     sendUserMessage(content, options) {
       wakes.push({
         text: content as string,
@@ -223,9 +246,6 @@ function makeFakePi(
         data: data as Record<string, any> | undefined,
       });
     },
-    registerEntryRenderer(customType: string, renderer: EntryRenderer<any>) {
-      entryRenderers.set(customType, renderer as unknown as FakeRenderer);
-    },
     registerTool(def) {
       tools.set(def.name, def as unknown as FakeTool);
     },
@@ -238,6 +258,17 @@ function makeFakePi(
       handlers.set(event, list);
     },
   };
+  if (host === "pi") {
+    used.registerEntryRenderer = (customType: string, renderer: EntryRenderer<any>) => {
+      entryRenderers.set(customType, renderer as unknown as FakeRenderer);
+    };
+  } else {
+    used.registerComposerShape = () => {};
+    used.logger = {
+      warn: (message: string) => hostLogs.push(message),
+      error: (message: string) => hostLogs.push(message),
+    };
+  }
   const pi = used as ExtensionAPI;
 
   const fireSessionStart = async () => {
@@ -263,6 +294,7 @@ function makeFakePi(
     handlers,
     fireSessionStart,
     fireSessionShutdown,
+    hostLogs,
   };
 }
 
@@ -4505,7 +4537,7 @@ test("shipped presets: ids are stable and every command ends in head (bounded ou
 test("shipped presets: README and digest-config skill document every preset id", () => {
   const readme = readFileSync(join(process.cwd(), "README.md"), "utf8");
   const skill = readFileSync(
-    join(process.cwd(), "skill", "digest-config", "SKILL.md"),
+    join(process.cwd(), "skills", "digest-config", "SKILL.md"),
     "utf8",
   );
   for (const id of DIGEST_PRESET_IDS) {
@@ -5795,6 +5827,146 @@ test("entry renderer: bgrun-job renders running and done/expanded without throwi
   );
   assert.ok(done, "done + expanded entry renders");
 });
+
+// ── Host contract: oh-my-pi (omp) vs upstream pi ───────────────────────────
+//
+// The hosts differ in four ways the extension must handle:
+//   * omp has no `registerEntryRenderer` at all — calling it aborts the whole
+//     extension load (the original omp porting blocker);
+//   * omp mounts a tool that omits `loadMode: "essential"` as an `xd://` device,
+//     so `bgrun` would stop being directly callable;
+//   * omp ignores `promptSnippet`/`promptGuidelines` on a tool definition, so the
+//     guidance has to reach the model through `description` instead;
+//   * omp exposes a file logger (its TUI owns the terminal), pi does not.
+
+const BG_TOOL_NAMES = ["bgrun", "bgtail", "bggrep", "bgstatus", "bgclean"];
+const BGGREP_HEADLINE = "Never search a bgrun log with the bash tool";
+
+test("host contract (omp): loads without registerEntryRenderer; every tool stays top-level", async () => {
+  const h = makeFakePi({ host: "omp" });
+  await loadExtension(h.pi); // must not throw — regression guard for the load blocker
+  assert.equal(h.entryRenderers.size, 0, "no entry renderer is registered");
+  for (const name of BG_TOOL_NAMES) {
+    const def = h.tools.get(name);
+    assert.ok(def, `${name} is registered`);
+    assert.equal(
+      def.loadMode,
+      "essential",
+      `${name} stays directly callable instead of becoming an xd:// device`,
+    );
+  }
+});
+
+test("host contract (omp): guidance is folded into the description the host actually reads", async () => {
+  const h = makeFakePi({ host: "omp" });
+  await loadExtension(h.pi);
+  assert.match(h.tools.get("bggrep")!.description, new RegExp(BGGREP_HEADLINE));
+  assert.match(
+    h.tools.get("bgrun")!.description,
+    /Use bgrun \(not bash\) for any command expected to run >30s/,
+  );
+});
+
+test("host contract (pi): guidance stays in promptGuidelines and is not duplicated", async () => {
+  const h = makeFakePi();
+  await loadExtension(h.pi);
+  const bggrep = h.tools.get("bggrep")!;
+  assert.ok(h.entryRenderers.has("bgrun-job"), "pi keeps the transcript card");
+  assert.match(bggrep.promptGuidelines!.join("\n"), new RegExp(BGGREP_HEADLINE));
+  assert.doesNotMatch(
+    bggrep.description,
+    new RegExp(BGGREP_HEADLINE),
+    "pi reads promptGuidelines, so the description carries no copy",
+  );
+});
+
+test("host contract (omp): diagnostics go to the host logger, not stderr", async () => {
+  const h = makeFakePi({ host: "omp" });
+  await loadExtension(h.pi);
+  // One unchecked cast for the dynamic module harness: `loadModule()` is typed
+  // loosely because tests reach for whatever the extension exports.
+  const mod = (await loadModule()) as {
+    resolveConfig(ctx: {
+      cwd?: string;
+      isProjectTrusted?: () => boolean;
+      userConfigPath?: string;
+    }): unknown;
+    installHostLogger(logger: {
+      warn(message: string): void;
+      error(message: string): void;
+    }): void;
+  };
+  const userCfg = join(mkTmp("pi-bgrun-user-"), "pi-bgrun.json");
+  writeFileSync(userCfg, "{ not json");
+  const consoleErrors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    consoleErrors.push(args.map(String).join(" "));
+  };
+  try {
+    mod.resolveConfig({
+      cwd: mkTmp("pi-bgrun-proj-"),
+      isProjectTrusted: () => true,
+      userConfigPath: userCfg,
+    });
+  } finally {
+    console.error = originalError;
+    // The sink is module-level: restore console routing for the tests that
+    // follow and assert on console.error.
+    mod.installHostLogger({
+      warn: (m: string) => console.error(m),
+      error: (m: string) => console.error(m),
+    });
+  }
+  assert.ok(
+    h.hostLogs.some((m) => m.includes("malformed")),
+    "the host logger received the config warning",
+  );
+  assert.equal(consoleErrors.length, 0, "nothing was written to stderr");
+});
+
+test("host contract (omp): the stale-job poller uses the host's managed interval and clears it the host's way", async () => {
+  // One unchecked cast for the dynamic module harness, as above.
+  const mod = (await loadModule()) as {
+    scheduleManagedInterval(
+      ctx: unknown,
+      callback: () => void,
+      ms: number,
+    ): { clear: () => void };
+  };
+  const scheduled: { callback: () => void; ms: number }[] = [];
+  const cleared: unknown[] = [];
+  const hostCtx = {
+    setInterval(callback: () => void, ms: number) {
+      scheduled.push({ callback, ms });
+      return "managed-handle";
+    },
+    clearTimer(timer: unknown) {
+      cleared.push(timer);
+    },
+  };
+
+  let ticks = 0;
+  const timer = mod.scheduleManagedInterval(hostCtx, () => ticks++, 250);
+  assert.equal(scheduled.length, 1, "scheduled through the host's managed timer");
+  assert.equal(scheduled[0].ms, 250);
+  scheduled[0].callback();
+  assert.equal(ticks, 1, "the wrapped callback runs");
+  timer.clear();
+  assert.deepEqual(
+    cleared,
+    ["managed-handle"],
+    "stopped through the host's clearTimer, not a raw clearInterval",
+  );
+
+  // A host without managed timers (upstream pi) must still work: raw timer,
+  // unref'd so a running poll never holds the process open, and clearable. This
+  // necessarily constructs a real timer — the fallback IS setInterval — but it
+  // is cleared on the next line, so nothing here waits on the clock and no
+  // fake-timer substitution can exercise the platform path.
+  const raw = mod.scheduleManagedInterval({}, () => {}, 600_000);
+  raw.clear();
+});
 test("bggrep: the match budget trips and reports an error (timeout plumbing)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;
@@ -7006,5 +7178,130 @@ test("bgclean: a running job's staging files survive an aggressive sweep", async
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Live panel + status line: what the pi-only transcript card shows ───────
+//
+// oh-my-pi has no entry renderer, so the job card cannot exist there. These two
+// surfaces carry the same information on BOTH hosts at zero context cost: the
+// editor panel lists what is running plus what just finished, and the status
+// line keeps the latest outcome visible once the panel is gone.
+
+test("panel + status line: running rows, the recent-finished section, and the last outcome", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // Three finished jobs from this session's lineage, with distinct exit times
+    // so "newest first" is observable.
+    const doneAt = Date.now();
+    const doneEntry = (name: string, exitedAt: number): CapturedEntry => ({
+      type: "custom",
+      customType: "bgrun-job",
+      data: {
+        id: `panel-done-${name}-2000000000-11111`,
+        pid: 11111,
+        cmd: `echo ${name}`,
+        name,
+        started: exitedAt - 5_000,
+        logPath: join(dir, `panel-done-${name}-2000000000-11111.log`),
+        state: "done",
+        exitCode: 0,
+        exitedAt,
+      },
+    });
+    const { pi, wakes, tools, ctx, fireSessionStart } = makeFakePi({
+      priorEntries: [
+        doneEntry("oldest", doneAt - 3_000),
+        doneEntry("newest", doneAt - 1_000),
+        doneEntry("middle", doneAt - 2_000),
+      ],
+    });
+    ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    // Nothing running: no panel (no permanent editor space), but the last
+    // outcome stays visible on the status line.
+    assert.equal(widgetCalls.at(-1), undefined, "idle panel is cleared");
+    assert.equal(statuses.at(-1), "✅ newest exit=0", "status shows the newest outcome");
+
+    await tools
+      .get("bgrun")!
+      .execute("call-panel", { command: "sleep 1", name: "long-one" }, undefined, undefined, ctx);
+
+    const shown = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    const flat = shown.join("\n");
+    assert.match(flat, /bgrun: 1 running/);
+    assert.match(flat, /long-one/);
+    assert.match(flat, /── recent ──/, "finished jobs ride along while something runs");
+    assert.match(flat, /✅/, "a finished job keeps its outcome icon");
+    assert.match(flat, /newest/, "the most recently finished job is listed");
+    assert.ok(
+      flat.indexOf("newest") < flat.indexOf("middle") &&
+        flat.indexOf("middle") < flat.indexOf("oldest"),
+      "recent jobs are newest-first",
+    );
+    assert.ok(
+      shown.length <= 10,
+      `panel stays inside the host's own cap instead of being truncated by it (${shown.length} lines)`,
+    );
+    assert.equal(statuses.at(-1), "⏳ 1 running", "status counts live jobs");
+
+    // The job finishes: panel goes away, status keeps the outcome.
+    await waitForWakes(wakes, 1);
+    assert.equal(widgetCalls.at(-1), undefined, "panel cleared when nothing runs");
+    assert.equal(statuses.at(-1), "✅ long-one exit=0", "status holds the newest outcome");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wake digest: a type mismatch reaches the agent once, then stays out of the context", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    // Only a typed entry, so a job that declares the wrong type — or none —
+    // selects nothing. The agent is the only party who can fix that.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ type: "test", preset: "go-test" }],
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute("call-m1", { command: "printf 'x\\n'", name: "mismatch-a" }, undefined, undefined, ctx);
+    await waitForWakes(wakes, 1);
+    await bgrun.execute("call-m2", { command: "printf 'x\\n'", name: "mismatch-a" }, undefined, undefined, ctx);
+    await waitForWakes(wakes, 2);
+
+    assert.match(
+      wakes[0].text,
+      /^digest: no scorecard selected for job name "mismatch-a" — configured types: test/m,
+      "the wake names the job and the configured types",
+    );
+    assert.match(
+      wakes[0].text,
+      /pass the matching `type`/,
+      "the note says how to fix it",
+    );
+    assert.ok(
+      !wakes[1].text.includes("no scorecard selected"),
+      "a repeated mismatch is not re-injected into context",
+    );
+    assert.ok(
+      !wakes[1].text.includes("digest ("),
+      "no scorecard ran for either job",
+    );
+  } finally {
+    teardownDigestEnv(dir, proj, home);
   }
 });

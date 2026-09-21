@@ -12,6 +12,11 @@ Run long/verbose commands detached. Output → file. Context stays clean; the se
 never blocks. The extension wakes this session automatically when the job finishes —
 no polling.
 
+Host-relative paths: `$AGENT_DIR` is the user-level agent directory (`~/.omp/agent`
+under oh-my-pi, `~/.pi/agent` under pi) and `$CONFIG_DIR` is the project config
+directory (`.omp` under oh-my-pi, `.pi` under pi). The jobs dir
+(`.pi-bgrun/jobs`) is shared by both hosts and does not vary.
+
 ## When to use
 
 - Any command expected to run > ~30s OR emit > ~100 lines.
@@ -24,11 +29,24 @@ no polling.
 - Short, quiet commands whose full output you actually need (`git status`).
 - Interactive commands (prompts, REPL, SSH) — bgrun detaches from the terminal.
 
+## Where the wake lands
+
+A job's completion wake goes to the session that started it. In normal use that
+is the main session, and the wake starts a turn there.
+
+**Inside a `task`/subagent session, do not start long jobs.** The wake is
+addressed to that subagent, which has usually already returned by the time a long
+job finishes, so nobody gets woken — the job runs to completion silently. The log
+still lands in the project's jobs dir, so `bgstatus <id>` / `bgtail <id>` can read
+it from the main session afterwards; only the notification is lost. Prefer
+starting long jobs from the main session, or run the command directly (blocking)
+when you are inside a subagent and need the result.
+
 ## Tools
 
 | Action | Tool |
 |---|---|
-| Start  | `bgrun(command: "make test-short", name: "unit-tests", type: "test")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the status widget, and wake messages) |
+| Start  | `bgrun(command: "make test-short", name: "unit-tests", type: "test")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the live panel, and wake messages) |
 | Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
 | Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing) |
 | Grep   | `bggrep(<job-id>, "pattern", context?)` — line-numbered matches, capped and condensed; default pattern = generic failure signatures (override when you know the format) |
@@ -121,16 +139,16 @@ that expensive rather than merely rude. Aggregate, then cap what you print:
 - `bgtail` with a larger `lines`, or a tighter `bggrep` pattern, is usually the
   cheaper answer to "I need to see more".
 
-## After a pi restart or session switch
+## After an agent restart or session switch
 
-- The live wake does not survive a pi restart or a `/resume` to a different session
+- The live wake does not survive an agent restart or a `/resume` to a different session
   (the extension loses the child process handle). The log still completes on disk.
 - After a restart/switch, run `bgstatus(<job-id>)` — the id still resolves via the
   log's `__BGRUN_EXIT__=N` marker. To browse everything on disk, use
   `bgstatus(includeDone: true)`.
 - Each session only tracks its own jobs by default. Running jobs from other
   sessions appear only when `adoptForeignJobs` is enabled in
-  `~/.pi/agent/pi-bgrun.json` (or `PI_BGRUN_FOREIGN_JOBS=1`); finished foreign
+  `$AGENT_DIR/pi-bgrun.json` (or `PI_BGRUN_FOREIGN_JOBS=1`); finished foreign
   logs appear with `bgstatus(includeDone: true)` regardless.
 
 ## Rules
