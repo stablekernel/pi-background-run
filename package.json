@@ -24,7 +24,8 @@
   },
   "scripts": {
     "test": "bun test extension/index.test.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "lint:pr-title": "bun scripts/check-conventional-commit.ts"
   },
   "files": [
     "extension/",
