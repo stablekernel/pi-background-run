@@ -23,9 +23,8 @@ here — copy the example below into your own working copy if you want the same.
 ## What it does
 
 - `showCompletedJobs: true` — finished jobs stay in `bgstatus` instead of
-  disappearing (the extension's default is `false`). The live panel always shows
-  the few most recent finishes while a job is still running, and the status line
-  holds the latest outcome either way.
+  disappearing (the extension's default is `false`). The live panel shows only
+  running jobs; the status line holds the latest outcome.
 - `digest[0]` — a **scorecard**: at wake time, for a job whose `type` is `test`
   *and* whose command matches `*bun test*`, the `command` runs with `$1` set to
   the job's log path, and its stdout is appended to the wake as

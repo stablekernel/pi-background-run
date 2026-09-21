@@ -1710,21 +1710,22 @@ export default function (pi: ExtensionAPI) {
   //
   // Two host-neutral surfaces carry what the pi-only transcript card shows, at
   // zero context cost:
-  //   * the editor widget — running jobs plus the jobs that just finished,
-  //     present only while something is still running (no permanent editor
-  //     space), self-limited to the 10 lines both hosts cap a string[] at;
-  //   * the status line — one always-visible line: the running count while
-  //     jobs are in flight, else how the most recent job ended. This is what
-  //     keeps a job's outcome visible after the panel is gone.
+  //   * the editor widget — RUNNING jobs only, present only while something is
+  //     running (no permanent editor space), self-limited to the 10 lines both
+  //     hosts cap a string[] at. A list of finished jobs is deliberately not
+  //     shown: above the editor it competes with the work in progress, and
+  //     `bgstatus` answers "what ran" on demand;
+  //   * the status line — one always-visible line: the running count while jobs
+  //     are in flight, else how the most recent job ended. This is what keeps a
+  //     job's outcome visible after the panel is gone.
 
   // Both hosts cap a string[] widget at 10 lines and append their own
   // "... (widget truncated)" note past that (pi `MAX_WIDGET_LINES`, oh-my-pi
   // the same). Bounding here keeps the two hosts byte-identical and spends the
   // budget on the panel's own content instead of the host's truncation line.
   const WIDGET_LINE_BUDGET = 10;
-  const WIDGET_RECENT_MAX = 4;
 
-  /** Compact one-line label for a job: its name, else the id's slug prefix. */
+  /** Compact one-line label for a job: its name, else the command. */
   function jobLabel(rec: JobRecord): string {
     const cmd = rec.cmd.length > 40 ? rec.cmd.slice(0, 37) + "…" : rec.cmd;
     return rec.name ? `${rec.name} · ${cmd}` : cmd;
@@ -1737,35 +1738,34 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     revalidateStaleJobs({ persist: opts.persistRevalidate ?? true });
     const running: JobRecord[] = [];
+    // The newest finished record exists only for the status line.
+    let lastDone: JobRecord | undefined;
     for (const rec of jobs.values()) {
-      if (rec.exitCode === undefined) running.push(rec);
+      if (rec.exitCode === undefined) {
+        running.push(rec);
+        continue;
+      }
+      const when = rec.exitedAt ?? rec.started;
+      if (!lastDone || when > (lastDone.exitedAt ?? lastDone.started)) {
+        lastDone = rec;
+      }
     }
-    // Newest finished first. Finished jobs stay in the map for the session
-    // (only adopted ones are dropped), so the panel can show what just ran
-    // without any extra bookkeeping.
-    const recent = [...jobs.values()]
-      .filter((rec) => rec.exitCode !== undefined)
-      .sort((a, b) => (b.exitedAt ?? b.started) - (a.exitedAt ?? a.started))
-      .slice(0, WIDGET_RECENT_MAX);
 
     // The status line is independent of whether the panel shows, so it is set
     // first: live count while running, else the newest outcome.
-    setStatusLine(ctx, recent[0]);
+    setStatusLine(ctx, lastDone);
 
     if (running.length === 0) {
-      // No live activity: the panel goes away (the status line keeps the last
-      // outcome), which is what an idle editor expects.
+      // No live activity: the panel goes away, which is what an idle editor
+      // expects. The status line keeps the outcome.
       ctx.ui.setWidget("bgrun", undefined);
       return;
     }
 
-    // Running rows get priority; the recent section is spent only out of what
-    // is left, and dropped whole rather than truncated, so the panel never
-    // reaches a host's own "... (widget truncated)" note.
     const lines = [`📊 bgrun: ${running.length} running`];
-    // Reserve the overflow line alongside the header before slicing the rows.
-    const maxRunningRows = WIDGET_LINE_BUDGET - 2;
-    const shownRunning = running.slice(0, maxRunningRows);
+    // Reserve the header and a possible overflow line before slicing the rows,
+    // so the panel never reaches a host's own truncation note.
+    const shownRunning = running.slice(0, WIDGET_LINE_BUDGET - 2);
     for (const rec of shownRunning) {
       const tag = rec.adopted ? " (adopted)" : "";
       // Full id (not truncated) so it can be copied straight into /bgtail <id>.
@@ -1775,14 +1775,6 @@ export default function (pi: ExtensionAPI) {
     }
     const hiddenRunning = running.length - shownRunning.length;
     if (hiddenRunning > 0) lines.push(`  … ${hiddenRunning} more running`);
-
-    const recentRows = recent.map((rec) => {
-      const icon = rec.exitCode === 0 ? "✅" : "❌";
-      return `  ${icon} ${rec.id}  ${jobLabel(rec)}  exit=${rec.exitCode ?? "?"}`;
-    });
-    if (recentRows.length > 0 && WIDGET_LINE_BUDGET - lines.length >= recentRows.length + 1) {
-      lines.push("  ── recent ──", ...recentRows);
-    }
     ctx.ui.setWidget("bgrun", lines);
   }
 

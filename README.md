@@ -53,11 +53,11 @@ The host also decides two presentation details, both handled internally:
   no entry renderer (`pi.appendEntry` records are never rendered — it renders only
   `pi.sendMessage` entries), so on omp the job card is skipped. The entries are
   still persisted on both hosts, and `session_start` replays them identically.
-  What the card carries — what ran, in order, and how it ended — is covered on
+  The card's job — "what is running, and how did the last one end" — is covered on
   both hosts by the editor panel and the status line (see
-  [What the human sees](#what-the-human-sees)), which cost no context and need no
-  entry renderer. omp's transcript still anchors each job through the `bgrun`
-  tool card and the wake message.
+  [What the human sees](#what-the-human-sees)) at no context cost and without an
+  entry renderer; the transcript still anchors each job through the `bgrun` tool
+  card and the wake message, and `bgstatus` has the full history on demand.
 - **Diagnostics.** Warnings and errors go to `pi.logger` when the host has one
   (omp writes `~/.omp/logs/omp.<date>.<pid>.log`; the TUI owns the terminal, so
   a raw stderr write would corrupt it) and to the console on pi. Anything the
@@ -125,7 +125,7 @@ child 'exit' event fires:
   → pi.sendUserMessage(wake) when idle (triggers a turn)
      or pi.sendUserMessage(wake, { deliverAs: 'followUp' }) when busy
   → ctx.ui.notify(...)  — toast for the human
-  → ctx.ui.setWidget("bgrun", ...)  — live panel: running jobs + recent finishes
+  → ctx.ui.setWidget("bgrun", ...)  — live panel: the running jobs
   → ctx.ui.setStatus("bgrun", ...) — one-line outcome that outlives the panel
 ```
 
@@ -140,17 +140,20 @@ Both hosts get the same two surfaces, so a job's progress and outcome are
 visible without the conversation having to carry them:
 
 - **Editor panel** (only while something is running — it never takes editor
-  space when idle): a header with the running count, a row per running job
-  (full id, label, elapsed), and a `── recent ──` section with the most recently
-  finished jobs and their ✅/❌ exit. Bounded to the 10 lines both hosts cap a
-  widget at, and dropped whole rather than truncated, so no host ever cuts it.
+  space when idle): a header with the running count, then a row per running job
+  (full id, label, elapsed). Deliberately nothing else — a list of finished jobs
+  above the editor competes with the work in progress, and `bgstatus` answers
+  "what ran" on demand. Rows are bounded to the 10 lines both hosts cap a widget
+  at, with `… N more running` instead of a silently dropped tail.
 - **Status line** (always visible): `⏳ N running` while jobs are in flight,
   then `✅ <name> exit=0` for the most recent finish, cleared when the session
   has neither.
 
-On pi a `bgrun-job` card is also drawn in the transcript (an entry renderer);
-oh-my-pi has no such hook, which is why the panel and the status line carry
-that role there. See [Host differences](#host-differences).
+On pi a `bgrun-job` card is also drawn in the transcript (an entry renderer),
+which omp cannot render — hence these two surfaces. Neither is a history view:
+the panel is live-only and the status line keeps just the latest outcome; use
+`bgstatus includeDone: true` when you need the full list. See
+[Host differences](#host-differences).
 
 ## Reading results without flooding context
 
@@ -262,11 +265,11 @@ is still recognized). Override via `jobsDir` / `PI_BGRUN_DIR`. Within a project,
 the dir is shared by every agent session working in that checkout — that sharing
 enables cross-session job lookup, session-restart reconstruction, and
 per-project cleanup. By default each session only *tracks its own jobs*: the
-panel and `bgstatus` listings show this session's running jobs, `bgstatus` keeps
-finished jobs out of its listing unless asked (`bgstatus includeDone: true`), and
-the panel shows only the few most recent finishes — the status line always holds
-the latest outcome. Jobs started by other sessions can still be inspected by id,
-but they don't clutter your panel.
+panel and `bgstatus` listings show this session's running jobs, and `bgstatus`
+keeps finished jobs out of its listing unless asked (`bgstatus includeDone:
+true`) — the panel never shows finished work at all. The status line holds the
+latest outcome. Jobs started by other sessions can still be inspected by id, but
+they don't clutter your panel.
 
 Configuration is layered (later wins): **defaults ← user config file ← project
 config file (trusted projects only) ← environment variables**.

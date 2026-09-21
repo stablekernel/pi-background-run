@@ -7188,12 +7188,13 @@ test("bgclean: a running job's staging files survive an aggressive sweep", async
 // editor panel lists what is running plus what just finished, and the status
 // line keeps the latest outcome visible once the panel is gone.
 
-test("panel + status line: running rows, the recent-finished section, and the last outcome", async () => {
+test("panel + status line: running rows only, and the last outcome once nothing runs", async () => {
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
   try {
-    // Three finished jobs from this session's lineage, with distinct exit times
-    // so "newest first" is observable.
+    // Three finished jobs from this session's lineage. They must NOT appear in
+    // the panel (a list of old jobs above the editor competes with live work);
+    // the newest one is what the status line should report.
     const doneAt = Date.now();
     const doneEntry = (name: string, exitedAt: number): CapturedEntry => ({
       type: "custom",
@@ -7241,13 +7242,13 @@ test("panel + status line: running rows, the recent-finished section, and the la
     const flat = shown.join("\n");
     assert.match(flat, /bgrun: 1 running/);
     assert.match(flat, /long-one/);
-    assert.match(flat, /── recent ──/, "finished jobs ride along while something runs");
-    assert.match(flat, /✅/, "a finished job keeps its outcome icon");
-    assert.match(flat, /newest/, "the most recently finished job is listed");
     assert.ok(
-      flat.indexOf("newest") < flat.indexOf("middle") &&
-        flat.indexOf("middle") < flat.indexOf("oldest"),
-      "recent jobs are newest-first",
+      !flat.includes("newest") && !flat.includes("oldest") && !flat.includes("middle"),
+      "finished jobs stay out of the panel",
+    );
+    assert.ok(
+      !/exit=/.test(flat),
+      "the panel reports live state, not past outcomes",
     );
     assert.ok(
       shown.length <= 10,
@@ -7259,6 +7260,55 @@ test("panel + status line: running rows, the recent-finished section, and the la
     await waitForWakes(wakes, 1);
     assert.equal(widgetCalls.at(-1), undefined, "panel cleared when nothing runs");
     assert.equal(statuses.at(-1), "✅ long-one exit=0", "status holds the newest outcome");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("panel: a burst of running jobs is bounded, and says how many it hid", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // Fourteen live jobs: more rows than the budget allows. The panel must say
+    // how many it did not show rather than silently dropping them (or letting a
+    // host truncate the list).
+    const priorEntries: CapturedEntry[] = Array.from({ length: 14 }, (_, i) => ({
+      type: "custom",
+      customType: "bgrun-job",
+      data: {
+        id: `burst-${String(i).padStart(2, "0")}-2000000000-${process.pid}`,
+        pid: process.pid,
+        cmd: `sleep 30 # ${i}`,
+        name: `burst-${i}`,
+        started: Date.now(),
+        logPath: join(dir, `burst-${String(i).padStart(2, "0")}-2000000000-${process.pid}.log`),
+        state: "running",
+      },
+    }));
+    // Each log exists and has no exit marker; the pid is this test process, so
+    // every record revalidates as still running.
+    for (const entry of priorEntries) {
+      writeFileSync(entry.data!.logPath as string, "working\n");
+    }
+
+    const { pi, ctx, fireSessionStart } = makeFakePi({ priorEntries });
+    ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    const shown = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    assert.match(shown[0], /bgrun: 14 running/);
+    assert.ok(shown.length <= 10, `bounded to the host cap (${shown.length} lines)`);
+    assert.match(
+      shown.join("\n"),
+      /… 6 more running/,
+      "the hidden count is stated instead of dropped",
+    );
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
