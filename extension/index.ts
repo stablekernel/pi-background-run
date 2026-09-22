@@ -1672,10 +1672,6 @@ export default function (pi: ExtensionAPI) {
   // literal would trip pi's excess-property check against its ToolDefinition.
   const ESSENTIAL_TOOL = { loadMode: "essential" as const };
 
-  // `<config-dir>/pi-bgrun.json` as the host spells it (`.omp/...` on oh-my-pi,
-  // `.pi/...` on upstream pi), for prose that points the model at the file.
-  const CONFIG_FILE_HINT = `${CONFIG_DIR_NAME}/pi-bgrun.json`;
-
   const jobs = new Map<string, JobRecord>();
   // bgtail's delta-tailing bookmarks: one entry per job id ever tailed, holding
   // the high-water mark of what the caller has already had the opportunity to
@@ -2469,7 +2465,7 @@ export default function (pi: ExtensionAPI) {
   const BGRUN_GUIDELINES = [
     "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
     "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
-    `When the project's digest config defines \`type\` entries, pass the matching \`type\` (e.g. type: 'test') so the wake selects the right scorecard; the vocabulary comes from the project's \`${CONFIG_FILE_HINT}\` digest entries.`,
+    "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard — bgrun's `started:` line names them when you omit it.",
     "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
     "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search or ctx_execute_file on the log path for whole-log analysis.",
   ];
@@ -2506,8 +2502,8 @@ export default function (pi: ExtensionAPI) {
         Type.String({
           description:
             "Optional job type used to select the project's digest scorecard (e.g. 'test', 'build', 'lint'). " +
-            "The vocabulary comes from the `type` fields in the project's `digest` config entries in " +
-            `\`${CONFIG_FILE_HINT}\`; when the project's digest config defines types, prefer passing the matching one.`,
+            "When the project's digest config defines types, pass the matching one — bgrun's `started:` line " +
+            "names them when you leave this out.",
         }),
       ),
     }),
