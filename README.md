@@ -149,6 +149,15 @@ visible without the conversation having to carry them:
   then `✅ <name> exit=0` for the most recent finish, cleared when the session
   has neither.
 
+Both surfaces also cover the **host's own** background jobs — oh-my-pi
+backgrounds long `bash` calls itself (`bash.autoBackground`, or `async: true`)
+and delivers their output as an async result. Those are not bgrun jobs: their ids
+look like `bg_1`, they have no log here, and they are cancelled when the session
+is switched or replaced. The panel tags them `native` and `bgstatus` lists them
+under their own heading, so one glance (or one call) covers all background work
+in the session, and an id from either namespace explains itself — `bggrep bg_5`
+says what `bg_5` is and where its output went, instead of a bare "no log found".
+
 On pi a `bgrun-job` card is also drawn in the transcript (an entry renderer),
 which omp cannot render — hence these two surfaces. Neither is a history view:
 the panel is live-only and the status line keeps just the latest outcome; use
@@ -504,13 +513,16 @@ bgrun(command: "go test ./...", name: "unit-tests", type: "test")
 ```
 
 `type` is an optional `bgrun` parameter. The vocabulary is defined by the
-`type` fields of the project's digest config in `$CONFIG_DIR/pi-bgrun.json`; when the
-project's digest config defines types, prefer passing the matching one. If a
-job's `type` (or name/command) selects no entry, the **wake itself** carries a
-line naming the job and the configured types, with the fix (`pass the matching
-type on the next bgrun call`) — the agent is the only party who can correct it,
-and on oh-my-pi a log-only diagnostic would be invisible to it. The same fact
-goes to the host log. It is emitted **once per distinct mismatch** (at most 3 per
+`type` fields of the project's digest config in `$CONFIG_DIR/pi-bgrun.json`. You do
+not have to read that file to use it: when a digest with typed entries is
+configured and the job is started **without** a `type`, `bgrun`'s `started:` line
+names the configured types and the one to pass — the one moment the answer is
+still actionable. If a job's `type` (or name/command) selects no entry, the
+**wake itself** carries a line naming the job and the configured types, with the
+fix (`pass the matching type on the next bgrun call`) — the agent is the only
+party who can correct it, and on oh-my-pi a log-only diagnostic would be
+invisible to it. The same fact goes to the
+host log. It is emitted **once per distinct mismatch** (at most 3 per
 session, then suppressed), so a project that never passes the right type cannot
 grow the context per job — a mismatched type is visible without being
 scorecard-less *and* without becoming noise.

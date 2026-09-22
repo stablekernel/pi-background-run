@@ -109,6 +109,111 @@ interface HostTimers {
 }
 
 /**
+ * oh-my-pi backgrounds long `bash` calls itself (`bash.autoBackground`, and an
+ * explicit `async: true`) and tracks them in an in-process job manager. Those
+ * jobs are NOT bgrun jobs: they have their own ids (`bg_1`), their output goes
+ * to an artifact plus a delivered `async-result` message, and they are cancelled
+ * on session transitions. Upstream pi has no such manager, so this is
+ * capability-probed and reads as empty there.
+ */
+interface NativeJob {
+  id: string;
+  type: string;
+  /** `running` | `completed` | `failed` | `cancelled` */
+  status: string;
+  label: string;
+  startTime: number;
+}
+
+/** Read-only native-job surface oh-my-pi adds to ExtensionContext. */
+interface HostAsyncJobs {
+  getAsyncJobSnapshot?: () => { running?: unknown; recent?: unknown } | null;
+}
+
+/**
+ * `customType` of the message a host delivers when a native background job
+ * finishes (`session/async-job-delivery.ts` in oh-my-pi). Watching for it is
+ * how the panel learns a native job is gone without polling.
+ */
+const NATIVE_RESULT_MESSAGE_TYPE = "async-result";
+
+/**
+ * Whether this context can report host-owned background jobs. A documented
+ * boundary rather than a bare check: it is what gates the panel refresh hooks,
+ * so hosts without the API (upstream pi) pay nothing for native-job support.
+ */
+export function supportsNativeJobSnapshot(ctx: ExtensionContext | undefined): boolean {
+  return (
+    typeof (ctx as (ExtensionContext & HostAsyncJobs) | undefined)
+      ?.getAsyncJobSnapshot === "function"
+  );
+}
+
+/**
+ * The session's native (host-owned) background jobs. `[]` on hosts without the
+ * snapshot API, so every caller degrades to bgrun-only behavior. Read-only
+ * throughout: bgrun never adopts, resumes, or cancels these — it only reports
+ * them, so one panel and one status line cover both kinds of background work.
+ */
+export function nativeJobs(
+  ctx: ExtensionContext | undefined,
+  which: "running" | "recent" = "running",
+): NativeJob[] {
+  if (!ctx) return [];
+  const host = ctx as ExtensionContext & HostAsyncJobs;
+  let snapshot: { running?: unknown; recent?: unknown } | null | undefined;
+  try {
+    snapshot = host.getAsyncJobSnapshot?.();
+  } catch {
+    // A host that throws here must not break the panel or a status query.
+    return [];
+  }
+  if (!snapshot || typeof snapshot !== "object") return [];
+  const list = which === "running" ? snapshot.running : snapshot.recent;
+  if (!Array.isArray(list)) return [];
+  const out: NativeJob[] = [];
+  for (const raw of list) {
+    // Untrusted shape: this crosses a host API boundary, so every field is
+    // checked rather than asserted.
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    if (typeof item.id !== "string" || !item.id) continue;
+    out.push({
+      id: item.id,
+      type: typeof item.type === "string" ? item.type : "job",
+      status: typeof item.status === "string" ? item.status : "running",
+      label: typeof item.label === "string" ? item.label : "",
+      startTime:
+        typeof item.startTime === "number" ? item.startTime : Date.now(),
+    });
+  }
+  return out;
+}
+
+/** One-line description of a native job row (label + kind), capped for the panel. */
+function nativeJobLabel(job: NativeJob): string {
+  const label = job.label.length > 40 ? job.label.slice(0, 37) + "…" : job.label;
+  return label ? `${label} · native ${job.type}` : `native ${job.type}`;
+}
+
+/**
+ * What to say when an id does not resolve to a bgrun job. Names the expected
+ * shape, and — for a native id — says where that job's output actually goes, so
+ * a `bg_N` id can't dead-end a session the way it did in practice.
+ */
+export function unknownJobHint(id: string): string {
+  const bgrunShape =
+    "bgrun job ids look like `<name>-<epoch>-<pid>`; run `bgstatus` with no id to list this session's jobs.";
+  // The native manager mints `bg_<n>`; bgrun mints `<slug>-<epoch>-<pid>`.
+  if (!/^bg_\d+$/.test(id)) return bgrunShape;
+  return (
+    `"${id}" looks like a native background job (the host backgrounds long bash calls itself). ` +
+    "Its output is delivered automatically as an async result and is never written to this jobs dir. " +
+    bgrunShape
+  );
+}
+
+/**
  * Interval timer that prefers the host's managed timers. Falls back to a raw
  * `setInterval`, `unref`'d so a watch loop never keeps the process alive.
  * Returns a handle whose `clear()` stops the timer on either path.
@@ -707,7 +812,9 @@ function logReadError(id: string, logPath: string): string {
   if (existsSync(logPath)) {
     return `Log for job ${id} at ${logPath} exists but could not be read (file may be too large or unreadable)`;
   }
-  return `No log found for job ${id} at ${logPath}`;
+  // Name the expected shape, and — for a host-minted native id — say where that
+  // job's output actually is, so the id can't dead-end the caller.
+  return `No log found for job ${id} at ${logPath}. ${unknownJobHint(id)}`;
 }
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -1506,6 +1613,10 @@ interface BgStatusDetails {
   type?: string;
   count?: number;
   recovered?: boolean;
+  /** The id resolved to a host-managed background job, not a bgrun job. */
+  native?: boolean;
+  /** Host-managed background jobs included in a listing. */
+  nativeCount?: number;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1750,31 +1861,46 @@ export default function (pi: ExtensionAPI) {
         lastDone = rec;
       }
     }
+    // The host's own background jobs (omp auto-backgrounds long bash calls) are
+    // read-only to us, but they belong in the same panel: one place to see what
+    // is running, and the `(native)` tag is what tells the human — and the
+    // agent reading the same id later — that its output is delivered rather
+    // than logged here.
+    const native = nativeJobs(ctx, "running");
 
     // The status line is independent of whether the panel shows, so it is set
     // first: live count while running, else the newest outcome.
     setStatusLine(ctx, lastDone);
 
-    if (running.length === 0) {
+    if (running.length === 0 && native.length === 0) {
       // No live activity: the panel goes away, which is what an idle editor
       // expects. The status line keeps the outcome.
       ctx.ui.setWidget("bgrun", undefined);
       return;
     }
 
-    const lines = [`📊 bgrun: ${running.length} running`];
+    const header = native.length
+      ? running.length
+        ? `📊 bgrun: ${running.length} running · ${native.length} native`
+        : `📊 bgrun: ${native.length} native running`
+      : `📊 bgrun: ${running.length} running`;
+    const lines = [header];
     // Reserve the header and a possible overflow line before slicing the rows,
     // so the panel never reaches a host's own truncation note.
-    const shownRunning = running.slice(0, WIDGET_LINE_BUDGET - 2);
-    for (const rec of shownRunning) {
+    const maxRows = WIDGET_LINE_BUDGET - 2;
+    const rows = running.map((rec) => {
       const tag = rec.adopted ? " (adopted)" : "";
       // Full id (not truncated) so it can be copied straight into /bgtail <id>.
-      lines.push(
-        `  ${rec.id}  ${jobLabel(rec)}  (since ${formatSince(rec.started)})${tag}`,
+      return `  ${rec.id}  ${jobLabel(rec)}  (since ${formatSince(rec.started)})${tag}`;
+    });
+    for (const job of native) {
+      rows.push(
+        `  ${job.id}  ${nativeJobLabel(job)}  (since ${formatSince(job.startTime)})`,
       );
     }
-    const hiddenRunning = running.length - shownRunning.length;
-    if (hiddenRunning > 0) lines.push(`  … ${hiddenRunning} more running`);
+    lines.push(...rows.slice(0, maxRows));
+    const hidden = rows.length - Math.min(rows.length, maxRows);
+    if (hidden > 0) lines.push(`  … ${hidden} more running`);
     ctx.ui.setWidget("bgrun", lines);
   }
 
@@ -1784,8 +1910,12 @@ export default function (pi: ExtensionAPI) {
     for (const rec of jobs.values()) {
       if (rec.exitCode === undefined) running++;
     }
-    if (running > 0) {
-      ctx.ui.setStatus("bgrun", `⏳ ${running} running`);
+    // Native jobs belong in the count too — "1 running" that ignores a
+    // backgrounded bash call would be wrong from the human's point of view.
+    const nativeRunning = nativeJobs(ctx, "running").length;
+    const live = running + nativeRunning;
+    if (live > 0) {
+      ctx.ui.setStatus("bgrun", `⏳ ${live} running`);
       return;
     }
     if (!lastDone) {
@@ -2301,6 +2431,25 @@ export default function (pi: ExtensionAPI) {
     autoCleanJobs(ctx);
   });
 
+  // Host-owned background jobs change with no bgrun event at all: the host
+  // backgrounds a `bash` call on its own (the tool result is the start notice),
+  // and delivers the outcome later as an `async-result` message. Without these
+  // two hooks the panel would keep showing the count from whenever bgrun last
+  // acted. Both are no-ops on hosts without the snapshot API (upstream pi).
+  pi.on("tool_execution_end", (_event, ctx) => {
+    if (!ctx.hasUI || !supportsNativeJobSnapshot(ctx)) return;
+    updateWidget(ctx, { persistRevalidate: false });
+  });
+
+  pi.on("message_start", (event, ctx) => {
+    if (!ctx.hasUI || !supportsNativeJobSnapshot(ctx)) return;
+    // Only the async-result delivery ends a native job; ignore every other
+    // message rather than rebuilding the panel on each one.
+    if (!event.message || !("customType" in event.message)) return;
+    if (event.message.customType !== NATIVE_RESULT_MESSAGE_TYPE) return;
+    updateWidget(ctx, { persistRevalidate: false });
+  });
+
   pi.on("session_shutdown", async (_event, ctx) => {
     stopStalePoller();
     // Sweep old logs on the way out. Throttled via the .last-clean marker so
@@ -2332,9 +2481,10 @@ export default function (pi: ExtensionAPI) {
     description: toolDescription(
       "Run a long shell command detached in the background. Returns 'started: <job-id>' immediately. " +
         "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
-        "expected to run >30s or emit >100 lines (tests, builds, linters). Optionally pass `name` for a " +
-        "short human-readable label used in the job id, status output, and wake messages, and `type` to " +
-        "select the project's digest scorecard.",
+        "expected to run >30s or emit >100 lines (tests, builds, linters) — and whenever the output must " +
+        "outlive the session, since the job's log survives a restart and stays greppable. Optionally pass " +
+        "`name` for a short human-readable label used in the job id, status output, and wake messages, and " +
+        "`type` to select the project's digest scorecard.",
       BGRUN_GUIDELINES,
     ),
     promptSnippet:
@@ -2708,6 +2858,25 @@ export default function (pi: ExtensionAPI) {
         const startedLines = [`started: ${id}`];
         if (name) startedLines.push(`  name: ${name}`);
         if (type) startedLines.push(`  type: ${type}`);
+        // The digest selector keys off `type`, and its vocabulary lives in the
+        // project's config — which the agent has no reason to read. Say it here,
+        // at the one moment it can act on it: the spawn. Costs nothing on the
+        // happy path (no digest, or a type already given), and the config is
+        // already resolved above.
+        if (!type) {
+          const digestTypes = [
+            ...new Set(
+              (cfg.digest ?? [])
+                .map((entry) => entry.type)
+                .filter((t): t is string => typeof t === "string"),
+            ),
+          ];
+          if (digestTypes.length > 0) {
+            startedLines.push(
+              `  digest: configured types ${digestTypes.join(", ")} — pass type: "${digestTypes[0]}" to attach a scorecard`,
+            );
+          }
+        }
         startedLines.push(
           `  log: ${logPath}`,
           `  You'll be woken automatically when it finishes.`,
@@ -3486,6 +3655,26 @@ export default function (pi: ExtensionAPI) {
       }
       const logPath = join(jobsDir, `${id}.log`);
       if (!existsSync(logPath)) {
+        // A host-owned background job (omp backgrounds long bash calls itself)
+        // is a real answer, just not a bgrun one: report it as such instead of
+        // a bare "not found", which in practice sent a session chasing `bg_5`.
+        const native = [...nativeJobs(ctx, "running"), ...nativeJobs(ctx, "recent")].find(
+          (job) => job.id === id,
+        );
+        if (native) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `${id}: ${native.status} — native background job (${native.type}), not a bgrun job.\n` +
+                  (native.label ? `  cmd: ${native.label}\n` : "") +
+                  "  output: delivered automatically as an async result (no log in this jobs dir)",
+              },
+            ],
+            details: { id, state: native.status, native: true },
+          };
+        }
         return {
           content: [{ type: "text", text: `No job found with id ${id}` }],
           details: { id, state: "unknown" },
@@ -3568,15 +3757,35 @@ export default function (pi: ExtensionAPI) {
         `  (${hiddenOnDisk} more job log(s) on disk — pass includeDone to list, bgclean all to prune)`,
       );
     }
-    if (lines.length === 0) {
+
+    // Host-managed background jobs (omp auto-backgrounds long bash calls) are
+    // listed too, so one call answers "what is running": running always, and
+    // finished ones only when finished jobs were asked for, matching the rule
+    // the bgrun rows above follow. They are not ours to read, clean, or adopt —
+    // the note says where their output goes.
+    const native = [
+      ...nativeJobs(ctx, "running"),
+      ...(showDone ? nativeJobs(ctx, "recent") : []),
+    ];
+    const sections: string[] = [];
+    if (lines.length > 0) sections.push(`bgrun jobs:\n${lines.join("\n")}`);
+    if (native.length > 0) {
+      const rows = native.map(
+        (job) => `  ${job.id}: ${job.status} — ${nativeJobLabel(job)}`,
+      );
+      sections.push(
+        `native background jobs (host-managed; output is delivered automatically, not logged here):\n${rows.join("\n")}`,
+      );
+    }
+    if (sections.length === 0) {
       return {
-        content: [{ type: "text", text: "(no bgrun jobs)" }],
-        details: { count: 0 },
+        content: [{ type: "text", text: "(no background jobs)" }],
+        details: { count: 0, nativeCount: 0 },
       };
     }
     return {
-      content: [{ type: "text", text: `bgrun jobs:\n${lines.join("\n")}` }],
-      details: { count: jobCount },
+      content: [{ type: "text", text: sections.join("\n") }],
+      details: { count: jobCount, nativeCount: native.length },
     };
   }
 
@@ -3588,8 +3797,11 @@ export default function (pi: ExtensionAPI) {
       "Show status of background jobs. With an id: one job's state + exit code. Without: list this session's " +
       "running jobs (finished jobs are hidden by default — pass includeDone or set showCompletedJobs to list " +
       "them). Other sessions' running jobs are listed only when adoptForeignJobs is enabled; finished foreign " +
-      "logs from the shared dir can also appear when finished jobs are included.",
-    promptSnippet: "Check status of bgrun jobs",
+      "logs from the shared dir can also appear when finished jobs are included. Host-managed background jobs " +
+      "(e.g. oh-my-pi's auto-backgrounded bash calls) are listed too, marked native, with where their output " +
+      "goes — they have no log here and are not ours to clean.",
+    promptSnippet:
+      "Check status of background jobs (bgrun jobs plus host-managed ones)",
     parameters: Type.Object({
       id: Type.Optional(
         Type.String({ description: "Optional job id to inspect" }),

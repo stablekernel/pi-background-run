@@ -184,6 +184,8 @@ interface FakePiHandles {
   handlers: Map<string, FakeHandler[]>;
   fireSessionStart: () => Promise<void>;
   fireSessionShutdown: () => Promise<void>;
+  /** Fire any registered event handler, for hooks beyond session_start/shutdown. */
+  fireEvent: (event: string, payload: unknown) => Promise<void>;
   /** Messages the extension routed to the host logger (omp path). */
   hostLogs: string[];
 }
@@ -283,6 +285,11 @@ function makeFakePi(
       await h(event, ctx);
     }
   };
+  const fireEvent = async (event: string, payload: unknown) => {
+    for (const h of handlers.get(event) ?? []) {
+      await h(payload, ctx);
+    }
+  };
   return {
     pi,
     wakes,
@@ -294,6 +301,7 @@ function makeFakePi(
     handlers,
     fireSessionStart,
     fireSessionShutdown,
+    fireEvent,
     hostLogs,
   };
 }
@@ -7351,6 +7359,320 @@ test("wake digest: a type mismatch reaches the agent once, then stays out of the
       !wakes[1].text.includes("digest ("),
       "no scorecard ran for either job",
     );
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+// ── Native (host-managed) background jobs ──────────────────────────────────
+//
+// omp backgrounds long bash calls itself. Those jobs are not bgrun jobs — they
+// have their own ids (`bg_1`), their output goes to a delivered async result
+// rather than a log here, and they are cancelled on session transitions. They
+// must still be *visible* in the same surfaces, or the two namespaces collide
+// (observed: `bggrep bg_5` dead-ending a session).
+
+interface NativeSnapshotItem {
+  id: string;
+  type: string;
+  status: string;
+  label: string;
+  startTime: number;
+}
+
+function nativeSnapshotCtxFields(
+  running: NativeSnapshotItem[],
+  recent: NativeSnapshotItem[] = [],
+): Record<string, unknown> {
+  return { getAsyncJobSnapshot: () => ({ running, recent }) };
+}
+
+const NATIVE_RUNNING: NativeSnapshotItem = {
+  id: "bg_9",
+  type: "bash",
+  status: "running",
+  label: "make its",
+  startTime: Date.now() - 60_000,
+};
+const NATIVE_DONE: NativeSnapshotItem = {
+  id: "bg_8",
+  type: "bash",
+  status: "completed",
+  label: "make lint",
+  startTime: Date.now() - 300_000,
+};
+
+test("native jobs: the panel and status line cover host-managed background work", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const h = makeFakePi({
+      ctxFields: nativeSnapshotCtxFields([NATIVE_RUNNING]),
+    });
+    h.ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    h.ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+
+    // Nothing of ours is running, but the host has a job: the panel must still
+    // appear — that is the point of one shared view.
+    const onlyNative = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    assert.match(onlyNative[0], /bgrun: 1 native running/);
+    assert.match(onlyNative.join("\n"), /bg_9.*make its · native bash/);
+    assert.equal(statuses.at(-1), "⏳ 1 running", "the status line counts host jobs");
+
+    await h.tools
+      .get("bgrun")!
+      .execute("call-native", { command: "sleep 1", name: "ours" }, undefined, undefined, h.ctx);
+
+    const both = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    assert.match(both[0], /bgrun: 1 running · 1 native/);
+    const flat = both.join("\n");
+    assert.ok(
+      flat.indexOf("ours") < flat.indexOf("bg_9"),
+      "bgrun rows come first, host rows after",
+    );
+    assert.equal(statuses.at(-1), "⏳ 2 running", "both kinds count as running");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hosts without the native snapshot API are unaffected (upstream pi)", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // No getAsyncJobSnapshot on the ctx at all.
+    const h = makeFakePi();
+    h.ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    h.ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+    assert.equal(widgetCalls.at(-1), undefined, "idle panel stays cleared");
+    assert.equal(statuses.at(-1), undefined, "no phantom status line");
+
+    const list = await h.tools
+      .get("bgstatus")!
+      .execute("c1", {}, undefined, undefined, h.ctx);
+    assert.equal(list.content[0].text, "(no background jobs)");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgstatus: a host-managed id resolves to an explanation, not a dead end", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const h = makeFakePi({
+      ctxFields: nativeSnapshotCtxFields([NATIVE_RUNNING], [NATIVE_DONE]),
+    });
+    await loadExtension(h.pi);
+    const bgstatus = h.tools.get("bgstatus")!;
+
+    const one = await bgstatus.execute("c1", { id: "bg_9" }, undefined, undefined, h.ctx);
+    assert.notEqual(one.isError, true, "a host job is a real answer, not an error");
+    const oneText = one.content[0].text as string;
+    assert.match(oneText, /native background job \(bash\), not a bgrun job/);
+    assert.match(oneText, /delivered automatically/);
+    assert.equal(
+      (one.details as { native?: boolean }).native,
+      true,
+      "the result is marked native",
+    );
+
+    // Listing: running host jobs always, finished ones only when asked.
+    const list = await bgstatus.execute("c2", {}, undefined, undefined, h.ctx);
+    const listText = list.content[0].text as string;
+    assert.match(listText, /native background jobs/);
+    assert.match(listText, /bg_9: running/);
+    assert.ok(!listText.includes("bg_8"), "finished host jobs stay hidden by default");
+
+    const listDone = await bgstatus.execute(
+      "c3",
+      { includeDone: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.match(listDone.content[0].text as string, /bg_8: completed/);
+    assert.equal(
+      (listDone.details as { nativeCount?: number }).nativeCount,
+      2,
+      "both host jobs are reported",
+    );
+
+    // An id that is neither ours nor the host's is still an error.
+    const ghost = await bgstatus.execute("c4", { id: "ghost-1-2" }, undefined, undefined, h.ctx);
+    assert.equal(ghost.isError, true, "an unknown non-native id is still an error");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgtail/bggrep: an unresolvable id names the expected shape and spots a host id", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const bggrep = h.tools.get("bggrep")!;
+
+    // A host-minted id: say what it is and where its output went.
+    const native = await bggrep.execute("c1", { id: "bg_5" }, undefined, undefined, h.ctx);
+    const nativeText = native.content[0].text as string;
+    assert.match(nativeText, /No log found for job bg_5/);
+    assert.match(nativeText, /native background job/);
+    assert.match(nativeText, /<name>-<epoch>-<pid>/, "the bgrun id shape is named");
+
+    // A bgrun-shaped id that simply does not exist: name the shape, but do not
+    // blame the host.
+    const typo = await bggrep.execute("c2", { id: "unit-tests-1-2" }, undefined, undefined, h.ctx);
+    const typoText = typo.content[0].text as string;
+    assert.match(typoText, /<name>-<epoch>-<pid>/);
+    assert.ok(
+      !typoText.includes("native background job"),
+      "a bgrun-shaped id is not blamed on the host",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: the panel refreshes on the host's own start and finish events", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // The host's job set changes underneath us: this stands in for the host
+    // backgrounding a bash call, then delivering its result.
+    let snapshotRunning: NativeSnapshotItem[] = [];
+    const h = makeFakePi({
+      ctxFields: { getAsyncJobSnapshot: () => ({ running: snapshotRunning, recent: [] }) },
+    });
+    h.ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    h.ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+    assert.equal(widgetCalls.at(-1), undefined, "nothing running yet");
+
+    // The host backgrounds a bash call: its tool_result fires, and the panel
+    // must pick the job up even though bgrun did nothing.
+    snapshotRunning = [NATIVE_RUNNING];
+    await h.fireEvent("tool_execution_end", { type: "tool_execution_end", toolName: "bash" });
+    const shown = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    assert.match(shown[0], /bgrun: 1 native running/);
+    assert.equal(statuses.at(-1), "⏳ 1 running");
+
+    // The host delivers the result: the panel clears on that message, not on
+    // the next bgrun event (there may never be one).
+    snapshotRunning = [];
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: { role: "custom", customType: "async-result", content: "done" },
+    });
+    assert.equal(widgetCalls.at(-1), undefined, "panel cleared when the host's job ends");
+
+    // An unrelated message must not rebuild the panel.
+    const before = widgetCalls.length;
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+    });
+    assert.equal(widgetCalls.length, before, "other messages are ignored");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: the started: line names the project's digest types when none was passed", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: "test", preset: "go-test" },
+        { type: "build", preset: "go-test" },
+        { type: "test", preset: "jest" },
+      ],
+    });
+    const h = makeFakePi();
+    trustCtx(h.ctx, proj, true);
+    await loadExtension(h.pi);
+    const bgrun = h.tools.get("bgrun")!;
+
+    // No type: the vocabulary is named, once per distinct type, at the moment
+    // it can still be used.
+    const noType = await bgrun.execute(
+      "call-hint",
+      { command: "printf 'x\\n'", name: "unit-tests" },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    const text = noType.content[0].text as string;
+    assert.match(text, /^ {2}digest: configured types test, build — pass type: "test" to attach a scorecard$/m);
+
+    // A type was given: nothing to suggest.
+    const withType = await bgrun.execute(
+      "call-hint-2",
+      { command: "printf 'x\\n'", name: "unit-tests", type: "build" },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.ok(
+      !(withType.content[0].text as string).includes("configured types"),
+      "no hint when the caller already passed a type",
+    );
+
+    await waitForWakes(h.wakes, 2);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("bgrun: no digest type hint when the project has no typed entries", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    // Only an untyped default entry: it matches every job, so there is nothing
+    // to pass and nothing to say.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ label: "always", command: "echo x" }],
+    });
+    const h = makeFakePi();
+    trustCtx(h.ctx, proj, true);
+    await loadExtension(h.pi);
+
+    const res = await h.tools
+      .get("bgrun")!
+      .execute("call-no-hint", { command: "printf 'x\\n'" }, undefined, undefined, h.ctx);
+    assert.ok(
+      !(res.content[0].text as string).includes("configured types"),
+      "an untyped digest needs no type from the caller",
+    );
+    await waitForWakes(h.wakes, 1);
   } finally {
     teardownDigestEnv(dir, proj, home);
   }

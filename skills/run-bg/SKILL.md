@@ -17,11 +17,20 @@ under oh-my-pi, `~/.pi/agent` under pi) and `$CONFIG_DIR` is the project config
 directory (`.omp` under oh-my-pi, `.pi` under pi). The jobs dir
 (`.pi-bgrun/jobs`) is shared by both hosts and does not vary.
 
+Host features: the **Native background jobs (oh-my-pi)** section and the `native`
+rows in `bgstatus` / the live panel apply only to oh-my-pi. On pi there is no
+host-managed background path — every background job is a bgrun job.
+
 ## When to use
 
 - Any command expected to run > ~30s OR emit > ~100 lines.
 - Typical: `make test`, `go test ./...`, `make lint`, `make build`.
 - Integration / infra suites (long-running, always background).
+
+The two thresholds measure different things: **> ~30s** is about the session
+staying unblocked, **> ~100 lines** is about context — output that reaches you as
+a tool result stays in the transcript for the rest of the session, and a bgrun
+log never does.
 
 ## When NOT to use
 
@@ -42,6 +51,23 @@ it from the main session afterwards; only the notification is lost. Prefer
 starting long jobs from the main session, or run the command directly (blocking)
 when you are inside a subagent and need the result.
 
+## Native background jobs (oh-my-pi)
+
+oh-my-pi backgrounds long `bash` calls by itself (`bash.autoBackground`, and an
+explicit `async: true`) and delivers the result automatically as an async result.
+Those jobs are **not** bgrun jobs: their ids look like `bg_1`, their output goes to
+a delivered message (never a log in the jobs dir), they are cancelled when the
+session is switched or replaced, and their ids do not work with `bgtail` /
+`bggrep`. `bgstatus` lists them too, marked `native`.
+
+Which to use:
+
+- **Native bash background** — a long command whose output you will read once, in
+  this session, and never need again.
+- **`bgrun`** — a job whose log must outlive the session: surviving a restart or a
+  crash, greppable on disk afterwards (`bgtail` / `bggrep`), scored by a digest,
+  or visible from another session in the same project.
+
 ## Tools
 
 | Action | Tool |
@@ -57,7 +83,9 @@ when you are inside a subagent and need the result.
 1. **Start:** call `bgrun` with the command (and a short `name`, e.g. `name: "unit-tests"`).
    When the project's digest config defines `type` entries, also pass the
    matching `type` (e.g. `type: "test"`) — like `name`, it helps the wake
-   select the right digest scorecard. Note the returned job-id. Continue other
+   select the right digest scorecard. You do not have to go looking for the
+   vocabulary: when a digest is configured and you omit `type`, the `started:`
+   result names the configured types. Note the returned job-id. Continue other
    work; you will be woken automatically when the job finishes.
 2. **On wake:** check the exit status in the wake message first.
    - `exit: 0` → success. `bgtail` to confirm.
