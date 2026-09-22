@@ -8,9 +8,11 @@ pi-background-run **wakes the live agent session** so it proactively reads a
 condensed digest of the results and continues — no polling, no human intervention.
 
 Built as a [pi](https://github.com/earendil-works/pi-coding-agent) extension. No
-shell runner and no external daemon — the extension spawns the job in-process,
-detects completion via the child `exit` event, and calls `pi.sendUserMessage` to wake
-the agent. The log file is self-describing (full output + a trailing
+shell runner and no external daemon — the extension spawns the job in-process
+and uses the child `exit` event while that extension generation remains active.
+On `/reload` or session shutdown it detaches generation-bound callbacks; the
+replacement extension reconciles completion from the self-describing log and
+never invokes stale Pi APIs. The log contains full output plus a trailing
 `__BGRUN_EXIT__=N` marker), so exit codes survive pi restarting. Two small pieces
 exist beyond the spawn: a 30s timer that only re-checks jobs whose live child handle
 is gone (reconstructed from a restart, or adopted from another session), and a
@@ -74,12 +76,17 @@ agent calls bgrun(command: "make test-short", name: "unit-tests")
   → records job in-memory + appends a bgrun-job entry to the session
   → returns "started: <job-id>"
 
-child 'exit' event fires:
+child 'exit' event fires while the same extension generation is active:
   → extension records exit code, appends a done entry
   → pi.sendUserMessage(wake) when idle (triggers a turn)
      or pi.sendUserMessage(wake, { deliverAs: 'followUp' }) when busy
   → ctx.ui.notify(...)  — toast for the human
   → ctx.ui.setWidget("bgrun", ...)  — updates/clears the live status widget
+
+/reload or session shutdown happens first:
+  → old generation invalidates itself and detaches child listeners
+  → detached process continues writing its log and exit marker
+  → active replacement generation reconstructs and persists completion once
 ```
 
 The child writes the log directly via its own stdout fd (no pipe to pi), so the job
@@ -198,7 +205,9 @@ the dir is shared by every pi session working in that checkout — that sharing
 enables cross-session job lookup, session-restart reconstruction, and
 per-project cleanup. By default each session only *tracks its own jobs*: the
 widget and `bgstatus` listings show this session's running jobs, and finished
-jobs are hidden (ask for them explicitly with `bgstatus includeDone: true`).
+jobs are hidden (ask for them explicitly with `bgstatus includeDone: true`). The
+extension also emits `bgrun:status` with `{ running, tracked }`, allowing a
+custom footer to replace the widget by setting `showWidget: false`.
 Jobs started by other sessions can still be inspected by id, but they don't
 clutter your widget.
 
@@ -218,6 +227,7 @@ run locally (completed jobs visible, a scorecard on `bun test` runs).
 {
   "adoptForeignJobs": false,
   "showCompletedJobs": false,
+  "showWidget": true,
   "cleanupDays": 7,
   "maxLogBytes": 67108864,
   "globalAutoClean": true,
@@ -317,6 +327,7 @@ Environment variables (same knobs, handy for one-off overrides):
 | `PI_BGRUN_GLOBAL_DIR` | `~/.pi-bgrun/jobs` | **Deprecated.** Overrides the machine-global jobs base — the fallback used only when the cwd has no project root (see [deprecation](#deprecated-machine-global-jobs-dir)). A leading `~` or `~/` is expanded to the home dir; `~user` is not. |
 | `PI_BGRUN_FOREIGN_JOBS` | `false` | Adopt other sessions' running jobs into this session's widget and job list. Adopted jobs are polled so they leave the widget when they finish. |
 | `PI_BGRUN_SHOW_COMPLETED` | `false` | Include finished jobs in `bgstatus` listings by default. |
+| `PI_BGRUN_SHOW_WIDGET` | `true` | Render the built-in multiline widget. Set false when a footer consumes `bgrun:status`. |
 | `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |
 | `PI_BGRUN_MAX_LOG_BYTES` | `67108864` (64 MiB) | Byte ceiling for a job's log (stdout+stderr). `0` disables it (unlimited). See [Log size ceiling](#log-size-ceiling). |
 | `PI_BGRUN_GLOBAL_AUTO_CLEAN` | `true` | Set `0`/`false` to disable the automatic orphan sweep (see below). |

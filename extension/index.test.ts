@@ -120,6 +120,7 @@ type UsedExtensionAPI = Pick<
   | "registerEntryRenderer"
   | "sendUserMessage"
   | "appendEntry"
+  | "events"
 >;
 
 // Tools as the tests consume them: real metadata types from ToolDefinition, but
@@ -173,6 +174,7 @@ interface FakePiHandles {
   pi: ExtensionAPI;
   wakes: CapturedWake[];
   entries: CapturedEntry[];
+  jobStatuses: Array<{ running: number; tracked: number }>;
   tools: Map<string, FakeTool>;
   commands: Map<string, FakeCommand>;
   entryRenderers: Map<string, FakeRenderer>;
@@ -193,6 +195,7 @@ function makeFakePi(
   const entries: CapturedEntry[] = opts.priorEntries
     ? [...opts.priorEntries]
     : [];
+  const jobStatuses: Array<{ running: number; tracked: number }> = [];
   const tools = new Map<string, FakeTool>();
   const commands = new Map<string, FakeCommand>();
   const entryRenderers = new Map<string, FakeRenderer>();
@@ -210,6 +213,12 @@ function makeFakePi(
   // compile-time drift guard. `as ExtensionAPI` below is the unavoidable seam
   // (the fake is deliberately partial); the *shapes* here are the real ones.
   const used: UsedExtensionAPI = {
+    events: {
+      emit(name: string, data: unknown) {
+        if (name === "bgrun:status")
+          jobStatuses.push(data as { running: number; tracked: number });
+      },
+    } as ExtensionAPI["events"],
     sendUserMessage(content, options) {
       wakes.push({
         text: content as string,
@@ -256,6 +265,7 @@ function makeFakePi(
     pi,
     wakes,
     entries,
+    jobStatuses,
     tools,
     commands,
     entryRenderers,
@@ -334,6 +344,19 @@ function waitForWakes(
   });
 }
 
+async function waitForLogExit(logPath: string, timeoutMs = 4000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start <= timeoutMs) {
+    try {
+      if (/__BGRUN_EXIT__=-?\d+/.test(readFileSync(logPath, "utf8"))) return;
+    } catch {
+      // log may not exist yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for exit marker in ${logPath}`);
+}
+
 test("bgrun: exit marker survives commands with # and explicit exit codes", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;
@@ -409,6 +432,23 @@ test("bgrun: successful command writes log + exit marker and wakes with ✅", as
     const log = readFileSync(logPath, "utf8");
     assert.match(log, /hello world/);
     assert.match(log, /__BGRUN_EXIT__=0/);
+  });
+});
+
+test("bgrun: emits compact running-job status for footer integrations", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { jobStatuses, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    await bgrun.execute(
+      "footer-status",
+      { command: "sleep 0.1" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(jobStatuses.at(-1)?.running, 1);
+    await new Promise((resolve) => setTimeout(resolve, 175));
+    assert.equal(jobStatuses.at(-1)?.running, 0);
   });
 });
 
@@ -5270,6 +5310,41 @@ test("bgrun: type flows into the started result, entries, and resume reconstruct
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("session_shutdown: detached completion is reconciled by the active session without stale callbacks", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { entries, wakes, tools, ctx, fireSessionShutdown } = h;
+    const bgrun = tools.get("bgrun")!;
+    const result = await bgrun.execute(
+      "reload-race",
+      { command: "sleep 0.15; echo after-reload", wake: "always" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (result.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    const logPath = join(dir, `${id}.log`);
+
+    await fireSessionShutdown();
+    await waitForLogExit(logPath);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    assert.equal(wakes.length, 0, "disposed generation did not wake the agent");
+    assert.equal(
+      entries.filter((entry) => entry.data?.id === id).length,
+      1,
+      "disposed generation persisted only the running entry",
+    );
+
+    const replacement = makeFakePi({ priorEntries: entries });
+    await loadExtension(replacement.pi);
+    await replacement.fireSessionStart();
+    const records = replacement.entries.filter((entry) => entry.data?.id === id);
+    assert.equal(records.length, 2, "active generation reconciled completion once");
+    assert.equal(records[1].data?.state, "done");
+    assert.equal(records[1].data?.exitCode, 0);
+  });
 });
 
 test("session_shutdown: sweeps this session's old logs and does not throw", async () => {
