@@ -1382,6 +1382,8 @@ interface JobRecord {
   exitCode?: number;
   donePersisted?: boolean; // done entry already appended to the transcript
   child?: ReturnType<typeof spawn>; // absent for adopted (fs-discovered) jobs
+  exitListener?: (code: number | null, signal: NodeJS.Signals | null) => void;
+  errorListener?: (error: Error) => void;
   ctx: ExtensionContext; // captured at tool-call time for isIdle() in the exit handler
   adopted?: boolean; // true when discovered from the jobs dir (another session's job)
 }
@@ -1414,6 +1416,9 @@ interface BgStatusDetails {
 
 export default function (pi: ExtensionAPI) {
   const jobs = new Map<string, JobRecord>();
+  // Extension APIs and contexts are generation-bound. Detached processes and
+  // their logs outlive /reload; callbacks registered by this generation do not.
+  let disposed = false;
   // bgtail's delta-tailing bookmarks: one entry per job id ever tailed, holding
   // the high-water mark of what the caller has already had the opportunity to
   // see. Declared here, ahead of the cleanup helpers, so removing a log can
@@ -1560,8 +1565,10 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     opts: { persistRevalidate?: boolean } = {},
   ): void {
-    if (!ctx.hasUI) return;
+    // Reconciliation is lifecycle state, not a UI side effect. Headless/RPC
+    // sessions must persist terminal evidence too.
     revalidateStaleJobs({ persist: opts.persistRevalidate ?? true });
+    if (!ctx.hasUI) return;
     const running: JobRecord[] = [];
     for (const rec of jobs.values()) {
       if (rec.exitCode === undefined) running.push(rec);
@@ -1848,6 +1855,7 @@ export default function (pi: ExtensionAPI) {
   // accurate view, but asking for status must not append transcript cards.
   // The stale poller / session_start re-run with persistence and reconcile.
   function persistDoneEntry(rec: JobRecord, exit: number): void {
+    if (disposed) return;
     rec.donePersisted = true;
     pi.appendEntry<BgrunJobEntryData>("bgrun-job", {
       id: rec.id,
@@ -1907,6 +1915,7 @@ export default function (pi: ExtensionAPI) {
   function ensureStalePoller(ctx: ExtensionContext): void {
     if (stalePoller !== undefined || !hasUnsupervisedRunning()) return;
     stalePoller = setInterval(() => {
+      if (disposed) return;
       revalidateStaleJobs();
       updateWidget(ctx);
       if (!hasUnsupervisedRunning()) stopStalePoller();
@@ -1980,6 +1989,11 @@ export default function (pi: ExtensionAPI) {
   // ── session_start: reconstruct Map from entries + auto-cleanup ────────────
 
   pi.on("session_start", async (_event, ctx) => {
+    disposed = false;
+    // A single extension instance can observe a session switch. Never carry
+    // another session's in-memory ownership into the new session.
+    jobs.clear();
+    tailBookmarks.clear();
     // Reconstruct the in-memory Map from this session's bgrun-job entries.
     // Only the current session's entries are visible; jobs from other sessions
     // remain discoverable via the filesystem scan in bgstatus.
@@ -2066,7 +2080,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    // Invalidate before any cleanup. A child may complete while shutdown is in
+    // progress, but this generation must never call Pi APIs afterward.
+    disposed = true;
     stopStalePoller();
+    for (const rec of jobs.values()) {
+      if (!rec.child) continue;
+      if (rec.exitListener) rec.child.removeListener("exit", rec.exitListener);
+      if (rec.errorListener) rec.child.removeListener("error", rec.errorListener);
+      // Avoid an unhandled late spawn error after detaching our generation-
+      // bound listener. Completion itself remains authoritative in the log.
+      rec.child.on("error", () => {});
+      delete rec.child;
+      delete rec.exitListener;
+      delete rec.errorListener;
+    }
     // Sweep old logs on the way out. Throttled via the .last-clean marker so
     // restart-heavy workflows don't sweep more than once per cleanupDays.
     try {
@@ -2118,6 +2146,9 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (disposed) {
+        throw new Error("bgrun: extension session is shutting down; retry after reload");
+      }
       const { command, name: rawName, type: rawType } = params;
       if (!command || !command.trim()) {
         throw new Error("bgrun: command is required");
@@ -2237,6 +2268,7 @@ export default function (pi: ExtensionAPI) {
         updateWidget(ctx);
 
         const finishSpawnFailure = (err: Error) => {
+          if (disposed) return;
           const rec = jobs.get(id);
           if (!rec || rec.exitCode !== undefined) return;
           rec.exitedAt = Date.now();
@@ -2289,7 +2321,11 @@ export default function (pi: ExtensionAPI) {
         };
 
         // ── exit handler: record exit, persist done entry, wake, notify, widget ─
-        child.on("exit", async (code, signal) => {
+        const exitListener = async (
+          code: number | null,
+          signal: NodeJS.Signals | null,
+        ) => {
+          if (disposed) return;
           const rec = jobs.get(id);
           if (!rec) return;
           // A spawn that emitted 'error' first already finalized this job; a
@@ -2407,6 +2443,10 @@ export default function (pi: ExtensionAPI) {
             );
           }
 
+          // A digest awaits an external child. Shutdown/reload may happen in
+          // that gap; the old generation must make no further Pi API calls.
+          if (disposed) return;
+
           // Wake the agent.
           const namePrefix = rec.name ? `"${rec.name}" ` : "";
           let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
@@ -2445,12 +2485,17 @@ export default function (pi: ExtensionAPI) {
 
           // Update/clear the widget.
           updateWidget(rec.ctx);
-        });
+        };
 
-        child.on("error", (err) => {
+        const errorListener = (err: Error) => {
+          if (disposed) return;
           console.error(`[pi-bgrun] spawn error for job ${id}:`, err.message);
           finishSpawnFailure(err);
-        });
+        };
+        record.exitListener = exitListener;
+        record.errorListener = errorListener;
+        child.on("exit", exitListener);
+        child.on("error", errorListener);
 
         const startedLines = [`started: ${id}`];
         if (name) startedLines.push(`  name: ${name}`);

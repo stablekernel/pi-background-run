@@ -8,9 +8,11 @@ pi-background-run **wakes the live agent session** so it proactively reads a
 condensed digest of the results and continues — no polling, no human intervention.
 
 Built as a [pi](https://github.com/earendil-works/pi-coding-agent) extension. No
-shell runner and no external daemon — the extension spawns the job in-process,
-detects completion via the child `exit` event, and calls `pi.sendUserMessage` to wake
-the agent. The log file is self-describing (full output + a trailing
+shell runner and no external daemon — the extension spawns the job in-process
+and uses the child `exit` event while that extension generation remains active.
+On `/reload` or session shutdown it detaches generation-bound callbacks; the
+replacement extension reconciles completion from the self-describing log and
+never invokes stale Pi APIs. The log contains full output plus a trailing
 `__BGRUN_EXIT__=N` marker), so exit codes survive pi restarting. Two small pieces
 exist beyond the spawn: a 30s timer that only re-checks jobs whose live child handle
 is gone (reconstructed from a restart, or adopted from another session), and a
@@ -74,12 +76,17 @@ agent calls bgrun(command: "make test-short", name: "unit-tests")
   → records job in-memory + appends a bgrun-job entry to the session
   → returns "started: <job-id>"
 
-child 'exit' event fires:
+child 'exit' event fires while the same extension generation is active:
   → extension records exit code, appends a done entry
   → pi.sendUserMessage(wake) when idle (triggers a turn)
      or pi.sendUserMessage(wake, { deliverAs: 'followUp' }) when busy
   → ctx.ui.notify(...)  — toast for the human
   → ctx.ui.setWidget("bgrun", ...)  — updates/clears the live status widget
+
+/reload or session shutdown happens first:
+  → old generation invalidates itself and detaches child listeners
+  → detached process continues writing its log and exit marker
+  → active replacement generation reconstructs and persists completion once
 ```
 
 The child writes the log directly via its own stdout fd (no pipe to pi), so the job
