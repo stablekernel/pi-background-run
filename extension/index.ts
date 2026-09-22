@@ -1094,8 +1094,8 @@ export function cappedWrapper(maxBytes: number): string {
 // machine-global `~/.pi-bgrun/jobs`. An explicit RELATIVE `jobsDir` (from any
 // config layer, or PI_BGRUN_DIR) resolves the same way; an absolute path is
 // used as-is (migration-safe). Project-local logs stay inside the workspace
-// sandbox so analysis tools confined to the project root (e.g. context-mode's
-// ctx_execute_file/ctx_index) can process whole logs without flooding context.
+// sandbox, so analysis tooling confined to the project root can process whole
+// logs without flooding context.
 
 function isProjectRootLike(dir: string): boolean {
   // Cheap heuristic: a directory holding .git or pi's config dir is a project.
@@ -2623,7 +2623,7 @@ export default function (pi: ExtensionAPI) {
     "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
     "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard — bgrun's `started:` line names them when you omit it.",
     "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
-    "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search or ctx_execute_file on the log path for whole-log analysis.",
+    "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search, or read the log's path directly for whole-log analysis.",
   ];
 
   pi.registerTool({
@@ -3218,7 +3218,12 @@ export default function (pi: ExtensionAPI) {
       return l;
     });
     ANSI_RE.lastIndex = 0;
-    // collapse runs of 3+ identical lines (spinner frames, retry spam)
+    // Collapse consecutive identical lines (spinner frames, retry spam) into
+    // one, but only for runs of 3+: that is when the text carries `[xN]`, so the
+    // reader can tell "one line" from "many". A pair is emitted verbatim, twice.
+    // Folding a pair silently drops a line with nothing on screen to say so —
+    // a fidelity bug, not a conservation win, since the count is what makes a
+    // fold legible and a folded pair carries none.
     const collapsed: { text: string; count: number }[] = [];
     let runs = 0;
     for (const l of clean) {
@@ -3232,20 +3237,33 @@ export default function (pi: ExtensionAPI) {
     }
     const out: string[] = [];
     let total = 0;
+    let capped = false;
     for (const c of collapsed) {
-      let line = c.count >= 3 ? `${c.text}  [x${c.count}]` : c.text;
-      if (line.length > LINE_CAP) {
-        line = line.slice(0, LINE_CAP) + ` …[+${line.length - LINE_CAP} chars]`;
-        cappedLines++;
+      // A run of 3+ collapses to one line carrying its count; anything shorter is
+      // emitted once per occurrence, so no line is lost without a marker.
+      const emissions =
+        c.count >= 3 ? [`${c.text}  [x${c.count}]`] : Array.from({ length: c.count }, () => c.text);
+      for (let line of emissions) {
+        if (line.length > LINE_CAP) {
+          line = line.slice(0, LINE_CAP) + ` …[+${line.length - LINE_CAP} chars]`;
+          cappedLines++;
+        }
+        // Budget per emission, not per run: a folded run is one line, an
+        // unfolded one is several, and the cap must count what is actually
+        // pushed or a pair-heavy log overruns it.
+        total += line.length + 1;
+        if (total > TOTAL_CAP) {
+          capped = true;
+          break;
+        }
+        out.push(line);
       }
-      total += line.length + 1;
-      if (total > TOTAL_CAP) {
-        notes.push(
-          `output capped at ${TOTAL_CAP} chars — ${lines.length} raw lines total; raise \`lines\`, use \`raw: true\`, or run ctx_execute_file on the log for whole-log analysis`,
-        );
-        break;
-      }
-      out.push(line);
+      if (capped) break;
+    }
+    if (capped) {
+      notes.push(
+        `output capped at ${TOTAL_CAP} chars — ${lines.length} raw lines total; raise \`lines\`, use \`raw: true\`, or read the log path directly for whole-log analysis`,
+      );
     }
     if (stripped > 0)
       notes.push(
@@ -3438,7 +3456,7 @@ export default function (pi: ExtensionAPI) {
     // (a max equal to the cap left its first bytes permanently unreadable).
     const windowNote =
       size > readWindow
-        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(readWindowMax())}) or use ctx_execute_file on the log path)`
+        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(readWindowMax())}) or read the log path directly)`
         : "";
     // Content lines only: wrapper bookkeeping (exit marker, truncation notice)
     // and blanks are filtered BEFORE the window is sliced, so "last N lines"
@@ -3565,7 +3583,7 @@ export default function (pi: ExtensionAPI) {
     name: "bgtail",
     label: "Tail Background Log",
     description:
-      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. A shrunken, replaced, or differently-windowed log resets to a full tail. Reads only the log's last 2 MiB by default (`bytes` widens it, max 64 MiB) and says so when the log is bigger. For pattern search use bggrep; for whole-log analysis, ctx_execute_file on the log path.",
+      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. A shrunken, replaced, or differently-windowed log resets to a full tail. Reads only the log's last 2 MiB by default (`bytes` widens it, max 64 MiB) and says so when the log is bigger. For pattern search use bggrep; for whole-log analysis, read the log path directly (it is printed by bgstatus and in these notes).",
     promptSnippet: "Read the last N lines of a bgrun job's log",
     parameters: Type.Object({
       id: Type.String({
@@ -3600,8 +3618,8 @@ export default function (pi: ExtensionAPI) {
   //
   // bggrep runs inside the extension, so it resolves the job id to the
   // configured jobs dir itself (no path to reconstruct) and needs no shell
-  // quoting for the regex; ctx_execute_file can read the same file, but you
-  // must hand it the absolute path. Matches are line-numbered (grep -n style),
+  // quoting for the regex; a plain read of the same path is the whole-log
+  // escape hatch. Matches are line-numbered (grep -n style),
   // optionally with context lines, capped at MAX_GREP_MATCHES, and run
   // through the same condenser as bgtail so a search can never flood context.
 
@@ -3663,7 +3681,7 @@ export default function (pi: ExtensionAPI) {
     // it can cover a capped log.
     const windowNote =
       size > readWindow
-        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(readWindowMax())}) or use ctx_execute_file on the log path)`
+        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(readWindowMax())}) or read the log path directly)`
         : "";
     // Bound the LINE count before splitting: a window of very short lines is
     // millions of lines in a few MiB, and materializing them costs ~100 bytes
@@ -3796,7 +3814,7 @@ export default function (pi: ExtensionAPI) {
     name: "bggrep",
     label: "Grep Background Log",
     description: toolDescription(
-      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; ctx_execute_file can read the same file, but needs the absolute path. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; reading that path directly is the whole-log escape hatch. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
       BGGREP_GUIDELINES,
     ),
     promptSnippet: "Search a bgrun job's log for a pattern",

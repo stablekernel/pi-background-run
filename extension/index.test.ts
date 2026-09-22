@@ -612,6 +612,46 @@ test("bgtail: raw=true skips condensing", async () => {
   });
 });
 
+test("bgtail: a repeated pair survives verbatim, runs of 3+ carry their count", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+
+    // dup,dup (a pair) / spinner x3 (a run) / done — through the real surface:
+    // spawn, wake, then read.
+    const res = await bgrun.execute(
+      "call-pair",
+      { command: "printf 'dup\\ndup\\nspinner\\nspinner\\nspinner\\ndone\\n'" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    const tail = await bgtail.execute(
+      "call-pair",
+      { id, lines: 40 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text = tail.content[0].text as string;
+    const body = text.split("\n\n(")[0].trimEnd();
+
+    // The pair is emitted twice — a folded pair would drop a line with nothing
+    // on screen to say so. The triple folds, carrying its count.
+    assert.equal(body, "dup\ndup\nspinner  [x3]\ndone");
+    assert.match(text, /\(1 repeated-line run collapsed\)/);
+    assert.equal(
+      (text.match(/dup/g) ?? []).length,
+      2,
+      "both occurrences of the pair reach the reader",
+    );
+  });
+});
+
 test("bgtail: total cap kicks in on large output with guidance note", async () => {
   await withJobsDir(async (_dir, h) => {
     const { wakes, tools, ctx } = h;

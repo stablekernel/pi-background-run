@@ -104,8 +104,10 @@ Which to use:
    - `done exit=<non-zero>` → failure; analyze the log.
    - `running` but the job should have finished long ago → likely crashed (the
      process died without writing the exit marker). Analyze the log with
-     `bggrep` (any jobs dir, last 2 MB) or `ctx_execute_file` on the absolute path
-     (whole file — needed for logs bigger than 2 MB).
+     `bggrep` (any jobs dir, last 2 MB) or a whole-file read of the absolute
+     path (needed for logs bigger than 2 MB) — with a sandboxed whole-log reader
+     if your environment provides one (context-mode's `ctx_execute_file`), or
+     your own file/shell tooling otherwise.
 
 ### Reading results without flooding context
 
@@ -117,14 +119,15 @@ usually answers "what failed" without any follow-up read. `bgtail` stays the
 positional-peek tool for everything else.
 
 - **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing) — polling a running job is nearly free.
-- **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Resolves the job id to the configured jobs dir itself — no path to reconstruct. (`ctx_execute_file` can read the same file given its absolute path.) Searches the last 2 MiB by default; `bytes: 67108864` widens it to the whole capped log — more scanning costs latency and memory, **not context**, since the returned matches stay capped. Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
-- **Whole-log failure analysis:** `ctx_execute_file` on the log's **absolute
-  path**. Unlike `bgtail`/`bggrep` (bounded to the last 2 MB), this reads the
-  whole file — the only way to cover a log bigger than 2 MB, e.g. one that hit
-  the size ceiling. Copy the `log:` path from `bgrun`'s `started:` line and
-  expand `~` yourself (it is not expanded for you; the tool takes an absolute
-  path or one relative to the project root). Otherwise it is an ordinary tool
-  call: your normal Read-deny rules still apply.
+- **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Resolves the job id to the configured jobs dir itself — no path to reconstruct. (A sandboxed whole-log reader, context-mode's `ctx_execute_file`, can read the same file given its absolute path — see below.) Searches the last 2 MiB by default; `bytes: 67108864` widens it to the whole capped log — more scanning costs latency and memory, **not context**, since the returned matches stay capped. Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
+- **Whole-log failure analysis:** read the log's **absolute path** directly
+  (with a sandboxed whole-log reader if your environment has one — context-mode's
+  `ctx_execute_file` — otherwise your own file/shell tooling). Unlike
+  `bgtail`/`bggrep` (bounded to the last 2 MB), this covers the whole file — the
+  only way to see a log bigger than 2 MB, e.g. one that hit the size ceiling.
+  Copy the `log:` path from `bgrun`'s `started:` line and expand `~` yourself (it
+  is not expanded for you; an absolute path or one relative to the project root).
+  Otherwise it is an ordinary read: your normal Read-deny rules still apply.
 
   ```javascript
   ctx_execute_file(
@@ -155,14 +158,17 @@ positional-peek tool for everything else.
 Plain `grep` via bash is fine only for a one-off search you know is tiny.
 
 **Never `cat`, `Read`, `bash cat`, or `bash grep` a full bgrun log.** Always
-`bgtail`, `bggrep`, or (for project-local logs) `ctx_execute_file`.
+`bgtail`, `bggrep`, or (for project-local logs) a whole-file read of the path.
 
-**Order of preference, cheapest first: `bgtail` → `bggrep` → `ctx_execute_file`.**
-Reach for the sandbox only when you need something a regex over lines cannot
-express — totals, dedup, grouping, joining the log against another file.
+**Order of preference, cheapest first: `bgtail` → `bggrep` → a whole-log read.**
+Reach for the whole-log read only when you need something a regex over lines
+cannot express — totals, dedup, grouping, joining the log against another file.
+A sandboxed reader (context-mode's `ctx_execute_file`) is the cheapest way to do
+it where one exists, because the file's bytes never enter context — see below.
 
-`ctx_execute_file` is not itself a context dump: the file's bytes never enter
-context, only your script's **stdout** does ("raw content never leaves"). So the
+A sandboxed whole-log reader is not itself a context dump: the file's bytes
+never enter context, only your script's **stdout** does ("raw content never
+leaves"). For `ctx_execute_file` specifically: the
 cost is exactly what you print — which makes `console.log(FILE_CONTENT)` (or
 `print(open(path).read())`, or a big unbounded slice) the one way a whole-log
 analysis turns into a context dump, and a capped-by-default 64 MiB log makes
@@ -213,8 +219,8 @@ that expensive rather than merely rude. Aggregate, then cap what you print:
   model (`~/.pi-bgrun/jobs` is a deprecated fallback for a cwd with no project
   root; an absolute `PI_BGRUN_DIR`/`jobsDir` still works but is legacy). Project-local dirs are
   auto-ignored via `.git/info/exclude`, which keeps `git status` clean; the
-  logs stay reachable for project-sandboxed analysis tools like
-  `ctx_execute_file` because they live inside the project.
+  logs stay reachable for project-sandboxed analysis tooling (context-mode's
+  `ctx_execute_file`, where installed) because they live inside the project.
 - Cleanup: `bgclean` removes only THIS session's old logs; `bgclean all`
   sweeps every session's. Auto-sweeps at session start/shutdown are
   session-scoped plus an orphan pass (default on — removes finished week-old

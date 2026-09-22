@@ -90,7 +90,9 @@ advisory; a preset entry with no `type` still applies to every job.
 2. **Sample the formats across job types.** Group the logs by job type using
    each job's `name` and command line (from `bgstatus`); most projects have at
    least a test job and a build job. Pick 2-3 logs per type — at least one
-   green and one red run each — and inspect them with `ctx_execute_file`
+   green and one red run each — and inspect them with a whole-log read of the
+   path (a sandboxed reader such as context-mode's `ctx_execute_file` if your
+   environment has one)
    (context-mode sandbox, so only your printed summary enters context).
    Identify the runner / output format for each type, and name the type with a
    short token (`test`, `build`, `lint`, `e2e`).
