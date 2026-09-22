@@ -1,7 +1,7 @@
 {
   "name": "pi-background-run",
   "version": "0.6.0",
-  "description": "Run long shell commands detached in the background for pi; get woken on completion. Output lands in a file; context stays clean.",
+  "description": "Run genuinely asynchronous shell commands detached in the background for pi, with explicit completion wake policies and bounded logs.",
   "type": "module",
   "engines": {
     "node": ">=20"

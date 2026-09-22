@@ -1,16 +1,17 @@
 # pi-background-run
 
-Run long shell commands (test suites, builds, linters) as detached background jobs
-so your pi agent session stays unblocked and its context stays clean. Output lands
-on disk — the full log plus a trailing exit marker — so nothing large ever enters
-the conversation; the command returns immediately. When the job finishes,
-pi-background-run **wakes the live agent session** so it proactively reads a
-condensed digest of the results and continues — no polling, no human intervention.
+Run genuinely asynchronous shell commands as detached background jobs so your pi
+agent session stays unblocked and its context stays clean. Output lands on disk —
+the full log plus a trailing exit marker — so nothing large enters the conversation;
+the command returns immediately. Each job chooses whether completion wakes the
+live agent always, only on failure, or never. Human toast and widget updates remain
+enabled for every policy.
 
 Built as a [pi](https://github.com/earendil-works/pi-coding-agent) extension. No
 shell runner and no external daemon — the extension spawns the job in-process,
-detects completion via the child `exit` event, and calls `pi.sendUserMessage` to wake
-the agent. The log file is self-describing (full output + a trailing
+detects completion via the child `exit` event, and conditionally calls
+`pi.sendUserMessage` when the job's wake policy requests a model turn. The log
+file is self-describing (full output + a trailing
 `__BGRUN_EXIT__=N` marker), so exit codes survive pi restarting. Two small pieces
 exist beyond the spawn: a 30s timer that only re-checks jobs whose live child handle
 is gone (reconstructed from a restart, or adopted from another session), and a
@@ -33,11 +34,31 @@ Restart pi after install so the extension loads.
 
 | Tool | Purpose |
 | ------ | --------- |
-| `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
+| `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. `wake` selects `never`, `failure`, or `always` model-turn delivery. Returns `started: <job-id>` immediately. |
 | `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
 | `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
 | `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days); `days` must be a positive number (`days: 0` is rejected rather than purging everything). Never removes a running job's log. |
+
+## Completion wake policy
+
+Every job accepts `wake: "never" | "failure" | "always"`:
+
+- `never` keeps model context quiet; completion still updates the toast/widget and persists status/logs.
+- `failure` wakes only for a non-zero exit or spawn failure.
+- `always` preserves the original behavior and wakes on every completion.
+
+Omitting `wake` uses `defaultWake` from layered configuration (`PI_BGRUN_WAKE`
+overrides it). The package default remains `always` for backward compatibility;
+users who want opt-in model turns can set `"defaultWake": "never"`. Per-job
+policy is persisted in transcript entries and displayed by `bgstatus` after a
+session reload.
+
+Use `always` for deployment/eval monitors whose completion requires immediate
+follow-up, `failure` for long checks whose successful completion needs no model
+turn, and `never` for independent work. Foreground execution remains the default
+for routine focused commands; do not choose background execution from command
+category alone.
 
 ## Slash commands
 
@@ -64,7 +85,7 @@ wake messages) is the agent's workflow.
 ## How it works
 
 ```text
-agent calls bgrun(command: "make test-short", name: "unit-tests")
+agent calls bgrun(command: "gh run watch …", name: "deploy-monitor", wake: "always")
   → extension resolves log path: <jobsDir>/<slug>-<ts>-<pid>.log (default <project>/.pi-bgrun/jobs/ in a repo, else ~/.pi-bgrun/jobs/)
   → spawn('sh', ['-c', <wrapper>, 'bgrun', '<cmd>'],
           { stdio: ['ignore', logFd, logFd], detached: true }).unref()
@@ -76,9 +97,9 @@ agent calls bgrun(command: "make test-short", name: "unit-tests")
 
 child 'exit' event fires:
   → extension records exit code, appends a done entry
-  → pi.sendUserMessage(wake) when idle (triggers a turn)
-     or pi.sendUserMessage(wake, { deliverAs: 'followUp' }) when busy
-  → ctx.ui.notify(...)  — toast for the human
+  → when the per-job wake policy matches the outcome, pi.sendUserMessage(wake)
+     triggers a turn when idle or queues a follow-up when busy
+  → ctx.ui.notify(...)  — toast for the human, regardless of wake policy
   → ctx.ui.setWidget("bgrun", ...)  — updates/clears the live status widget
 ```
 
@@ -218,6 +239,7 @@ run locally (completed jobs visible, a scorecard on `bun test` runs).
 {
   "adoptForeignJobs": false,
   "showCompletedJobs": false,
+  "defaultWake": "always",
   "cleanupDays": 7,
   "maxLogBytes": 67108864,
   "globalAutoClean": true,
@@ -317,6 +339,7 @@ Environment variables (same knobs, handy for one-off overrides):
 | `PI_BGRUN_GLOBAL_DIR` | `~/.pi-bgrun/jobs` | **Deprecated.** Overrides the machine-global jobs base — the fallback used only when the cwd has no project root (see [deprecation](#deprecated-machine-global-jobs-dir)). A leading `~` or `~/` is expanded to the home dir; `~user` is not. |
 | `PI_BGRUN_FOREIGN_JOBS` | `false` | Adopt other sessions' running jobs into this session's widget and job list. Adopted jobs are polled so they leave the widget when they finish. |
 | `PI_BGRUN_SHOW_COMPLETED` | `false` | Include finished jobs in `bgstatus` listings by default. |
+| `PI_BGRUN_WAKE` | `always` | Default model-turn completion policy when a job omits `wake`: `never`, `failure`, or `always`. Per-job `wake` takes precedence. Toast/widget updates are unaffected. |
 | `PI_BGRUN_CLEANUP_DAYS` | `7` | Log retention for cleanup sweeps and the `bgclean` default. |
 | `PI_BGRUN_MAX_LOG_BYTES` | `67108864` (64 MiB) | Byte ceiling for a job's log (stdout+stderr). `0` disables it (unlimited). See [Log size ceiling](#log-size-ceiling). |
 | `PI_BGRUN_GLOBAL_AUTO_CLEAN` | `true` | Set `0`/`false` to disable the automatic orphan sweep (see below). |
@@ -325,10 +348,11 @@ Environment variables (same knobs, handy for one-off overrides):
 
 ### Digest scorecard (opt-in)
 
-Wake messages always lead with universal facts — exit code, duration, and the
-command's own log line count (the internal exit marker is excluded). A project
-can additionally opt into a **digest scorecard**: a one-line pass/fail summary
-extracted from the log and appended to the wake.
+When a job's wake policy requests a model turn, its message leads with universal
+facts — exit code, duration, and the command's own log line count (the internal
+exit marker is excluded). A project can additionally opt into a **digest
+scorecard**: a one-line pass/fail summary extracted from the log and appended
+to that wake.
 
 #### Job identity: name, type, command
 

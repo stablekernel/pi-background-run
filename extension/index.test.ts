@@ -311,6 +311,27 @@ async function withJobsDir<T>(
 
 // Default below Bun's 5s test timeout so a stuck wait rejects with a clear
 // message instead of racing the harness kill (a flake-masking failure mode).
+function waitForLogExit(
+  logPath: string,
+  timeoutMs = 4000,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const tick = () => {
+      try {
+        if (readFileSync(logPath, "utf8").includes("__BGRUN_EXIT__="))
+          return resolve();
+      } catch {
+        // The child may not have created/renamed the final log yet.
+      }
+      if (Date.now() - start > timeoutMs)
+        return reject(new Error(`timed out waiting for ${logPath} to finish`));
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+}
+
 function waitForWakes(
   wakes: CapturedWake[],
   count: number,
@@ -409,6 +430,60 @@ test("bgrun: successful command writes log + exit marker and wakes with ✅", as
     const log = readFileSync(logPath, "utf8");
     assert.match(log, /hello world/);
     assert.match(log, /__BGRUN_EXIT__=0/);
+  });
+});
+
+test("bgrun: wake never keeps model context quiet while persisting completion", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { wakes, entries, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const res = await bgrun.execute(
+      "call-never",
+      { command: "echo quiet-success", wake: "never" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text = res.content[0].text as string;
+    const id = text.match(/^started: ([^\n]+)/)![1];
+    assert.match(text, /wake: never/);
+    assert.match(text, /without waking the agent/);
+    await waitForLogExit(join(dir, `${id}.log`));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(wakes.length, 0);
+    const records = entries.filter((entry) => entry.data?.id === id);
+    assert.equal(records.length, 2, "running + done entries persisted");
+    assert.ok(records.every((entry) => entry.data?.wake === "never"));
+  });
+});
+
+test("bgrun: wake failure ignores success and wakes on non-zero exit", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const success = await bgrun.execute(
+      "call-failure-success",
+      { command: "echo pass", wake: "failure" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const successId = (success.content[0].text as string).match(
+      /^started: ([^\n]+)/,
+    )![1];
+    await waitForLogExit(join(dir, `${successId}.log`));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(wakes.length, 0);
+
+    await bgrun.execute(
+      "call-failure-error",
+      { command: "echo failed; exit 9", wake: "failure" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    assert.match(wakes[0].text, /exit 9/);
   });
 });
 
@@ -5215,7 +5290,7 @@ test("wake digest: invalid type entry dropped, other entries still work", async 
   }
 });
 
-test("bgrun: type flows into the started result, entries, and resume reconstruction", async () => {
+test("bgrun: type and wake policy survive entry persistence and reconstruction", async () => {
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
   try {
@@ -5224,7 +5299,12 @@ test("bgrun: type flows into the started result, entries, and resume reconstruct
     const bgrun = tools.get("bgrun")!;
     const res = await bgrun.execute(
       "call-ty1",
-      { command: "echo typed", name: "unit-tests", type: "Test" },
+      {
+        command: "echo typed; exit 1",
+        name: "unit-tests",
+        type: "Test",
+        wake: "failure",
+      },
       undefined,
       undefined,
       ctx,
@@ -5235,12 +5315,15 @@ test("bgrun: type flows into the started result, entries, and resume reconstruct
     assert.match(started, /^ {2}name: unit-tests$/m);
     // Types are lowercase-normalized so selection is an exact compare.
     assert.match(started, /^ {2}type: test$/m);
+    assert.match(started, /^ {2}wake: failure$/m);
     assert.equal((res.details as any).type, "test");
+    assert.equal((res.details as any).wake, "failure");
     await waitForWakes(wakes, 1);
 
     // The persisted done entry carries the type.
     const done = entries.filter((e) => e.customType === "bgrun-job").at(-1);
     assert.equal(done?.data?.type, "test");
+    assert.equal(done?.data?.wake, "failure");
 
     // Resume: a fresh instance reconstructs the in-memory map from entries.
     const {
@@ -5266,6 +5349,8 @@ test("bgrun: type flows into the started result, entries, and resume reconstruct
       "reconstructed record carries the type",
     );
     assert.equal((status.details as any).type, "test");
+    assert.match(text, /^ {2}wake: failure$/m);
+    assert.equal((status.details as any).wake, "failure");
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
@@ -5668,10 +5753,15 @@ test("resolveConfig: env vars override config files", async () => {
   const userCfg = join(userDir, "pi-bgrun.json");
   const prevDir = process.env.PI_BGRUN_DIR;
   const prevDays = process.env.PI_BGRUN_CLEANUP_DAYS;
+  const prevWake = process.env.PI_BGRUN_WAKE;
   delete process.env.PI_BGRUN_DIR;
   try {
-    writeFileSync(userCfg, JSON.stringify({ cleanupDays: 11 }));
+    writeFileSync(
+      userCfg,
+      JSON.stringify({ cleanupDays: 11, defaultWake: "failure" }),
+    );
     process.env.PI_BGRUN_CLEANUP_DAYS = "3";
+    process.env.PI_BGRUN_WAKE = "never";
 
     const cfg = mod.resolveConfig({
       cwd: proj,
@@ -5679,10 +5769,13 @@ test("resolveConfig: env vars override config files", async () => {
       userConfigPath: userCfg,
     });
     assert.equal(cfg.cleanupDays, 3, "env beats both config files");
+    assert.equal(cfg.defaultWake, "never", "wake env beats config file");
   } finally {
     if (prevDir !== undefined) process.env.PI_BGRUN_DIR = prevDir;
     if (prevDays === undefined) delete process.env.PI_BGRUN_CLEANUP_DAYS;
     else process.env.PI_BGRUN_CLEANUP_DAYS = prevDays;
+    if (prevWake === undefined) delete process.env.PI_BGRUN_WAKE;
+    else process.env.PI_BGRUN_WAKE = prevWake;
     rmSync(proj, { recursive: true, force: true });
     rmSync(userDir, { recursive: true, force: true });
   }
