@@ -659,6 +659,9 @@ interface BgrunConfig {
   // Include finished jobs in bgstatus listings by default. Default false —
   // completed jobs are noise; ask for them explicitly (bgstatus includeDone).
   showCompletedJobs: boolean;
+  // Render the built-in multiline status widget. Integrations can disable it
+  // and consume the `bgrun:status` event in a compact footer instead.
+  showWidget: boolean;
   // Log retention for cleanup (auto-sweeps and the bgclean default).
   cleanupDays: number;
   // Byte ceiling for a job's log (stdout+stderr). A runaway job (`yes`, a spew
@@ -693,6 +696,7 @@ interface BgrunConfigFile {
   jobsDir?: unknown;
   adoptForeignJobs?: unknown;
   showCompletedJobs?: unknown;
+  showWidget?: unknown;
   cleanupDays?: unknown;
   maxLogBytes?: unknown;
   globalAutoClean?: unknown;
@@ -1249,6 +1253,8 @@ export function resolveConfig(ctx?: {
     typeof merged.showCompletedJobs === "boolean"
       ? merged.showCompletedJobs
       : undefined;
+  const widgetFile =
+    typeof merged.showWidget === "boolean" ? merged.showWidget : undefined;
   const globalCleanFile =
     typeof merged.globalAutoClean === "boolean"
       ? merged.globalAutoClean
@@ -1324,6 +1330,8 @@ export function resolveConfig(ctx?: {
       parseBoolEnv(process.env.PI_BGRUN_SHOW_COMPLETED) ??
       completedFile ??
       false,
+    showWidget:
+      parseBoolEnv(process.env.PI_BGRUN_SHOW_WIDGET) ?? widgetFile ?? true,
     cleanupDays: daysEnv ?? daysFile ?? DEFAULT_CLEANUP_DAYS,
     maxLogBytes: maxBytesEnv ?? maxBytesFile ?? DEFAULT_MAX_LOG_BYTES,
     globalAutoClean:
@@ -1568,12 +1576,16 @@ export default function (pi: ExtensionAPI) {
     // Reconciliation is lifecycle state, not a UI side effect. Headless/RPC
     // sessions must persist terminal evidence too.
     revalidateStaleJobs({ persist: opts.persistRevalidate ?? true });
-    if (!ctx.hasUI) return;
     const running: JobRecord[] = [];
     for (const rec of jobs.values()) {
       if (rec.exitCode === undefined) running.push(rec);
     }
-    if (running.length === 0) {
+    pi.events.emit("bgrun:status", {
+      running: running.length,
+      tracked: jobs.size,
+    });
+    if (!ctx.hasUI) return;
+    if (!resolveConfig(ctx).showWidget || running.length === 0) {
       ctx.ui.setWidget("bgrun", undefined);
       return;
     }
