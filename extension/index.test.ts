@@ -7784,6 +7784,19 @@ test("native jobs: a delivered result makes the host's spilled output readable",
       .execute("c3", { id: "bg_8", pattern: "FAIL" }, undefined, undefined, h.ctx);
     assert.match(g.content[0].text as string, /FAIL: TestFoo/);
 
+    // The human path reads the same artifact, and must say so too: `/bgtail`
+    // calls the same core, so an unstamped toast would claim bgrun provenance
+    // for the host's file. Content-wise this is a delta read — the tool call
+    // above already advanced the shared bookmark — so only the stamp is asserted.
+    const notes: { text: string }[] = [];
+    h.ctx.hasUI = true;
+    h.ctx.ui.notify = (text: string) => notes.push({ text });
+    await h.commands.get("bgtail")!.handler("bg_8 5", h.ctx);
+    assert.match(
+      notes.at(-1)!.text,
+      /the host's spill of native job bg_8's full output, not a bgrun log/,
+    );
+
     const s = await h.tools
       .get("bgstatus")!
       .execute("c4", { id: "bg_8" }, undefined, undefined, h.ctx);

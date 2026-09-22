@@ -3411,7 +3411,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Shared by the bgtail tool (agent-facing) and the /bgtail slash command
-  // (human-facing).
+  // (human-facing). Returns the read *unstamped*: both callers pass the result
+  // through annotateNative() so a read of a native job's artifact says so — the
+  // stamp needs the job id, which is the caller's parameter, not this one's.
   async function bgtailCore(
     params: { id: string; lines?: number; raw?: boolean; bytes?: number },
     ctx?: ExtensionContext,
@@ -4227,9 +4229,15 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const n = Number(tokens[1]);
-      const res = await bgtailCore(
-        { id, lines: Number.isFinite(n) && n > 0 ? n : undefined },
-        ctx,
+      // Stamped like the tool path: a native job's artifact is the host's file
+      // and the reader must say so. Both callers apply annotateNative() — see
+      // bgtailCore's note.
+      const res = annotateNative(
+        await bgtailCore(
+          { id, lines: Number.isFinite(n) && n > 0 ? n : undefined },
+          ctx,
+        ),
+        id,
       );
       if (ctx.hasUI) {
         ctx.ui.notify(res.content[0].text, res.isError ? "error" : "info");
