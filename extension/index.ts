@@ -57,6 +57,7 @@ import {
   DIGEST_PRESET_IDS,
   digestNoMatchWakeLine,
   digestNoMatchWarning,
+  digestTypes,
   selectDigestEntry,
   type DigestEntry,
   type DigestJobTarget,
@@ -127,7 +128,12 @@ interface NativeJob {
 
 /** Read-only native-job surface oh-my-pi adds to ExtensionContext. */
 interface HostAsyncJobs {
-  getAsyncJobSnapshot?: () => { running?: unknown; recent?: unknown } | null;
+  getAsyncJobSnapshot?: () => {
+    running?: unknown;
+    recent?: unknown;
+    /** Delivery queue state: jobs settled but whose result is not injected yet. */
+    delivery?: unknown;
+  } | null;
 }
 
 /**
@@ -150,6 +156,24 @@ export function supportsNativeJobSnapshot(ctx: ExtensionContext | undefined): bo
 }
 
 /**
+ * The raw native snapshot, or undefined on hosts without the API (and for a host
+ * that throws from it — a broken snapshot must not break a status query or the
+ * panel). Single-sourced so every reader shares one failure rule.
+ */
+function readNativeSnapshot(
+  ctx: ExtensionContext | undefined,
+): { running?: unknown; recent?: unknown; delivery?: unknown } | undefined {
+  if (!ctx) return undefined;
+  let snapshot: { running?: unknown; recent?: unknown; delivery?: unknown } | null | undefined;
+  try {
+    snapshot = (ctx as ExtensionContext & HostAsyncJobs).getAsyncJobSnapshot?.();
+  } catch {
+    return undefined;
+  }
+  return snapshot && typeof snapshot === "object" ? snapshot : undefined;
+}
+
+/**
  * The session's native (host-owned) background jobs. `[]` on hosts without the
  * snapshot API, so every caller degrades to bgrun-only behavior. Read-only
  * throughout: bgrun never adopts, resumes, or cancels these — it only reports
@@ -159,16 +183,8 @@ export function nativeJobs(
   ctx: ExtensionContext | undefined,
   which: "running" | "recent" = "running",
 ): NativeJob[] {
-  if (!ctx) return [];
-  const host = ctx as ExtensionContext & HostAsyncJobs;
-  let snapshot: { running?: unknown; recent?: unknown } | null | undefined;
-  try {
-    snapshot = host.getAsyncJobSnapshot?.();
-  } catch {
-    // A host that throws here must not break the panel or a status query.
-    return [];
-  }
-  if (!snapshot || typeof snapshot !== "object") return [];
+  const snapshot = readNativeSnapshot(ctx);
+  if (!snapshot) return [];
   const list = which === "running" ? snapshot.running : snapshot.recent;
   if (!Array.isArray(list)) return [];
   const out: NativeJob[] = [];
@@ -197,9 +213,49 @@ function nativeJobLabel(job: NativeJob): string {
 }
 
 /**
+ * Native jobs that have settled but whose `async-result` the host has not
+ * injected yet. They are neither running nor in the transcript, so a count that
+ * ignored them would read as "nothing is happening" for exactly the window in
+ * which the agent is waiting for a result it has already earned.
+ */
+export function nativePendingDeliveries(ctx: ExtensionContext | undefined): string[] {
+  const delivery = readNativeSnapshot(ctx)?.delivery as
+    | { pendingJobIds?: unknown }
+    | undefined;
+  if (!delivery || typeof delivery !== "object") return [];
+  const ids = delivery.pendingJobIds;
+  if (!Array.isArray(ids)) return [];
+  return ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+}
+
+/**
+ * Cheap identity of the host's job set: which jobs it reports and in which
+ * state, plus how many results are still waiting to be delivered. Used to skip
+ * a panel rebuild when a host-driven refresh cannot have anything new to show.
+ */
+function nativeSignature(ctx: ExtensionContext): string {
+  const running = nativeJobs(ctx, "running")
+    .map((job) => `${job.id}:${job.status}`)
+    .join(",");
+  return `${running}|${nativePendingDeliveries(ctx).join(",")}`;
+}
+
+/**
+ * One native job by id, running first (a live job with a reused id wins over a
+ * settled one). Used where a caller has an id and needs the host's view of it.
+ */
+function findNativeJob(ctx: ExtensionContext, id: string): NativeJob | undefined {
+  return [...nativeJobs(ctx, "running"), ...nativeJobs(ctx, "recent")].find(
+    (job) => job.id === id,
+  );
+}
+
+/**
  * What to say when an id does not resolve to a bgrun job. Names the expected
- * shape, and — for a native id — says where that job's output actually goes, so
- * a `bg_N` id can't dead-end a session the way it did in practice.
+ * shape, and — for a native id — says where that job's output goes and how to
+ * inspect or kill it, so a `bg_N` id can't dead-end a session the way it did in
+ * practice. The remedy is the host's own (`hub`), not a bgrun tool: those jobs
+ * are not ours to steer.
  */
 export function unknownJobHint(id: string): string {
   const bgrunShape =
@@ -208,7 +264,10 @@ export function unknownJobHint(id: string): string {
   if (!/^bg_\d+$/.test(id)) return bgrunShape;
   return (
     `"${id}" looks like a native background job (the host backgrounds long bash calls itself). ` +
-    "Its output is delivered automatically as an async result and is never written to this jobs dir. " +
+    "Its output is delivered automatically as an async result; when the host spilled it, " +
+    `bgtail ${id} reads it back from the artifact. ` +
+    `The host owns it, so cancel it with \`hub cancel ids:["${id}"]\` and list it with \`hub jobs\` ` +
+    "(humans: `/jobs`). " +
     bgrunShape
   );
 }
@@ -1617,6 +1676,10 @@ interface BgStatusDetails {
   native?: boolean;
   /** Host-managed background jobs included in a listing. */
   nativeCount?: number;
+  /** Readable path for a native job: the host's spill of its full output. */
+  logPath?: string;
+  /** Artifact id backing that path. */
+  artifactId?: string;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1673,6 +1736,21 @@ export default function (pi: ExtensionAPI) {
   const ESSENTIAL_TOOL = { loadMode: "essential" as const };
 
   const jobs = new Map<string, JobRecord>();
+
+  // Native job id → the host's spilled full-output artifact, when one exists.
+  //
+  // oh-my-pi bounds what it hands the model and mirrors the full sanitized
+  // output of a long bash run to a per-session artifact, advertising the id on
+  // the delivered async result (`details.jobs[].meta.truncation.artifactId`).
+  // Resolving it is what lets bgtail/bggrep answer for a `bg_N` id — the same
+  // bounded readers, applied to the host's own spill instead of a bgrun log.
+  //
+  // In-memory by construction: `bg_N` ids are process-scoped (they restart at
+  // bg_1) and artifact ids are session-scoped, so a persisted mapping could
+  // point at a *different* job's output after a restart. Only a delivery this
+  // process saw is ever resolvable, which makes a stale hit impossible.
+  const nativeOutputs = new Map<string, { artifactId: string; path: string }>();
+
   // bgtail's delta-tailing bookmarks: one entry per job id ever tailed, holding
   // the high-water mark of what the caller has already had the opportunity to
   // see. Declared here, ahead of the cleanup helpers, so removing a log can
@@ -1909,9 +1987,19 @@ export default function (pi: ExtensionAPI) {
     // Native jobs belong in the count too — "1 running" that ignores a
     // backgrounded bash call would be wrong from the human's point of view.
     const nativeRunning = nativeJobs(ctx, "running").length;
+    // ...and a settled native job whose result has not been injected yet is
+    // neither running nor visible anywhere else, so it gets its own clause.
+    const pending = nativePendingDeliveries(ctx).length;
     const live = running + nativeRunning;
     if (live > 0) {
-      ctx.ui.setStatus("bgrun", `⏳ ${live} running`);
+      ctx.ui.setStatus(
+        "bgrun",
+        pending > 0 ? `⏳ ${live} running · ${pending} result pending` : `⏳ ${live} running`,
+      );
+      return;
+    }
+    if (pending > 0) {
+      ctx.ui.setStatus("bgrun", `⏳ ${pending} result pending`);
       return;
     }
     if (!lastDone) {
@@ -2342,7 +2430,18 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_start: reconstruct Map from entries + auto-cleanup ────────────
 
-  pi.on("session_start", async (_event, ctx) => {
+  /**
+   * Re-index this transcript's jobs: rebuild the in-memory Map from its
+   * `bgrun-job` entries, adopt still-running jobs found on disk when the config
+   * asks for that, and re-point the panel/poller at the result.
+   *
+   * Split out of session_start because oh-my-pi does not re-emit session_start
+   * when the transcript changes: `/new`, `/resume`, a fork and a tree branch all
+   * fire `session_switch` / `session_branch` instead (the host's own internal
+   * bridge re-initialises on all three). A plugin that only listened for
+   * session_start kept rendering the previous transcript's jobs.
+   */
+  function reindexSession(ctx: ExtensionContext): void {
     // Reconstruct the in-memory Map from this session's bgrun-job entries.
     // Only the current session's entries are visible; jobs from other sessions
     // remain discoverable via the filesystem scan in bgstatus.
@@ -2411,10 +2510,6 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // One-shot digest nudge (toast only, never the LLM context). All of its
-    // failure modes are swallowed inside — it must never break session_start.
-    maybeNudgeDigest(ctx);
-
     // Show the widget if anything is now running. revalidateStaleJobs()
     // inside clears zombies — reconstructed jobs that finished while pi was
     // down — before they ever render. Then start the stale poller for
@@ -2422,10 +2517,66 @@ export default function (pi: ExtensionAPI) {
     // resumed sessions live tracking of their still-running jobs).
     updateWidget(ctx);
     ensureStalePoller(ctx);
+  }
+
+  // `tool_execution_end` fires on *every* tool call on hosts that have the
+  // snapshot API, so the host-driven rebuild is gated on the host's job set
+  // actually differing: rebuilding per call would re-run the stale revalidation
+  // (a 256 KiB tail read per record with no live child handle) and two host-side
+  // UI re-renders for no new information. A native job moving between states
+  // always changes this signature — a completion drops it from `running` — and
+  // bgrun's own jobs are driven by its own events plus the stale poller.
+  let lastNativeSignature = "";
+  function refreshForNative(ctx: ExtensionContext): void {
+    const signature = nativeSignature(ctx);
+    if (signature === lastNativeSignature) return;
+    lastNativeSignature = signature;
+    updateWidget(ctx, { persistRevalidate: false });
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    reindexSession(ctx);
+    // One-shot digest nudge (toast only, never the LLM context). All of its
+    // failure modes are swallowed inside — it must never break session_start.
+    maybeNudgeDigest(ctx);
     // Auto-cleanup of old logs, throttled to one sweep per cleanupDays via a
     // marker in the jobs dir (see autoCleanJobs). Also runs on session_shutdown.
     autoCleanJobs(ctx);
   });
+
+  // oh-my-pi changes the transcript without a session_start: `/new`, `/resume`,
+  // a fork and a tree branch each fire `session_switch` / `session_branch` (the
+  // host's own internal event bridge re-initialises on all three). Re-index
+  // there too, or the panel and status line keep reporting the jobs of a
+  // transcript that is no longer on screen. Registered unconditionally: a host
+  // that never emits these (upstream pi) simply never calls the handler.
+  const onTranscriptChanged = (_event: unknown, ctx: ExtensionContext): void => {
+    // Finished jobs belong to the transcript that ran them — the new one has its
+    // own entries, and re-indexing below re-adds them if it really does. Running
+    // jobs stay: they are alive on disk, they exist nowhere else once dropped,
+    // and their wake is still ours to deliver into whichever session is live now.
+    for (const [id, rec] of jobs) {
+      if (rec.exitCode !== undefined) jobs.delete(id);
+    }
+    reindexSession(ctx);
+    // Refresh even with nothing running, so a stale "✅ <job> exit=0" cannot
+    // outlive the session that ran it. The next host-driven refresh must not be
+    // skipped by a signature the pre-switch session left behind.
+    lastNativeSignature = "";
+    updateWidget(ctx, { persistRevalidate: false });
+  };
+  // `pi.on` is a method on the host's api facade — oh-my-pi implements it as a
+  // class method that reads `this.extension` (loader.ts), so it must be *called
+  // on the api object*: a detached reference throws inside the host and aborts
+  // the whole extension load. Hence `.call(pi, …)`, not a bare saved reference.
+  const registerHostEvent = (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void,
+  ): void => {
+    (pi.on as unknown as (e: string, h: unknown) => void).call(pi, event, handler);
+  };
+  registerHostEvent("session_switch", onTranscriptChanged);
+  registerHostEvent("session_branch", onTranscriptChanged);
 
   // Host-owned background jobs change with no bgrun event at all: the host
   // backgrounds a `bash` call on its own (the tool result is the start notice),
@@ -2434,16 +2585,21 @@ export default function (pi: ExtensionAPI) {
   // acted. Both are no-ops on hosts without the snapshot API (upstream pi).
   pi.on("tool_execution_end", (_event, ctx) => {
     if (!ctx.hasUI || !supportsNativeJobSnapshot(ctx)) return;
-    updateWidget(ctx, { persistRevalidate: false });
+    refreshForNative(ctx);
   });
 
-  pi.on("message_start", (event, ctx) => {
-    if (!ctx.hasUI || !supportsNativeJobSnapshot(ctx)) return;
+  pi.on("message_start", async (event, ctx) => {
+    if (!supportsNativeJobSnapshot(ctx)) return;
     // Only the async-result delivery ends a native job; ignore every other
-    // message rather than rebuilding the panel on each one.
+    // message rather than doing work on each one.
     if (!event.message || !("customType" in event.message)) return;
     if (event.message.customType !== NATIVE_RESULT_MESSAGE_TYPE) return;
-    updateWidget(ctx, { persistRevalidate: false });
+    // Before the panel refresh: a delivery is the one moment the host tells us
+    // where a native job's full output went, which is what makes `bg_N` IDs
+    // readable by bgtail/bggrep afterwards.
+    await recordNativeOutputs(event.message, ctx);
+    if (!ctx.hasUI) return;
+    refreshForNative(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -2860,16 +3016,10 @@ export default function (pi: ExtensionAPI) {
         // happy path (no digest, or a type already given), and the config is
         // already resolved above.
         if (!type) {
-          const digestTypes = [
-            ...new Set(
-              (cfg.digest ?? [])
-                .map((entry) => entry.type)
-                .filter((t): t is string => typeof t === "string"),
-            ),
-          ];
-          if (digestTypes.length > 0) {
+          const declared = digestTypes(cfg.digest ?? []);
+          if (declared.length > 0) {
             startedLines.push(
-              `  digest: configured types ${digestTypes.join(", ")} — pass type: "${digestTypes[0]}" to attach a scorecard`,
+              `  digest: configured types ${declared.join(", ")} — pass type: "${declared[0]}" to attach a scorecard`,
             );
           }
         }
@@ -3131,6 +3281,62 @@ export default function (pi: ExtensionAPI) {
     if (oldest !== undefined && oldest !== id) tailBookmarks.delete(oldest);
   }
 
+  /**
+   * Learn where a native job's full output landed, from the delivery the host
+   * just made. Best-effort by design: a small output that was delivered inline
+   * has no artifact, a session without an artifact store cannot resolve one, and
+   * a host that fails the lookup is still a host whose job we can list — none of
+   * those may break the delivery path, so they record nothing and move on.
+   */
+  async function recordNativeOutputs(
+    message: unknown,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const details = (message as { details?: unknown } | undefined)?.details;
+    if (!details || typeof details !== "object") return;
+    const delivered = (details as { jobs?: unknown }).jobs;
+    if (!Array.isArray(delivered)) return;
+    const manager = ctx.sessionManager as
+      | (typeof ctx.sessionManager & {
+          getArtifactPath?: (id: string) => Promise<string | null>;
+        })
+      | undefined;
+    const resolvePath = manager?.getArtifactPath;
+    if (typeof resolvePath !== "function") return;
+    for (const entry of delivered) {
+      if (!entry || typeof entry !== "object") continue;
+      const { jobId, meta } = entry as { jobId?: unknown; meta?: unknown };
+      if (typeof jobId !== "string" || !jobId) continue;
+      const artifactId = (
+        meta as { truncation?: { artifactId?: unknown } } | undefined
+      )?.truncation?.artifactId;
+      if (typeof artifactId !== "string" || !artifactId) continue;
+      try {
+        const path = await resolvePath.call(manager, artifactId);
+        // existsSync: a resolved-but-missing path is worse than no path, because
+        // every later read would report a broken log rather than the real story.
+        if (typeof path === "string" && path && existsSync(path)) {
+          nativeOutputs.set(jobId, { artifactId, path });
+        }
+      } catch {
+        // Swallowed on purpose: this is enrichment, not the delivery.
+      }
+    }
+  }
+
+  /** The host's spilled artifact for a native job id, when this process saw it. */
+  function nativeOutputFor(id: string): { artifactId: string; path: string } | undefined {
+    const rec = nativeOutputs.get(id);
+    if (!rec) return undefined;
+    if (!existsSync(rec.path)) {
+      // Pruned or moved under us (session artifact dirs move on fork/move): drop
+      // the entry rather than claim a path that no longer answers.
+      nativeOutputs.delete(id);
+      return undefined;
+    }
+    return rec;
+  }
+
   // Resolve a job's log path and read its bounded slice, single-sourcing the
   // "in-memory record first, then the configured jobs dir" rule shared by
   // bgtail and bggrep. The record's logPath stays correct even if the config
@@ -3145,8 +3351,14 @@ export default function (pi: ExtensionAPI) {
     | { logPath: string; content: string; size: number }
     | { logPath: string; errorText: string; notFound: boolean } {
     validateJobId(id, tool);
+    const native = nativeOutputFor(id);
+    // A native job whose full output the host spilled is readable through the
+    // same readers: its artifact path stands in for the log we never wrote (the
+    // caller stamps the output as native — see annotateNative).
     const logPath =
-      jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
+      jobs.get(id)?.logPath ??
+      native?.path ??
+      join(resolveConfig(ctx).jobsDir, `${id}.log`);
     const slice = readLogSlice(logPath, window);
     if (!slice) {
       return {
@@ -3156,6 +3368,28 @@ export default function (pi: ExtensionAPI) {
       };
     }
     return { logPath, content: slice.content, size: slice.size };
+  }
+
+  /**
+   * Stamp a read of a native job's spilled artifact as such. It is the host's
+   * file, not a bgrun log: it has no `__BGRUN_EXIT__` marker, bgrun never cleans
+   * it, and the host may drop it with the session — a reader that stayed silent
+   * about that would imply provenance it does not have.
+   */
+  function annotateNative<T extends { content: { type: "text"; text: string }[] }>(
+    result: T,
+    id: string,
+  ): T {
+    const native = nativeOutputFor(id);
+    const first = result.content[0];
+    if (!native || !first || first.type !== "text") return result;
+    const note =
+      `\n\n(read from artifact ${native.artifactId} — the host's spill of native job ${id}'s full output, not a bgrun log: ` +
+      `no exit marker, and only the host's retention applies. Path: ${native.path})`;
+    return {
+      ...result,
+      content: [{ ...first, text: first.text + note }, ...result.content.slice(1)],
+    };
   }
 
   // Shared by the bgtail tool (agent-facing) and the /bgtail slash command
@@ -3358,7 +3592,7 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      return bgtailCore(params, ctx);
+      return annotateNative(await bgtailCore(params, ctx), params.id);
     },
   });
 
@@ -3593,7 +3827,7 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      return bggrepCore(params, ctx);
+      return annotateNative(await bggrepCore(params, ctx), params.id);
     },
   });
 
@@ -3649,14 +3883,40 @@ export default function (pi: ExtensionAPI) {
           },
         };
       }
+      // A native job whose delivery this process saw has a readable path: the
+      // host spilled its full output to a session artifact. Report it as such.
+      // The marker-based state below would otherwise call it "running" forever,
+      // since the host's spill carries no `__BGRUN_EXIT__` line.
+      const nativeOutput = nativeOutputFor(id);
+      if (nativeOutput) {
+        const native = findNativeJob(ctx, id);
+        const state = native?.status ?? "completed";
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${id}: ${state} — native background job (${native?.type ?? "bash"}), not a bgrun job.\n` +
+                (native?.label ? `  cmd: ${native.label}\n` : "") +
+                `  output: ${nativeOutput.path} (artifact ${nativeOutput.artifactId} — the host's spill of the full output; bgtail ${id} and bggrep ${id} read it)\n` +
+                `  cancel: hub cancel ids:["${id}"]`,
+            },
+          ],
+          details: {
+            id,
+            state,
+            native: true,
+            logPath: nativeOutput.path,
+            artifactId: nativeOutput.artifactId,
+          },
+        };
+      }
       const logPath = join(jobsDir, `${id}.log`);
       if (!existsSync(logPath)) {
         // A host-owned background job (omp backgrounds long bash calls itself)
         // is a real answer, just not a bgrun one: report it as such instead of
         // a bare "not found", which in practice sent a session chasing `bg_5`.
-        const native = [...nativeJobs(ctx, "running"), ...nativeJobs(ctx, "recent")].find(
-          (job) => job.id === id,
-        );
+        const native = findNativeJob(ctx, id);
         if (native) {
           return {
             content: [
@@ -3665,14 +3925,21 @@ export default function (pi: ExtensionAPI) {
                 text:
                   `${id}: ${native.status} — native background job (${native.type}), not a bgrun job.\n` +
                   (native.label ? `  cmd: ${native.label}\n` : "") +
-                  "  output: delivered automatically as an async result (no log in this jobs dir)",
+                  "  output: delivered automatically as an async result (no artifact: the host " +
+                  "spills only output it truncated, and only deliveries this session saw resolve)\n" +
+                  `  cancel: hub cancel ids:["${id}"]`,
               },
             ],
             details: { id, state: native.status, native: true },
           };
         }
         return {
-          content: [{ type: "text", text: `No job found with id ${id}` }],
+          content: [
+            {
+              type: "text",
+              text: `No job found with id ${id}. ${unknownJobHint(id)}`,
+            },
+          ],
           details: { id, state: "unknown" },
           isError: true,
         };
@@ -3770,7 +4037,7 @@ export default function (pi: ExtensionAPI) {
         (job) => `  ${job.id}: ${job.status} — ${nativeJobLabel(job)}`,
       );
       sections.push(
-        `native background jobs (host-managed; output is delivered automatically, not logged here):\n${rows.join("\n")}`,
+        `native background jobs (host-managed; their output is delivered automatically, and bgtail/bggrep can read it once the host spills it — the host's own list is \`hub jobs\`, humans \`/jobs\`):\n${rows.join("\n")}`,
       );
     }
     if (sections.length === 0) {

@@ -55,10 +55,18 @@ when you are inside a subagent and need the result.
 
 oh-my-pi backgrounds long `bash` calls by itself (`bash.autoBackground`, and an
 explicit `async: true`) and delivers the result automatically as an async result.
-Those jobs are **not** bgrun jobs: their ids look like `bg_1`, their output goes to
-a delivered message (never a log in the jobs dir), they are cancelled when the
-session is switched or replaced, and their ids do not work with `bgtail` /
-`bggrep`. `bgstatus` lists them too, marked `native`.
+Those jobs are **not** bgrun jobs: their ids look like `bg_1`, they are cancelled
+when the session is switched or replaced, and bgrun never starts, adopts or
+cleans them. `bgstatus` lists them too, marked `native`, and `bgtail` / `bggrep`
+resolve a `bg_N` id (see below) rather than dead-ending on it.
+
+- Their output is delivered to you automatically — do not poll for it.
+- When the host truncated the output, it spilled the full text to a session
+  artifact; `bgtail bg_3` / `bggrep bg_3` read that back through the same bounded
+  readers used for bgrun logs (the read is stamped as the host's file, not ours).
+  If nothing was spilled, the id says so — it never invents a path.
+- They belong to the host: to kill one, `hub cancel ids:["bg_3"]` (see `hub jobs`,
+  or `/jobs` for a human). There is no bgrun tool that touches them.
 
 Which to use:
 

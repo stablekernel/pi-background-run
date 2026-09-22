@@ -52,12 +52,22 @@ The host also decides two presentation details, both handled internally:
 - **Job cards.** pi renders an `bgrun-job` card per job in the transcript. omp has
   no entry renderer (`pi.appendEntry` records are never rendered — it renders only
   `pi.sendMessage` entries), so on omp the job card is skipped. The entries are
-  still persisted on both hosts, and `session_start` replays them identically.
+  still persisted on both hosts, and the index is rebuilt from them on
+  `session_start` and on omp's `session_switch` / `session_branch` (which is how
+  omp announces `/new`, `/resume`, a fork and a tree branch).
   The card's job — "what is running, and how did the last one end" — is covered on
   both hosts by the editor panel and the status line (see
   [What the human sees](#what-the-human-sees)) at no context cost and without an
   entry renderer; the transcript still anchors each job through the `bgrun` tool
   card and the wake message, and `bgstatus` has the full history on demand.
+- **Host-managed background jobs.** omp backgrounds long `bash` calls itself and
+  exposes its in-process job list to extensions (`getAsyncJobSnapshot`), so bgrun
+  reports those jobs alongside its own — in the panel, the status line and
+  `bgstatus` (see [What the human sees](#what-the-human-sees)) — and reads back
+  the artifact the host spills a truncated job's full output to. pi has no job
+  manager, no snapshot API and no session artifacts, so every one of those paths
+  degrades to bgrun-only. Nothing here is ever adopted, cancelled or cleaned by
+  bgrun: those jobs are the host's, and `hub` is how the agent steers them.
 - **Diagnostics.** Warnings and errors go to `pi.logger` when the host has one
   (omp writes `~/.omp/logs/omp.<date>.<pid>.log`; the TUI owns the terminal, so
   a raw stderr write would corrupt it) and to the console on pi. Anything the
@@ -69,9 +79,9 @@ The host also decides two presentation details, both handled internally:
 | Tool | Purpose |
 | ------ | --------- |
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
-| `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
-| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
-| `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
+| `bgstatus` | Show job status. With an id: any job's state + exit code — a `bg_N` id (the host's own background job on omp) is answered with its state, where its output went and how to cancel it, rather than "not found". Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`), then the host's background jobs under their own heading. Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
+| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). On omp, a native `bg_N` job's spilled output is read the same way, stamped as the host's file. |
+| `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB; on omp, a native `bg_N` job's spilled output is searchable the same way): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days); `days` must be a positive number (`days: 0` is rejected rather than purging everything). Never removes a running job's log. |
 
 ## Slash commands
@@ -156,12 +166,31 @@ look like `bg_1`, they have no log here, and they are cancelled when the session
 is switched or replaced. The panel tags them `native` and `bgstatus` lists them
 under their own heading, so one glance (or one call) covers all background work
 in the session, and an id from either namespace explains itself — `bggrep bg_5`
-says what `bg_5` is and where its output went, instead of a bare "no log found".
+names what `bg_5` is, where its output went, and how to kill it (`hub cancel
+ids:["bg_5"]`, the host's own tool), instead of a bare "no log found".
+
+When the host truncated a native job's output it spills the full text to a
+session artifact, and the delivery advertises the id. bgrun resolves it, so
+`bgtail bg_5` / `bggrep bg_5` read the host's own spill through the same bounded
+readers used for bgrun logs — the same condensation, caps and grep budgets, with
+the output stamped as the host's file (no exit marker, not ours to clean). That
+mapping is deliberately in-memory: `bg_N` ids restart at 1 and artifact ids are
+session-scoped, so a persisted one could point at a different job's output after
+a restart. A native job whose output was small enough to deliver inline has no
+artifact, and bgrun says so rather than inventing a path.
+
+The panel and status line are also re-indexed when oh-my-pi changes the
+transcript: `/new`, `/resume`, a fork and a tree branch emit
+`session_switch`/`session_branch` instead of `session_start`, so listening only
+for `session_start` left a fresh session reporting the jobs of the one before it.
+Finished jobs are dropped with the transcript that ran them; jobs that are still
+running stay, since they outlive it.
 
 On pi a `bgrun-job` card is also drawn in the transcript (an entry renderer),
 which omp cannot render — hence these two surfaces. Neither is a history view:
-the panel is live-only and the status line keeps just the latest outcome; use
-`bgstatus includeDone: true` when you need the full list. See
+the panel is live-only and the status line keeps just the latest outcome (plus
+`N result pending` when the host has settled a job but not yet injected its
+result); use `bgstatus includeDone: true` when you need the full list. See
 [Host differences](#host-differences).
 
 ## Reading results without flooding context

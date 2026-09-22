@@ -222,19 +222,31 @@ function labelFromMatchName(pattern: string): string {
 }
 
 /**
+ * The distinct `type` values a digest config declares, in config order. Empty
+ * when no entry is typed. Single-sourced because three surfaces report the same
+ * vocabulary — the no-match log line, the wake note, and bgrun's spawn hint —
+ * and they must never disagree about what the project offers.
+ */
+export function digestTypes(entries: readonly DigestEntry[]): string[] {
+  return [
+    ...new Set(
+      entries
+        .map((e) => e.type)
+        .filter((t): t is string => typeof t === "string"),
+    ),
+  ];
+}
+
+/**
  * The no-match diagnostic's shared facts: how the job was identified and which
  * types the config declares. Both the log line and the wake note are built from
  * these, so the two can never describe different things.
  */
 function digestNoMatchParts(
- target: DigestJobTarget,
- entries: DigestEntry[],
+  target: DigestJobTarget,
+  entries: DigestEntry[],
 ): { job: string; types: string } {
- const declaredTypes = [
-  ...new Set(
-   entries.map((e) => e.type).filter((t): t is string => typeof t === "string"),
-  ),
- ];
+  const declaredTypes = digestTypes(entries);
  const job =
   target.type === undefined
    ? target.name === undefined
