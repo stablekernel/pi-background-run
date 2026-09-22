@@ -1,34 +1,35 @@
 ---
 name: run-bg
-description: Use when running any long or verbose shell command (make test, go test ./...,
-  make lint, builds) so output lands in a file instead of flooding context and the session
-  stays unblocked. Start the job, hand control back, check status later, and read only a
-  tail or a code-processed summary of the log.
+description: Use for genuinely asynchronous shell work such as deployment or CI monitoring,
+  long evals, sustained observability, or commands that must continue while the agent does
+  other work. Choose whether completion wakes the model; do not use merely because a command
+  is a test, build, lint, query, or external request.
 ---
 
 # Run in Background (pi-bgrun)
 
-Run long/verbose commands detached. Output → file. Context stays clean; the session
-never blocks. The extension wakes this session automatically when the job finishes —
-no polling.
+Run genuinely asynchronous commands detached. Output → file and the session stays
+unblocked. Human toast/widget updates always happen; the `wake` policy decides whether
+completion also injects a model turn. Never poll through model turns.
 
 ## When to use
 
-- Any command expected to run > ~30s OR emit > ~100 lines.
-- Typical: `make test`, `go test ./...`, `make lint`, `make build`.
-- Integration / infra suites (long-running, always background).
+- Deployment, CI, or merge-queue monitoring that must trigger follow-up work.
+- Long evals, sustained observability, installs, or integration suites that need to run while other work continues.
+- Independent long-running work whose output should stay on disk.
 
 ## When NOT to use
 
-- Commands that complete in < ~5s — the overhead isn't worth it.
-- Short, quiet commands whose full output you actually need (`git status`).
+- Do not select bgrun merely because a command is a test, build, lint, database query, or external request.
+- Default to foreground execution for routine and focused checks. Reassess after a fast or fail-fast result.
+- For verbose but quick commands, redirect raw output to a file and print a bounded summary instead of creating a background lifecycle.
 - Interactive commands (prompts, REPL, SSH) — bgrun detaches from the terminal.
 
 ## Tools
 
 | Action | Tool |
 |---|---|
-| Start  | `bgrun(command: "make test-short", name: "unit-tests", type: "test")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the status widget, and wake messages) |
+| Start  | `bgrun(command: "gh run watch …", name: "deploy-monitor", wake: "always")` → `started: <job-id>` (`wake` is `never`, `failure`, or `always`) |
 | Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
 | Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing) |
 | Grep   | `bggrep(<job-id>, "pattern", context?)` — line-numbered matches, capped and condensed; default pattern = generic failure signatures (override when you know the format) |
@@ -36,12 +37,14 @@ no polling.
 
 ## Workflow
 
-1. **Start:** call `bgrun` with the command (and a short `name`, e.g. `name: "unit-tests"`).
+1. **Start:** call `bgrun` with the command, a short `name`, and an intentional wake policy:
+   - `wake: "always"` when continuation depends on completion (deploy/eval monitors);
+   - `wake: "failure"` when success needs no model turn;
+   - `wake: "never"` for independent work.
    When the project's digest config defines `type` entries, also pass the
-   matching `type` (e.g. `type: "test"`) — like `name`, it helps the wake
-   select the right digest scorecard. Note the returned job-id. Continue other
-   work; you will be woken automatically when the job finishes.
-2. **On wake:** check the exit status in the wake message first.
+   matching `type`; a digest is useful only for jobs that wake. Note the returned
+   job-id and continue other work.
+2. **On wake (if requested):** check the exit status in the wake message first.
    - `exit: 0` → success. `bgtail` to confirm.
    - `exit: <non-zero>` → failure. Analyze the log (see below).
 3. **If you need to check before the wake (non-blocking):** call `bgstatus` with the job id.

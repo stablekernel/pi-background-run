@@ -1,14 +1,15 @@
 /**
  * pi-bgrun — pi extension that runs long shell commands detached in the
- * background and wakes the live agent session on completion.
+ * background and optionally wakes the live agent session on completion.
  *
  * Architecture:
  * - In-process spawn via child_process.spawn with stdio redirected to a log file
  *   (detached + unref so the job survives pi crashing).
  * - The child wraps the command to append a trailing __BGRUN_EXIT__=N marker,
  *   making the log self-describing — exit codes survive pi restarting.
- * - Completion is the child 'exit' event, not a poller. The exit handler wakes
- *   the agent via pi.sendUserMessage (triggers a turn when idle; followUp when busy).
+ * - Completion is the child 'exit' event, not a poller. The exit handler follows
+ *   the per-job wake policy before using pi.sendUserMessage; toast/widget updates
+ *   remain unconditional.
  * - Job records persist via pi.appendEntry (survives same-session restart,
  *   renders as a card in the transcript, does NOT enter LLM context).
  * - Live status widget above the editor while jobs are running.
@@ -645,6 +646,21 @@ function logReadError(id: string, logPath: string): string {
 // <cwd>/<CONFIG_DIR_NAME>/pi-bgrun.json (project, honored only when the project
 // is trusted), with PI_BGRUN_* env vars as overrides.
 
+export type WakePolicy = "never" | "failure" | "always";
+
+export function shouldWakeAgent(
+  policy: WakePolicy,
+  exitCode: number,
+): boolean {
+  return policy === "always" || (policy === "failure" && exitCode !== 0);
+}
+
+function normalizeWakePolicy(value: unknown): WakePolicy | undefined {
+  return value === "never" || value === "failure" || value === "always"
+    ? value
+    : undefined;
+}
+
 interface BgrunConfig {
   jobsDir: string;
   // True when jobsDir resolves inside the project root (the default in a
@@ -659,6 +675,9 @@ interface BgrunConfig {
   // Include finished jobs in bgstatus listings by default. Default false —
   // completed jobs are noise; ask for them explicitly (bgstatus includeDone).
   showCompletedJobs: boolean;
+  // Default policy for injecting a completion message into the model turn.
+  // Human toast/widget updates are independent and always remain enabled.
+  defaultWake: WakePolicy;
   // Log retention for cleanup (auto-sweeps and the bgclean default).
   cleanupDays: number;
   // Byte ceiling for a job's log (stdout+stderr). A runaway job (`yes`, a spew
@@ -693,6 +712,7 @@ interface BgrunConfigFile {
   jobsDir?: unknown;
   adoptForeignJobs?: unknown;
   showCompletedJobs?: unknown;
+  defaultWake?: unknown;
   cleanupDays?: unknown;
   maxLogBytes?: unknown;
   globalAutoClean?: unknown;
@@ -1253,6 +1273,8 @@ export function resolveConfig(ctx?: {
     typeof merged.globalAutoClean === "boolean"
       ? merged.globalAutoClean
       : undefined;
+  const wakeFile = normalizeWakePolicy(merged.defaultWake);
+  const wakeEnv = normalizeWakePolicy(process.env.PI_BGRUN_WAKE);
   const dirFile =
     typeof merged.jobsDir === "string" && merged.jobsDir
       ? merged.jobsDir
@@ -1324,6 +1346,9 @@ export function resolveConfig(ctx?: {
       parseBoolEnv(process.env.PI_BGRUN_SHOW_COMPLETED) ??
       completedFile ??
       false,
+    // Preserve the package's historical behavior unless the user/project opts
+    // into quieter defaults. Each bgrun call can still override this policy.
+    defaultWake: wakeEnv ?? wakeFile ?? "always",
     cleanupDays: daysEnv ?? daysFile ?? DEFAULT_CLEANUP_DAYS,
     maxLogBytes: maxBytesEnv ?? maxBytesFile ?? DEFAULT_MAX_LOG_BYTES,
     globalAutoClean:
@@ -1376,6 +1401,7 @@ interface JobRecord {
   cmd: string;
   name?: string; // optional human-readable label
   type?: string; // optional job type used for digest scorecard selection
+  wake: WakePolicy; // whether completion injects a model turn
   started: number;
   logPath: string;
   exitedAt?: number;
@@ -1394,6 +1420,7 @@ interface BgrunJobEntryData {
   cmd: string;
   name?: string;
   type?: string;
+  wake?: WakePolicy;
   started: number;
   logPath: string;
   state: "running" | "done";
@@ -1408,6 +1435,7 @@ interface BgStatusDetails {
   cmd?: string;
   name?: string;
   type?: string;
+  wake?: WakePolicy;
   count?: number;
   recovered?: boolean;
 }
@@ -1855,6 +1883,7 @@ export default function (pi: ExtensionAPI) {
       cmd: rec.cmd,
       name: rec.name,
       type: rec.type,
+      wake: rec.wake,
       started: rec.started,
       logPath: rec.logPath,
       state: "done",
@@ -2007,6 +2036,7 @@ export default function (pi: ExtensionAPI) {
           cmd: d.cmd,
           name: d.name,
           type: d.type,
+          wake: d.wake ?? resolveConfig(ctx).defaultWake,
           started: d.started,
           logPath: d.logPath,
           exitedAt: d.exitedAt,
@@ -2041,6 +2071,7 @@ export default function (pi: ExtensionAPI) {
           id: entry.id,
           pid: entry.pid ?? -1,
           cmd: "(started by another session)",
+          wake: "never",
           started: entry.birthtimeMs || Date.now(),
           logPath: entry.logPath,
           ctx,
@@ -2082,18 +2113,18 @@ export default function (pi: ExtensionAPI) {
     name: "bgrun",
     label: "Run in Background",
     description:
-      "Run a long shell command detached in the background. Returns 'started: <job-id>' immediately. " +
-      "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
-      "expected to run >30s or emit >100 lines (tests, builds, linters). Optionally pass `name` for a " +
-      "short human-readable label used in the job id, status output, and wake messages, and `type` to " +
-      "select the project's digest scorecard.",
+      "Run a genuinely asynchronous shell command detached in the background. Returns 'started: <job-id>' immediately. " +
+      "Use this for deployment/CI monitoring, long evals, sustained observability, or work that must continue while the agent does something else—not merely because a command is a test, build, lint, query, or external request. " +
+      "Choose `wake` explicitly when the agent must resume on completion; human toast/widget updates always remain enabled. " +
+      "Optionally pass `name` for a short human-readable label and `type` to select the project's digest scorecard.",
     promptSnippet:
-      "Run a long command detached in the background; get woken on completion",
+      "Run a genuinely asynchronous command detached; choose whether completion should wake the agent",
     promptGuidelines: [
-      "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
-      "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
-      "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard; the vocabulary comes from the project's `.pi/pi-bgrun.json` digest entries.",
-      "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
+      "Default to foreground execution. Use bgrun only for genuinely asynchronous monitoring/concurrency or work known to be long-running; do not infer background execution from command category alone.",
+      "Set wake:'always' when continuation depends on completion (deploy/eval monitors), wake:'failure' when only failure needs attention, or wake:'never' for independent work.",
+      "Give every bgrun job a short name so it is recognizable in status output, the status widget, and notifications.",
+      "When the project's digest config defines `type` entries, pass the matching `type` so a waking job selects the right scorecard.",
+      "After bgrun returns a job id, continue other work; do not poll through model turns.",
       "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search or ctx_execute_file on the log path for whole-log analysis.",
     ],
     parameters: Type.Object({
@@ -2116,9 +2147,26 @@ export default function (pi: ExtensionAPI) {
             "`.pi/pi-bgrun.json`; when the project's digest config defines types, prefer passing the matching one.",
         }),
       ),
+      wake: Type.Optional(
+        Type.Union(
+          ["never", "failure", "always"].map((policy) =>
+            Type.Literal(policy),
+          ),
+          {
+            description:
+              "Whether completion injects a model turn: never, only on failure, or always. " +
+              "When omitted, defaultWake from configuration applies. Human toast/widget updates are always shown.",
+          },
+        ),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { command, name: rawName, type: rawType } = params;
+      const {
+        command,
+        name: rawName,
+        type: rawType,
+        wake: rawWake,
+      } = params;
       if (!command || !command.trim()) {
         throw new Error("bgrun: command is required");
       }
@@ -2126,6 +2174,7 @@ export default function (pi: ExtensionAPI) {
       const type = sanitizeType(rawType);
 
       const cfg = resolveConfig(ctx);
+      const wake = normalizeWakePolicy(rawWake) ?? cfg.defaultWake;
       // Project-local logs are auto-ignored in .git/info/exclude (best-effort)
       // so they never pollute `git status`. Absolute dirs are left untouched.
       if (cfg.jobsDirProjectLocal) ensureGitExcluded(cfg.jobsDir);
@@ -2215,6 +2264,7 @@ export default function (pi: ExtensionAPI) {
           cmd: command,
           name,
           type,
+          wake,
           started: Date.now(),
           logPath,
           child,
@@ -2229,6 +2279,7 @@ export default function (pi: ExtensionAPI) {
           cmd: command,
           name,
           type,
+          wake,
           started: Date.now(),
           logPath,
           state: "running",
@@ -2256,27 +2307,32 @@ export default function (pi: ExtensionAPI) {
             pid: rec.pid,
             cmd: rec.cmd,
             name: rec.name,
+            type: rec.type,
+            wake: rec.wake,
             started: rec.started,
             logPath: rec.logPath,
             state: "done",
             exitCode: -1,
             exitedAt: rec.exitedAt,
           });
-          const namePrefix = rec.name ? `"${rec.name}" ` : "";
-          const wake =
-            `❌ Background job ${namePrefix}\`${id}\` failed to start: ${err.message}\n` +
-            `Command: ${command}`;
-          try {
-            if (rec.ctx.isIdle()) pi.sendUserMessage(wake);
-            else pi.sendUserMessage(wake, { deliverAs: "followUp" });
-          } catch {
+          if (shouldWakeAgent(rec.wake, -1)) {
+            const namePrefix = rec.name ? `"${rec.name}" ` : "";
+            const wakeMessage =
+              `❌ Background job ${namePrefix}\`${id}\` failed to start: ${err.message}\n` +
+              `Command: ${command}`;
             try {
-              pi.sendUserMessage(wake, { deliverAs: "followUp" });
-            } catch (e2) {
-              console.error(
-                `[pi-bgrun] wake failed for job ${id}:`,
-                (e2 as Error).message,
-              );
+              if (rec.ctx.isIdle()) pi.sendUserMessage(wakeMessage);
+              else
+                pi.sendUserMessage(wakeMessage, { deliverAs: "followUp" });
+            } catch {
+              try {
+                pi.sendUserMessage(wakeMessage, { deliverAs: "followUp" });
+              } catch (e2) {
+                console.error(
+                  `[pi-bgrun] wake failed for job ${id}:`,
+                  (e2 as Error).message,
+                );
+              }
             }
           }
           if (rec.ctx.hasUI) {
@@ -2335,6 +2391,7 @@ export default function (pi: ExtensionAPI) {
             cmd: rec.cmd,
             name: rec.name,
             type: rec.type,
+            wake: rec.wake,
             started: rec.started,
             logPath,
             state: "done",
@@ -2353,8 +2410,10 @@ export default function (pi: ExtensionAPI) {
           // that fails, times out, or prints
           // nothing appends nothing, and the exit code / universal part above are
           // never affected.
+          const willWake = shouldWakeAgent(rec.wake, exitCode);
           let digestBlock: { label: string; text: string } | undefined;
-          try {
+          if (willWake) {
+            try {
             // First matching entry wins, in config order. The label defaults to
             // the entry's label, the entry's type, a matched `match.name`, then
             // the entry's preset id (or "command").
@@ -2399,38 +2458,43 @@ export default function (pi: ExtensionAPI) {
                 }
               }
             }
-          } catch (e) {
-            // Silent-fail: a broken digest never breaks a wake (ground rule 3).
-            console.error(
-              `[pi-bgrun] digest failed for job ${id}:`,
-              (e as Error).message,
-            );
+            } catch (e) {
+              // Silent-fail: a broken digest never breaks a wake (ground rule 3).
+              console.error(
+                `[pi-bgrun] digest failed for job ${id}:`,
+                (e as Error).message,
+              );
+            }
           }
 
-          // Wake the agent.
-          const namePrefix = rec.name ? `"${rec.name}" ` : "";
-          let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
-          wake += `Command: ${command}\n`;
-          wake += `Stats: ${statsParts.join(", ")}\n`;
-          if (lastLine) wake += `Last output: ${lastLine}\n`;
-          if (digestBlock) {
-            wake += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
-          }
-          wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
-          try {
-            if (rec.ctx.isIdle()) {
-              pi.sendUserMessage(wake);
-            } else {
-              pi.sendUserMessage(wake, { deliverAs: "followUp" });
+          // Wake the agent only when this job's explicit/configured policy
+          // requires a model turn. Toast and widget updates below are always
+          // delivered independently.
+          if (willWake) {
+            const namePrefix = rec.name ? `"${rec.name}" ` : "";
+            let wakeMessage = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
+            wakeMessage += `Command: ${command}\n`;
+            wakeMessage += `Stats: ${statsParts.join(", ")}\n`;
+            if (lastLine) wakeMessage += `Last output: ${lastLine}\n`;
+            if (digestBlock) {
+              wakeMessage += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
             }
-          } catch {
+            wakeMessage += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
             try {
-              pi.sendUserMessage(wake, { deliverAs: "followUp" });
-            } catch (e2) {
-              console.error(
-                `[pi-bgrun] wake failed for job ${id}:`,
-                (e2 as Error).message,
-              );
+              if (rec.ctx.isIdle()) {
+                pi.sendUserMessage(wakeMessage);
+              } else {
+                pi.sendUserMessage(wakeMessage, { deliverAs: "followUp" });
+              }
+            } catch {
+              try {
+                pi.sendUserMessage(wakeMessage, { deliverAs: "followUp" });
+              } catch (e2) {
+                console.error(
+                  `[pi-bgrun] wake failed for job ${id}:`,
+                  (e2 as Error).message,
+                );
+              }
             }
           }
 
@@ -2455,13 +2519,18 @@ export default function (pi: ExtensionAPI) {
         const startedLines = [`started: ${id}`];
         if (name) startedLines.push(`  name: ${name}`);
         if (type) startedLines.push(`  type: ${type}`);
-        startedLines.push(
-          `  log: ${logPath}`,
-          `  You'll be woken automatically when it finishes.`,
-        );
+        startedLines.push(`  wake: ${wake}`, `  log: ${logPath}`);
+        if (wake === "always")
+          startedLines.push("  You'll be woken when it finishes.");
+        else if (wake === "failure")
+          startedLines.push("  You'll be woken only if it fails.");
+        else
+          startedLines.push(
+            "  Completion will update the toast/widget without waking the agent.",
+          );
         return {
           content: [{ type: "text", text: startedLines.join("\n") }],
-          details: { id, name, type, logPath, pid: childPid },
+          details: { id, name, type, wake, logPath, pid: childPid },
         };
       } finally {
         if (logFd !== undefined) closeSync(logFd);
@@ -3211,6 +3280,7 @@ export default function (pi: ExtensionAPI) {
         const lines = [`${id}: ${state}${exitStr}`];
         if (rec.name) lines.push(`  name: ${rec.name}`);
         if (rec.type) lines.push(`  type: ${rec.type}`);
+        lines.push(`  wake: ${rec.wake}`);
         lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
         return {
           content: [{ type: "text", text: lines.join("\n") }],
@@ -3221,6 +3291,7 @@ export default function (pi: ExtensionAPI) {
             cmd: rec.cmd,
             name: rec.name,
             type: rec.type,
+            wake: rec.wake,
             recovered: false,
           },
         };
