@@ -41,7 +41,7 @@ host-supplied names:
 | `$AGENT_DIR` — the user-level agent directory | `~/.pi/agent` | `~/.omp/agent` (profile-aware) |
 | `$CONFIG_DIR` — the project config directory | `.pi` | `.omp` |
 
-The host also decides two presentation details, both handled internally:
+The host also decides several details, all handled internally:
 
 - **Tool visibility.** `omp` mounts any tool that does not opt out as an
   `xd://` device (`write xd://bgrun {…}`); bgrun declares `loadMode: "essential"`
@@ -80,8 +80,8 @@ The host also decides two presentation details, both handled internally:
 | ------ | --------- |
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
 | `bgstatus` | Show job status. With an id: any job's state + exit code — a `bg_N` id (the host's own background job on omp) is answered with its state, where its output went and how to cancel it, rather than "not found". Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`), then the host's background jobs under their own heading. Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
-| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB), **condensed for context**: ANSI escapes stripped, repeated lines collapsed (a run of 3+ folds into one line carrying its `[xN]` count; a pair is kept as two lines — a fold needs its count to stay legible), long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). On omp, a native `bg_N` job's spilled output is read the same way, stamped as the host's file. |
-| `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB; on omp, a native `bg_N` job's spilled output is searchable the same way): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
+| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB + 4 KiB of wrapper overhead), **condensed for context**: ANSI escapes stripped, repeated lines collapsed (a run of 3+ folds into one line carrying its `[xN]` count; a pair is kept as two lines — a fold needs its count to stay legible), long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). On omp, a native `bg_N` job's spilled output is read the same way, stamped as the host's file. |
+| `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB + 4 KiB of wrapper overhead; on omp, a native `bg_N` job's spilled output is searchable the same way): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days); `days` must be a positive number (`days: 0` is rejected rather than purging everything). Never removes a running job's log. |
 
 ## Slash commands
@@ -275,7 +275,8 @@ default **64 MiB**, `0` = unlimited):
   job as "unknown", not "no failures".
 - Reading a capped log stays readable-whole: the widest `bytes` window is the
   ceiling **plus 4 KiB** (not the ceiling itself, which a capped log always
-  exceeds by its notices and marker), so `bytes: 67108864` still spans the whole
+  exceeds by its notices and marker), so `bytes: 67112960` (ceiling + the wrapper's
+  4 KiB) is what spans the whole
   kept log. Windows are additionally limited to their last 500 000 lines —
   materializing a 64 MiB window of one-character lines would cost gigabytes of
   strings — and when that line bound trims a window, `bgtail`/`bggrep` say so in

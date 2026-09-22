@@ -7431,6 +7431,30 @@ interface NativeSnapshotItem {
   startTime: number;
 }
 
+/**
+ * A fake session manager with the artifact surface omp exposes: an artifacts
+ * directory, a resolver, and the *receiver rule* the real class methods have
+ * (they read `this.#artifactManagerForSession()`, so a detached call throws —
+ * see the detached-`on` guard for the same reason).
+ */
+function artifactsManager(
+  artifactsDir: string,
+  byId: Record<string, string>,
+): Record<string, unknown> {
+  const manager: Record<string, unknown> = {
+    getEntries: () => [],
+    getArtifactsDir(this: unknown) {
+      if (this !== manager) throw new TypeError("detached getArtifactsDir");
+      return artifactsDir;
+    },
+    async getArtifactPath(this: unknown, id: string) {
+      if (this !== manager) throw new TypeError("detached getArtifactPath");
+      return byId[id] ?? null;
+    },
+  };
+  return manager;
+}
+
 function nativeSnapshotCtxFields(
   running: NativeSnapshotItem[],
   recent: NativeSnapshotItem[] = [],
@@ -7519,6 +7543,22 @@ test("hosts without the native snapshot API are unaffected (upstream pi)", async
       .get("bgstatus")!
       .execute("c1", {}, undefined, undefined, h.ctx);
     assert.equal(list.content[0].text, "(no background jobs)");
+
+    // A `bg_N`-shaped id on this host is just an unknown bgrun id: there is no
+    // job manager to explain, no artifact to read back, and no `hub` to cancel
+    // it with. Telling the agent otherwise would be four false clauses and one
+    // instruction it cannot follow.
+    const hint = (
+      await h.tools
+        .get("bggrep")!
+        .execute("c2", { id: "bg_5", pattern: "x" }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.match(hint, /bgrun job ids look like/);
+    assert.ok(!hint.includes("hub cancel"), "no hub remedy on a host without hub");
+    assert.ok(
+      !hint.includes("native background job"),
+      "no job manager is described where none exists",
+    );
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
@@ -7580,15 +7620,17 @@ test("bgtail/bggrep: an unresolvable id names the expected shape and spots a hos
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
   try {
-    const h = makeFakePi();
+    // A host that *has* a native job manager: a host-minted id says what it is,
+    // where its output went, and how the host kills it.
+    const h = makeFakePi({ ctxFields: nativeSnapshotCtxFields([]) });
     await loadExtension(h.pi);
     const bggrep = h.tools.get("bggrep")!;
 
-    // A host-minted id: say what it is and where its output went.
     const native = await bggrep.execute("c1", { id: "bg_5" }, undefined, undefined, h.ctx);
     const nativeText = native.content[0].text as string;
     assert.match(nativeText, /No log found for job bg_5/);
     assert.match(nativeText, /native background job/);
+    assert.match(nativeText, /hub cancel ids:\["bg_5"\]/, "the host's own kill path");
     assert.match(nativeText, /<name>-<epoch>-<pid>/, "the bgrun id shape is named");
 
     // A bgrun-shaped id that simply does not exist: name the shape, but do not
@@ -7645,13 +7687,32 @@ test("native jobs: the panel refreshes on the host's own start and finish events
     });
     assert.equal(widgetCalls.at(-1), undefined, "panel cleared when the host's job ends");
 
-    // An unrelated message must not rebuild the panel.
+    // An unrelated message must not rebuild the panel. The host's job set is
+    // changed first, so only the async-result filter can prevent the rebuild —
+    // otherwise the refresh gate (which sees no change) would mask a missing
+    // filter and the assertion could never fail.
+    snapshotRunning = [NATIVE_RUNNING];
     const before = widgetCalls.length;
     await h.fireEvent("message_start", {
       type: "message_start",
       message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
     });
     assert.equal(widgetCalls.length, before, "other messages are ignored");
+
+    // The gate itself: `tool_execution_end` fires on every tool call, so a
+    // rebuild per call is what it exists to prevent. One call settles the panel
+    // against the current job set; the next one must not repaint.
+    await h.fireEvent("tool_execution_end", { type: "tool_execution_end", toolName: "bash" });
+    const settled = widgetCalls.length;
+    await h.fireEvent("tool_execution_end", { type: "tool_execution_end", toolName: "bash" });
+    assert.equal(
+      widgetCalls.length,
+      settled,
+      "an unchanged host job set does not repaint the panel",
+    );
+    snapshotRunning = [NATIVE_RUNNING, { ...NATIVE_RUNNING, id: "bg_10" }];
+    await h.fireEvent("tool_execution_end", { type: "tool_execution_end", toolName: "bash" });
+    assert.ok(widgetCalls.length > settled, "a changed job set does repaint");
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
@@ -7734,17 +7795,19 @@ test("native jobs: a delivered result makes the host's spilled output readable",
   const artifacts = mkTmp("pi-bgrun-artifacts-");
   process.env.PI_BGRUN_DIR = dir;
   try {
-    // Stands in for the host's own spill of a truncated bash job's full output.
+    // Stands in for the host's own spill of a truncated bash job's full output,
+    // inside the session's artifact directory the way omp lays it out
+    // (`<artifacts dir>/<id>.<toolType>.log`).
     const spilled = join(artifacts, "3.bash.log");
     writeFileSync(spilled, "building...\nFAIL: TestFoo\n3 specs, 1 failure\n");
+    // A file that exists and is readable but is *not* the job's spill: the host
+    // (or a forged delivery) naming it must not be believed.
+    const outside = join(mkTmp("pi-bgrun-outside-"), "secret.txt");
+    writeFileSync(outside, "OUTSIDE-ARTIFACT-CONTENT\n");
     const h = makeFakePi({
       ctxFields: {
         ...nativeSnapshotCtxFields([], [NATIVE_DONE]),
-        sessionManager: {
-          getEntries: () => [],
-          // How an extension turns an artifact id into a path (omp only).
-          getArtifactPath: async (id: string) => (id === "3" ? spilled : null),
-        },
+        sessionManager: artifactsManager(artifacts, { "3": spilled, "4": outside }),
       },
     });
     await loadExtension(h.pi);
@@ -7908,12 +7971,281 @@ test("native jobs: a transcript change re-indexes instead of reporting the old s
     await h.tools
       .get("bgrun")!
       .execute("call-run", { command: "sleep 1", name: "survivor" }, undefined, undefined, h.ctx);
+    // A branch lands on a *different* transcript, which is what makes this
+    // assertion about the handler rather than about the state it already had:
+    // only re-indexing can turn the branched-to job into the reported outcome.
+    entries = [
+      {
+        type: "custom",
+        customType: "bgrun-job",
+        data: {
+          id: "branched-job-2-2",
+          pid: 2,
+          cmd: "echo branched",
+          started: Date.now(),
+          logPath: join(dir, "branched-job-2-2.log"),
+          state: "done",
+          exitCode: 1,
+          exitedAt: Date.now(),
+        },
+      },
+    ];
     await h.fireEvent("session_branch", { type: "session_branch" });
     const listed = await h.tools.get("bgstatus")!.execute("c1", {}, undefined, undefined, h.ctx);
     assert.match(listed.content[0].text as string, /survivor/, "a running job is not forgotten");
-    assert.equal(statuses.at(-1), "⏳ 1 running");
+    // The branched-to job is in memory only because the handler re-indexed that
+    // transcript; nothing else could have put it there, and its log was never
+    // written, so the on-disk scan cannot explain its presence either.
+    const done = await h.tools
+      .get("bgstatus")!
+      .execute("c2", { includeDone: true }, undefined, undefined, h.ctx);
+    assert.match(
+      done.content[0].text as string,
+      /branched-job-2-2/,
+      "the branched-to transcript's jobs are indexed",
+    );
 
     await waitForWakes(h.wakes, 1);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: a recycled bg_N id does not serve the previous job's artifact", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  const artifacts = mkTmp("pi-bgrun-artifacts-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const oldSpill = join(artifacts, "3.bash.log");
+    writeFileSync(oldSpill, "OLD JOB OUTPUT: FAIL: previous\n");
+    // The host's view of `bg_1`, which changes under us: first the job that
+    // spilled the artifact, then — after its row was evicted and the id minted
+    // again — a completely different job. The artifact file stays on disk.
+    const oldJob: NativeSnapshotItem = {
+      id: "bg_1",
+      type: "bash",
+      status: "completed",
+      label: "make test",
+      startTime: 1_700_000_000_000,
+    };
+    const recycled: NativeSnapshotItem = {
+      id: "bg_1",
+      type: "bash",
+      status: "running",
+      label: "seq 1 30000",
+      startTime: 1_700_000_999_000,
+    };
+    let running: NativeSnapshotItem[] = [];
+    let recent: NativeSnapshotItem[] = [oldJob];
+    const h = makeFakePi({
+      ctxFields: {
+        getAsyncJobSnapshot: () => ({ running, recent }),
+        sessionManager: artifactsManager(artifacts, { "3": oldSpill }),
+      },
+    });
+    await loadExtension(h.pi);
+
+    // The delivery for the job that really did spill artifact 3…
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done",
+        details: { jobs: [{ jobId: "bg_1", meta: { truncation: { artifactId: "3" } } }] },
+      },
+    });
+
+    // …and then the id comes back as a different job.
+    running = [recycled];
+    recent = [];
+
+    // …is not readable as the *new* bg_1's output: the id now belongs to another
+    // job, and answering with the previous job's log would be a fabrication.
+    const tail = await h.tools
+      .get("bgtail")!
+      .execute("c1", { id: "bg_1" }, undefined, undefined, h.ctx);
+    const text = tail.content[0].text as string;
+    assert.ok(!text.includes("OLD JOB OUTPUT"), "the stale artifact is not served");
+    assert.match(text, /native background job/, "the id still explains itself");
+
+    const status = await h.tools
+      .get("bgstatus")!
+      .execute("c2", { id: "bg_1" }, undefined, undefined, h.ctx);
+    assert.ok(
+      !(status.content[0].text as string).includes(oldSpill),
+      "and bgstatus does not advertise the stale path",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: a remapped artifact resets the delta tail instead of hiding its head", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  const artifacts = mkTmp("pi-bgrun-artifacts-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const first = join(artifacts, "3.bash.log");
+    writeFileSync(first, "SAME FIRST LINE\nold line 2\nold line 3\n");
+    // Same job (same start time) but its full output now resolves elsewhere —
+    // e.g. a re-delivery after the host spilled a second time. Without the path
+    // in the bookmark, the matching first line plus a non-shrinking size read as
+    // "the same log with 1 new line", silently dropping this file's head.
+    const second = join(artifacts, "4.bash.log");
+    writeFileSync(second, "SAME FIRST LINE\nNEW HEAD 2\nNEW HEAD 3\nNEW HEAD 4\n");
+    const job: NativeSnapshotItem = {
+      id: "bg_7",
+      type: "bash",
+      status: "completed",
+      label: "make test",
+      startTime: 1_700_000_000_000,
+    };
+    const h = makeFakePi({
+      ctxFields: {
+        ...nativeSnapshotCtxFields([], [job]),
+        sessionManager: artifactsManager(artifacts, { "3": first, "4": second }),
+      },
+    });
+    await loadExtension(h.pi);
+    const deliver = async (artifactId: string) => {
+      await h.fireEvent("message_start", {
+        type: "message_start",
+        message: {
+          role: "custom",
+          customType: "async-result",
+          content: "done",
+          details: { jobs: [{ jobId: "bg_7", meta: { truncation: { artifactId } } }] },
+        },
+      });
+    };
+    const bgtail = h.tools.get("bgtail")!;
+
+    await deliver("3");
+    assert.match(
+      (await bgtail.execute("c1", { id: "bg_7" }, undefined, undefined, h.ctx)).content[0].text as string,
+      /old line 3/,
+    );
+
+    await deliver("4");
+    const after = (
+      await bgtail.execute("c2", { id: "bg_7" }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.match(after, /log path changed since last read/, "a new file is not a delta");
+    assert.match(after, /NEW HEAD 3/, "and its head is not hidden");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: a hostile label or id cannot reach the panel, status line or tool output", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // A host string with the tricks that matter: escape sequences that would set
+    // a window title, plant a hyperlink, or clear the screen, plus a newline that
+    // would forge an extra panel row. oh-my-pi takes a bash job's label verbatim
+    // from the command line, so this is reachable without a hostile host.
+    const esc = "\u001b";
+    const hostile = `${esc}[2J${esc}]0;pwned\u0007label\nsecond row ${esc}]8;;http://evil.example/\u0007x`;
+    const h = makeFakePi({
+      ctxFields: nativeSnapshotCtxFields([
+        { id: `bg_1${esc}[31m`, type: "bash", status: "running", label: hostile, startTime: Date.now() },
+      ]),
+    });
+    h.ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    h.ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+
+    const panel = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    const flat = panel.join("\n");
+    assert.ok(!flat.includes(esc), "no escape sequence reaches the widget");
+    assert.ok(!flat.includes("\u0007"), "no BEL reaches the widget");
+    assert.equal(
+      panel.filter((l) => l.startsWith("📊")).length,
+      1,
+      "the header row cannot be forged",
+    );
+    assert.equal(
+      panel.length,
+      2,
+      "header + one job row: a newline in a label cannot forge a row of its own",
+    );
+    assert.ok(
+      panel[1].includes("second row") && panel[1].includes("label"),
+      "the label stays on its own row, newline flattened to a space",
+    );
+    assert.ok(statuses.at(-1)!.indexOf(esc) === -1, "nor the status line");
+
+    // The same data reaches the model through tool output; it must be inert there
+    // too (an escape-laden line is also how instructions hide in a transcript).
+    const listed = await h.tools
+      .get("bgstatus")!
+      .execute("c1", { includeDone: true }, undefined, undefined, h.ctx);
+    const rows = listed.content[0].text as string;
+    assert.ok(!rows.includes(esc) && !rows.includes("\u0007"), "tool output is inert");
+    assert.ok(rows.includes("label"), "and still carries the readable text");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: the stale poller uses the host's managed timers where they exist", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // An unsupervised running job (reconstructed from the transcript: no child
+    // handle) is what starts the poller. Its pid is this test process, so it is
+    // genuinely alive and the revalidation leaves it running.
+    const logPath = join(dir, "rebuilt-job-1-1.log");
+    writeFileSync(logPath, "still working\n");
+    const scheduled: { ms: number }[] = [];
+    const cleared: unknown[] = [];
+    const h = makeFakePi({
+      priorEntries: [
+        {
+          type: "custom",
+          customType: "bgrun-job",
+          data: {
+            id: "rebuilt-job-1-1",
+            pid: process.pid,
+            cmd: "make test",
+            started: Date.now(),
+            logPath,
+            state: "running",
+          },
+        },
+      ],
+      ctxFields: {
+        setInterval(_cb: () => void, ms: number) {
+          scheduled.push({ ms });
+          return "managed-handle";
+        },
+        clearTimer(timer: unknown) {
+          cleared.push(timer);
+        },
+      },
+    });
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+    assert.equal(scheduled.length, 1, "the poller is scheduled through the host");
+    assert.equal(scheduled[0].ms, 30_000, "at the stale-check interval");
+
+    await h.fireSessionShutdown();
+    assert.deepEqual(cleared, ["managed-handle"], "and cleared on shutdown");
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
