@@ -8765,3 +8765,63 @@ test("bgkill: a live pid with no process group of that id is refused, not signal
     void dir;
   }
 });
+
+test("native jobs: an artifact the host advertises but we cannot use is logged, not swallowed", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  const artifacts = mkTmp("pi-bgrun-artifacts-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const good = join(artifacts, "3.bash.log");
+    writeFileSync(good, "in-dir spill\n");
+    const outside = join(mkTmp("pi-bgrun-outside-"), "elsewhere.txt");
+    writeFileSync(outside, "not a spill\n");
+    // host: "omp" gives the fake a logger, which is where diagnostics go there.
+    const h = makeFakePi({
+      host: "omp",
+      ctxFields: {
+        ...nativeSnapshotCtxFields([], [NATIVE_DONE]),
+        sessionManager: artifactsManager(artifacts, { "3": good, "4": outside }),
+      },
+    });
+    await loadExtension(h.pi);
+    const deliver = async (artifactId: string) => {
+      await h.fireEvent("message_start", {
+        type: "message_start",
+        message: {
+          role: "custom",
+          customType: "async-result",
+          content: "done",
+          details: { jobs: [{ jobId: "bg_8", meta: { truncation: { artifactId } } }] },
+        },
+      });
+    };
+
+    // A contained artifact is ordinary enrichment: nothing to report.
+    await deliver("3");
+    assert.equal(
+      h.hostLogs.filter((m) => m.includes("native job output not readable")).length,
+      0,
+      "a usable artifact is not a diagnostic",
+    );
+
+    // A path outside the artifact dir is refused — and now leaves a trace, so a
+    // host upgrade that changes the layout cannot make the bridge silently stop
+    // working with nothing anywhere to grep.
+    await deliver("4");
+    const gaps = h.hostLogs.filter((m) => m.includes("native job output not readable"));
+    assert.equal(gaps.length, 1, "the refusal is logged once");
+    assert.match(gaps[0], /outside the session artifact dir/);
+
+    // Repeating the same cause stays quiet: diagnostics must not become noise.
+    await deliver("4");
+    assert.equal(
+      h.hostLogs.filter((m) => m.includes("native job output not readable")).length,
+      1,
+      "one line per distinct reason",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }
+});

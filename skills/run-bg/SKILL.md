@@ -65,8 +65,10 @@ resolve a `bg_N` id (see below) rather than dead-ending on it.
   artifact; `bgtail bg_3` / `bggrep bg_3` read that back through the same bounded
   readers used for bgrun logs (the read is stamped as the host's file, not ours).
   If nothing was spilled, the id says so — it never invents a path.
-- They belong to the host: to kill one, `hub cancel ids:["bg_3"]` (see `hub jobs`,
-  or `/jobs` for a human). There is no bgrun tool that touches them.
+- They belong to the host: to kill one, use oh-my-pi's own `hub cancel ids:["bg_3"]`
+  (see `hub jobs`, or `/jobs` for a human). `bgkill` refuses them for that reason,
+  and the two namespaces keep separate lists and separate kill switches
+  (`bgstatus`/`bgkill` for bgrun's, `hub jobs`/`hub cancel` for the host's).
 
 Which to use:
 

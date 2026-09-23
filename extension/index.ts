@@ -276,8 +276,8 @@ export function unknownJobHint(id: string, hostHasNativeJobs = true): string {
     `"${id}" looks like a native background job (the host backgrounds long bash calls itself). ` +
     "Its output is delivered automatically as an async result; when the host spilled it, " +
     `bgtail ${id} reads it back from the artifact. ` +
-    `The host owns it, so cancel it with \`hub cancel ids:["${id}"]\` and list it with \`hub jobs\` ` +
-    "(humans: `/jobs`). " +
+    `The host owns it: cancel it with oh-my-pi's own \`hub cancel ids:["${id}"]\`, and list it with ` +
+    "`hub jobs` (humans: `/jobs`). " +
     bgrunShape
   );
 }
@@ -3471,6 +3471,19 @@ export default function (pi: ExtensionAPI) {
     if (oldest !== undefined && oldest !== id) tailBookmarks.delete(oldest);
   }
 
+  // Reasons a delivery advertised an artifact we would not record, logged once
+  // each (bounded like the digest diagnostics). The bridge refuses anything it
+  // cannot verify, which is the safe direction — but "safe" must not also mean
+  // "silent": if a host upgrade changes the artifact layout or the delivery
+  // shape, the feature stops working with no other trace anywhere.
+  const nativeOutputGaps = new Set<string>();
+  const NATIVE_OUTPUT_GAP_CAP = 3;
+  function noteNativeOutputGap(reason: string): void {
+    if (nativeOutputGaps.has(reason) || nativeOutputGaps.size >= NATIVE_OUTPUT_GAP_CAP) return;
+    nativeOutputGaps.add(reason);
+    logWarn(`[pi-bgrun] native job output not readable: ${reason}`);
+  }
+
   /**
    * Learn where a native job's full output landed, from the delivery the host
    * just made. Best-effort by design: a small output that was delivered inline
@@ -3504,7 +3517,10 @@ export default function (pi: ExtensionAPI) {
     // artifact store would let a later `bgtail <id>` read an unrelated file and
     // be told it is that job's output.
     const artifactsDir = manager?.getArtifactsDir?.();
-    if (typeof artifactsDir !== "string" || !artifactsDir) return;
+    if (typeof artifactsDir !== "string" || !artifactsDir) {
+      noteNativeOutputGap("the host reported no artifact directory");
+      return;
+    }
     const root = safeRealpath(artifactsDir) ?? artifactsDir;
     for (const entry of delivered) {
       if (!entry || typeof entry !== "object") continue;
@@ -3518,10 +3534,20 @@ export default function (pi: ExtensionAPI) {
       if (typeof artifactId !== "string" || !isSafeJobId(artifactId)) continue;
       try {
         const path = await resolvePath.call(manager, artifactId);
-        if (typeof path !== "string" || !path) continue;
+        if (typeof path !== "string" || !path) {
+          noteNativeOutputGap(`artifact ${artifactId} did not resolve to a path`);
+          continue;
+        }
         // existsSync: a resolved-but-missing path is worse than no path, because
         // every later read would report a broken log rather than the real story.
-        if (!existsSync(path) || !isInsideDir(root, path)) continue;
+        if (!existsSync(path)) {
+          noteNativeOutputGap(`artifact ${artifactId} resolved to a missing path`);
+          continue;
+        }
+        if (!isInsideDir(root, path)) {
+          noteNativeOutputGap(`artifact ${artifactId} resolved outside the session artifact dir`);
+          continue;
+        }
         // Bound like the tail bookmarks: a long session that retires many native
         // jobs must not grow this map forever for ids nobody will read.
         if (nativeOutputs.size >= NATIVE_OUTPUT_CAP && !nativeOutputs.has(jobId)) {
@@ -4162,7 +4188,7 @@ export default function (pi: ExtensionAPI) {
                 `${displayId}: ${state} — native background job (${native?.type ?? "bash"}), not a bgrun job.\n` +
                 (native?.label ? `  cmd: ${native.label}\n` : "") +
                 `  output: ${nativeOutput.path} (artifact ${nativeOutput.artifactId} — the host's spill of the full output; bgtail ${displayId} and bggrep ${displayId} read it)\n` +
-                `  cancel: hub cancel ids:["${displayId}"]`,
+                `  cancel: oh-my-pi's \`hub cancel ids:["${displayId}"]\` (the host's own tool)`,
             },
           ],
           details: {
@@ -4191,7 +4217,7 @@ export default function (pi: ExtensionAPI) {
                   (native.label ? `  cmd: ${native.label}\n` : "") +
                   "  output: delivered automatically as an async result (no artifact: the host " +
                   "spills only output it truncated, and only deliveries this session saw resolve)\n" +
-                  `  cancel: hub cancel ids:["${displayId}"]`,
+                  `  cancel: oh-my-pi's \`hub cancel ids:["${displayId}"]\` (the host's own tool)`,
               },
             ],
             details: { id, state: native.status, native: true },
@@ -4302,7 +4328,7 @@ export default function (pi: ExtensionAPI) {
           `  ${job.id}: ${job.status} — ${nativeJobLabel(job)}`,
       );
       sections.push(
-        `native background jobs (host-managed; their output is delivered automatically, and bgtail/bggrep can read it once the host spills it — the host's own list is \`hub jobs\`, humans \`/jobs\`):\n${rows.join("\n")}`,
+        `native background jobs (host-managed; their output is delivered automatically, and bgtail/bggrep can read it once the host spills it — on oh-my-pi the host's own list is \`hub jobs\` for the agent, \`/jobs\` for a human):\n${rows.join("\n")}`,
       );
     }
     if (sections.length === 0) {
@@ -4328,8 +4354,8 @@ export default function (pi: ExtensionAPI) {
       "logs from the shared dir can also appear when finished jobs are included. Host-managed background jobs " +
       "(e.g. oh-my-pi's auto-backgrounded bash calls) are listed too, marked native, with where their output " +
       "goes — they have no log here and are not ours to clean. Note the two job lists are separate: the host's " +
-      "own list (`hub jobs`, or /jobs for a human) covers only its jobs and never bgrun's, so use bgstatus for " +
-      "bgrun work and `hub cancel` / `bgkill` respectively to stop the two kinds.",
+      "own list (oh-my-pi: `hub jobs`, or /jobs for a human) covers only its jobs and never bgrun's, so use bgstatus for " +
+      "bgrun work and oh-my-pi's `hub cancel` / `bgkill` respectively to stop the two kinds.",
     promptSnippet:
       "Check status of background jobs (bgrun jobs plus host-managed ones)",
     parameters: Type.Object({
@@ -4356,7 +4382,8 @@ export default function (pi: ExtensionAPI) {
       "Stop a running bgrun job (SIGTERM by default; force: true for SIGKILL). Signals the job's whole " +
       "process group — the command and anything it started — because the job was spawned detached. Refuses " +
       "when the job already finished (its log stays readable) and when the id is not a bgrun job (a " +
-      "host-managed `bg_N` job belongs to the host: cancel it with `hub cancel`). A job started by another " +
+      "host-managed `bg_N` job belongs to the host: cancel it with oh-my-pi's `hub cancel`). A job started by " +
+      "another " +
       "session needs includeForeign: true. It refuses a pid that cannot be the job's — one that is already " +
       "gone, unusable, or recycled onto an unrelated process — because signalling a stranger is worse than " +
       "failing. It reports the signal it sent, not a guess at the outcome: the authoritative result is the " +
@@ -4416,7 +4443,7 @@ export default function (pi: ExtensionAPI) {
       const native = ctx ? findNativeJob(ctx, id) : undefined;
       const text = native
         ? `"${id}" is a host-managed background job, not a bgrun job — bgrun never signals it. ` +
-          `Cancel it with \`hub cancel ids:["${id}"]\` (the host's own tool).`
+          `Cancel it with \`hub cancel ids:["${id}"]\` (oh-my-pi's own tool).`
         : `No running bgrun job with id ${id}. ${unknownJobHint(id, supportsNativeJobSnapshot(ctx))}`;
       return {
         content: [{ type: "text", text }],

@@ -168,8 +168,8 @@ look like `bg_1`, they have no log here, and they are cancelled when the session
 is switched or replaced. The panel tags them `native` and `bgstatus` lists them
 under their own heading, so one glance (or one call) covers all background work
 in the session, and an id from either namespace explains itself — `bggrep bg_5`
-names what `bg_5` is, where its output went, and how to kill it (`hub cancel
-ids:["bg_5"]`, the host's own tool), instead of a bare "no log found".
+names what `bg_5` is, where its output went, and how to kill it (oh-my-pi's own
+`hub cancel ids:["bg_5"]`), instead of a bare "no log found".
 
 When the host truncated a native job's output it spills the full text to a
 session artifact, and the delivery advertises the id. bgrun resolves it, so
