@@ -85,6 +85,7 @@ Which to use:
 | Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing) |
 | Grep   | `bggrep(<job-id>, "pattern", context?)` — line-numbered matches, capped and condensed; default pattern = generic failure signatures (override when you know the format) |
 | Clean  | `bgclean()` for this session's old logs; `bgclean all` to sweep every session's (default 7-day retention) |
+| Kill   | `bgkill(<job-id>)` — SIGTERM to the job's process group; `force: true` for SIGKILL. Refuses finished ids, non-bgrun ids, and another session's job unless `includeForeign: true` |
 
 ## Workflow
 
@@ -229,4 +230,4 @@ that expensive rather than merely rude. Aggregate, then cap what you print:
   pass covers the current project's jobs dir AND the machine-global
   `~/.pi-bgrun/jobs`; an explicit absolute `jobsDir` is swept alone. Retention
   is `cleanupDays` (default 7, configurable).
-- To stop a running job, use `bash` with `kill -- -<pid>` (process group — required because the child is spawned detached). The pid is the last `--`-separated segment of the job id; it is not shown as a separate field in `bgstatus` output. There is no `bgkill` tool.
+- To stop a running job, call `bgkill` with its id: `SIGTERM` to the job's **process group** (required because the child is spawned detached), or `force: true` for `SIGKILL` when it ignores that. It refuses an id that already finished, one that is not a bgrun job, and another session's job unless you pass `includeForeign: true` — the same session-scoped default `bgclean` uses. The authoritative outcome still arrives as the wake (a foreign job's is picked up by the stale-check). By hand: `bash` with `kill -- -<pid>`; the pid is the last `--`-separated segment of the job id.

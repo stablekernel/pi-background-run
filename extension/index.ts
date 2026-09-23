@@ -737,6 +737,34 @@ function isInsideDir(dir: string, target: string): boolean {
 }
 
 /**
+ * Signal a whole process group by leader pid. bgrun spawns detached, so the job's
+ * wrapper leads its own group and `-pid` is what reaches the command *and* the
+ * children it started; a bare pid kill would leave a compiler or test binary
+ * running. Process groups are POSIX-only, so a failing negative-pid kill falls
+ * back to the single pid (the same two-step the digest runner's closure uses).
+ *
+ * Returns the failure code (`ESRCH` for "already gone") or undefined on success.
+ */
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): string | undefined {
+  try {
+    process.kill(-pid, signal);
+    return undefined;
+  } catch (err) {
+    const groupCode = (err as NodeJS.ErrnoException).code;
+    try {
+      process.kill(pid, signal);
+      return undefined;
+    } catch (fallbackErr) {
+      const code = (fallbackErr as NodeJS.ErrnoException).code;
+      // ESRCH from either attempt means the process is gone, which is not an
+      // error for a kill: the job is already stopped.
+      if (code === "ESRCH" || groupCode === "ESRCH") return "ESRCH";
+      return code ?? (fallbackErr as Error).message;
+    }
+  }
+}
+
+/**
  * Every string this extension puts on a terminal-interpreted surface (widget
  * panel, status line, toast, tool output) passes through here first: C0/C1
  * control bytes become spaces, so a value can neither forge extra panel rows nor
@@ -4232,7 +4260,9 @@ export default function (pi: ExtensionAPI) {
       "them). Other sessions' running jobs are listed only when adoptForeignJobs is enabled; finished foreign " +
       "logs from the shared dir can also appear when finished jobs are included. Host-managed background jobs " +
       "(e.g. oh-my-pi's auto-backgrounded bash calls) are listed too, marked native, with where their output " +
-      "goes — they have no log here and are not ours to clean.",
+      "goes — they have no log here and are not ours to clean. Note the two job lists are separate: the host's " +
+      "own list (`hub jobs`, or /jobs for a human) covers only its jobs and never bgrun's, so use bgstatus for " +
+      "bgrun work and `hub cancel` / `bgkill` respectively to stop the two kinds.",
     promptSnippet:
       "Check status of background jobs (bgrun jobs plus host-managed ones)",
     parameters: Type.Object({
@@ -4250,6 +4280,176 @@ export default function (pi: ExtensionAPI) {
       return bgstatusCore(params, ctx);
     },
   });
+
+  pi.registerTool({
+    ...ESSENTIAL_TOOL,
+    name: "bgkill",
+    label: "Kill Background Job",
+    description:
+      "Stop a running bgrun job (SIGTERM by default; force: true for SIGKILL). Signals the job's whole " +
+      "process group — the command and anything it started — because the job was spawned detached. Refuses " +
+      "when the job already finished (its log stays readable) and when the id is not a bgrun job (a " +
+      "host-managed `bg_N` job belongs to the host: cancel it with `hub cancel`). A job started by another " +
+      "session needs includeForeign: true. Reports whether the process is still alive after the signal; the " +
+      "authoritative outcome is the wake that follows (or the stale-check, for a foreign job).",
+    promptSnippet: "Stop a running bgrun job",
+    parameters: Type.Object({
+      id: Type.String({
+        description: "Job id (from bgrun's 'started: <id>' response, or bgstatus)",
+      }),
+      force: Type.Optional(
+        Type.Boolean({
+          description: "Send SIGKILL instead of SIGTERM (for a process that ignores the polite signal)",
+        }),
+      ),
+      includeForeign: Type.Optional(
+        Type.Boolean({
+          description:
+            "Allow stopping a job another session started (an adopted job); refused by default",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return bgkillCore(params, ctx);
+    },
+  });
+
+  // ── bgkill: stop a running job ────────────────────────────────────────────
+  //
+  // The one destructive verb over a job. The child is spawned detached, so it
+  // leads its own process group: signalling the *group* is what stops the
+  // command's children too (a bare pid kill leaves a compiler or test binary
+  // running). Before signalling, the job is resolved and its state checked, so
+  // "killed" is never reported for something that had already finished — and a
+  // job another session owns needs an explicit opt-in, matching bgclean's
+  // session-scoped default.
+
+  async function bgkillCore(
+    params: { id: string; includeForeign?: boolean; force?: boolean },
+    ctx?: ExtensionContext,
+  ): Promise<{
+    content: { type: "text"; text: string }[];
+    details: Record<string, unknown>;
+    isError?: boolean;
+  }> {
+    const { id, includeForeign = false, force = false } = params;
+    validateJobId(id, "bgkill");
+    const signal = force ? "SIGKILL" : "SIGTERM";
+    const cfg = resolveConfig(ctx);
+    const rec = jobs.get(id);
+    const scanned = rec
+      ? undefined
+      : scanJobsDir(cfg.jobsDir).find((entry) => entry.id === id);
+
+    if (!rec && !scanned) {
+      // A native id is a real answer, and the one case where the kill belongs to
+      // the host rather than to us.
+      const native = ctx ? findNativeJob(ctx, id) : undefined;
+      const text = native
+        ? `"${id}" is a host-managed background job, not a bgrun job — bgrun never signals it. ` +
+          `Cancel it with \`hub cancel ids:["${sanitizeHostText(id, 64)}"]\` (the host's own tool).`
+        : `No running bgrun job with id ${id}. ${unknownJobHint(id, supportsNativeJobSnapshot(ctx))}`;
+      return {
+        content: [{ type: "text", text }],
+        details: { id, state: "unknown", native: native !== undefined },
+        isError: true,
+      };
+    }
+
+    // Only a record we adopted from the jobs dir is foreign: `adopted` is unset
+    // (not false) on our own records, so it cannot be defaulted with `??`.
+    const adopted = rec ? rec.adopted === true : true;
+    const pid = rec && rec.pid > 0 ? rec.pid : (pidFromId(id) ?? -1);
+    const exit = rec?.exitCode ?? scanned?.exit ?? null;
+
+    if (exit !== null && exit !== undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${id} already finished (exit=${exit}) — nothing to kill. Its log is still on disk; \`bgtail ${id}\` reads it.`,
+          },
+        ],
+        details: { id, state: "done", exitCode: exit },
+        isError: true,
+      };
+    }
+    if (adopted && !includeForeign) {
+      const text =
+        `${id} was not started by this session (adopted from the jobs dir), so bgkill leaves it alone. ` +
+        "Pass includeForeign: true if you really mean to stop another session's job.";
+      return {
+        content: [{ type: "text", text }],
+        details: { id, state: "foreign", adopted: true },
+        isError: true,
+      };
+    }
+    if (pid <= 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${id} has no recorded pid (its wrapper never wrote one, or the id is not a bgrun id) — kill it by hand if a process is still attached.`,
+          },
+        ],
+        details: { id, state: "nopid" },
+        isError: true,
+      };
+    }
+    if (!isRunningPid(pid)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `${id}: pid ${pid} is not running, so nothing was signalled. If its log carries no ` +
+              "`__BGRUN_EXIT__` marker, the wrapper died before writing one — `bgstatus` settles that on its next stale-check.",
+          },
+        ],
+        details: { id, state: "gone", pid },
+      };
+    }
+
+    const failure = signalProcessGroup(pid, signal);
+    if (failure && failure !== "ESRCH") {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Could not signal process group ${pid} (${failure}). ` +
+              `Kill it directly if you need it gone: kill -${force ? "9" : "TERM"} -- -${pid}`,
+          },
+        ],
+        details: { id, state: "failed", pid, error: failure },
+        isError: true,
+      };
+    }
+    const signalled = failure === undefined;
+
+    // No liveness probe after the signal: a group that has just been signalled
+    // still reads as alive for the few milliseconds the signal is pending (seen
+    // on the real host), and a "retry with force" that fires on a job already
+    // dying is worse than no hint at all. The deterministic answer is the wake
+    // the wrapper's exit triggers — or, for a foreign job, the stale-check.
+    const lines = [
+      signalled
+        ? `${id}: ${signal} sent to process group ${pid}.`
+        : `${id}: process group ${pid} was already gone — nothing was signalled.`,
+      adopted
+        ? "It belongs to another session: the stale-check settles its state here (no wake is sent to you)."
+        : "You will be woken with its exit code.",
+    ];
+    if (!force) {
+      lines.push(
+        `If it is still running when you next look — some processes ignore ${signal} — retry with force: true.`,
+      );
+    }
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+      details: { id, state: signalled ? "signalled" : "gone", pid, signal, ...(adopted ? { foreign: true } : {}) },
+    };
+  }
 
   // ── bgclean: remove old job logs ───────────────────────────────────────────
 
@@ -4418,6 +4618,23 @@ export default function (pi: ExtensionAPI) {
         if (ctx.hasUI) {
           ctx.ui.notify(String(err), "error");
         }
+      }
+    },
+  });
+
+  pi.registerCommand("bgkill", {
+    description: "Stop a running background job (/bgkill <id> [force])",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const id = tokens[0];
+      const force = tokens.some((t) => t.toLowerCase() === "force");
+      if (!id) {
+        if (ctx.hasUI) ctx.ui.notify("usage: /bgkill <job-id> [force]", "error");
+        return;
+      }
+      const res = await bgkillCore({ id, force }, ctx);
+      if (ctx.hasUI) {
+        ctx.ui.notify(res.content[0].text, res.isError ? "error" : "info");
       }
     },
   });

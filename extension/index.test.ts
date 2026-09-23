@@ -361,6 +361,33 @@ async function withJobsDir<T>(
 
 // Default below Bun's 5s test timeout so a stuck wait rejects with a clear
 // message instead of racing the harness kill (a flake-masking failure mode).
+// Poll for a path to appear: fixtures that must be *ready* before the test
+// signals them (see the SIGTERM-trapping process in the bgkill tests).
+async function waitForPath(path: string, timeoutMs = 3_000): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    if (existsSync(path)) return true;
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+// Poll for a process to disappear. Used by the bgkill tests, where the signal is
+// asynchronous: the tool reports liveness at signal time, and the test asserts
+// the eventual state.
+async function waitUntilGone(pid: number, timeoutMs = 3_000): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 function waitForWakes(
   wakes: CapturedWake[],
   count: number,
@@ -8247,6 +8274,167 @@ test("native jobs: the stale poller uses the host's managed timers where they ex
     await h.fireSessionShutdown();
     assert.deepEqual(cleared, ["managed-handle"], "and cleared on shutdown");
   } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgkill: stops a running job by signalling its process group", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgkill = tools.get("bgkill")!;
+    const bgstatus = tools.get("bgstatus")!;
+
+    const started = await bgrun.execute(
+      "call-k1",
+      { command: "sleep 30", name: "victim" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (started.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+
+    const killed = await bgkill.execute("call-k2", { id }, undefined, undefined, ctx);
+    assert.notEqual(killed.isError, true, "stopping a running job is a normal outcome");
+    assert.match(
+      killed.content[0].text as string,
+      /SIGTERM sent to process group \d+/,
+      "the whole group is signalled, not just the wrapper",
+    );
+
+    // The wrapper records the exit as it dies, so the normal wake path reports
+    // the outcome — bgkill does not have to invent one.
+    await waitForWakes(wakes, 1);
+    const after = await bgstatus.execute("call-k3", { id }, undefined, undefined, ctx);
+    assert.match(after.content[0].text as string, /done/, "the job is finished");
+  });
+});
+
+test("bgkill: refuses finished ids, unknown ids and host-managed ids", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const native = makeFakePi({ ctxFields: nativeSnapshotCtxFields([NATIVE_RUNNING]) });
+    await loadExtension(native.pi);
+
+    // A host-managed job is the host's to stop: the refusal names its kill switch
+    // and never claims to have signalled anything.
+    const bgkill = native.tools.get("bgkill")!;
+    const hostJob = await bgkill.execute("c1", { id: "bg_9" }, undefined, undefined, native.ctx);
+    assert.equal(hostJob.isError, true);
+    const hostText = hostJob.content[0].text as string;
+    assert.match(hostText, /hub cancel ids:\["bg_9"\]/, "the host's own remedy");
+    assert.ok(!hostText.includes("SIGTERM"), "and no claim of having signalled it");
+
+    // An id that names nothing.
+    const unknown = await bgkill.execute(
+      "c2",
+      { id: "unit-tests-1-2" },
+      undefined,
+      undefined,
+      native.ctx,
+    );
+    assert.equal(unknown.isError, true);
+    assert.match(unknown.content[0].text as string, /bgrun job ids look like/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgkill = tools.get("bgkill")!;
+    const started = await bgrun.execute(
+      "call-k4",
+      { command: "true", name: "finished" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (started.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    const late = await bgkill.execute("call-k5", { id }, undefined, undefined, ctx);
+    assert.equal(late.isError, true, "nothing to kill");
+    assert.match(late.content[0].text as string, /already finished \(exit=0\)/);
+    assert.match(
+      late.content[0].text as string,
+      /bgtail/,
+      "and it says where the output still is",
+    );
+
+    // The human path reports the same refusal as an error toast rather than
+    // throwing into the command handler.
+    const notices: { text: string; kind: string }[] = [];
+    ctx.hasUI = true;
+    ctx.ui.notify = (text: string, kind: string) => notices.push({ text, kind });
+    await h.commands.get("bgkill")!.handler(id, ctx);
+    assert.equal(notices.at(-1)!.kind, "error");
+  });
+});
+
+test("bgkill: another session's job needs includeForeign, and force kills a stubborn one", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  // A real process outside this session, in its own group and ignoring SIGTERM —
+  // the case a kill tool has to handle rather than hope about.
+  // The readiness file matters: signalling before the trap is installed would
+  // kill the process and make the force step untestable (the first version of
+  // this test raced exactly that way).
+  const readyFile = join(dir, ".stubborn-ready");
+  const spawned = spawnSync("bash", [
+    "-c",
+    `bash -c "trap '' TERM; touch '${readyFile}'; while true; do sleep 1; done" >/dev/null 2>&1 & echo $!`,
+  ]);
+  const pid = Number(spawned.stdout.toString().trim());
+  const id = `foreign-stubborn-${Math.floor(Date.now() / 1000)}-${pid}`;
+  writeFileSync(join(dir, `${id}.log`), "another session's job\n");
+  try {
+    assert.ok(pid > 0, "fixture process started");
+    assert.equal(await waitForPath(readyFile), true, "fixture has installed its trap");
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const bgkill = h.tools.get("bgkill")!;
+
+    // Not ours: refused, and the process is untouched.
+    const refused = await bgkill.execute("c1", { id }, undefined, undefined, h.ctx);
+    assert.equal(refused.isError, true);
+    assert.match(refused.content[0].text as string, /includeForeign/);
+    assert.doesNotThrow(() => process.kill(pid, 0), "still running after the refusal");
+
+    // Ours to stop, when asked. It traps SIGTERM, so the honest answer is "still
+    // alive" — and the retry with force is what actually ends it.
+    const term = await bgkill.execute(
+      "c2",
+      { id, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.notEqual(term.isError, true);
+    assert.match(term.content[0].text as string, /SIGTERM sent to process group/);
+    assert.match(term.content[0].text as string, /force: true/, "says how to finish it off");
+    // The OS is the witness that SIGTERM did not work, not the tool's prose: the
+    // tool no longer guesses at post-signal liveness (that reading races).
+    assert.equal(await waitUntilGone(pid, 250), false, "the process ignored SIGTERM");
+
+    const force = await bgkill.execute(
+      "c3",
+      { id, includeForeign: true, force: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.match(force.content[0].text as string, /SIGKILL sent to process group/);
+    assert.equal(await waitUntilGone(pid), true, "SIGKILL ends a process that ignored SIGTERM");
+  } finally {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
   }

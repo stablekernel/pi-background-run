@@ -45,7 +45,7 @@ The host also decides several details, all handled internally:
 
 - **Tool visibility.** `omp` mounts any tool that does not opt out as an
   `xd://` device (`write xd://bgrun {…}`); bgrun declares `loadMode: "essential"`
-  so all five tools stay directly callable, exactly as on pi.
+  so all six tools stay directly callable, exactly as on pi.
 - **Tool guidance.** pi reads the tool definition's `promptSnippet` /
   `promptGuidelines` into the system prompt; omp reads only `description`, so on
   omp the same bullets are folded into the description instead of being dropped.
@@ -83,6 +83,7 @@ The host also decides several details, all handled internally:
 | `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB + 4 KiB of wrapper overhead), **condensed for context**: ANSI escapes stripped, repeated lines collapsed (a run of 3+ folds into one line carrying its `[xN]` count; a pair is kept as two lines — a fold needs its count to stay legible), long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). On omp, a native `bg_N` job's spilled output is read the same way, stamped as the host's file. |
 | `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB + 4 KiB of wrapper overhead; on omp, a native `bg_N` job's spilled output is searchable the same way): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days); `days` must be a positive number (`days: 0` is rejected rather than purging everything). Never removes a running job's log. |
+| `bgkill` | Stop a running job. Optional `force: true` sends `SIGKILL` instead of `SIGTERM`. Signals the job's **whole process group** (the child is spawned detached, so the command and anything it started go together). Refuses an id that already finished, an id that is not a bgrun job (`bg_N` belongs to the host — `hub cancel`), and another session's job unless `includeForeign: true`. Reports liveness after the signal; the authoritative outcome is the wake, or the stale-check for a foreign job. |
 
 ## Slash commands
 
@@ -96,6 +97,7 @@ up as `/` commands):
 | `/bgstatus [id] [done]` | One job's status by id, or the session listing (`done`/`all` includes finished jobs). |
 | `/bgtail <id> [lines]` | Tail a job's log (condensed, same as the tool). |
 | `/bgclean [days] [all]` | Remove old logs — session-scoped by default; `all` sweeps every session's. |
+| `/bgkill <id> [force]` | Stop a running job (its process group; `force` sends SIGKILL). |
 
 `/bgrun` is deliberately not a command — starting jobs (and reacting to their
 wake messages) is the agent's workflow.
@@ -103,7 +105,7 @@ wake messages) is the agent's workflow.
 ## Roadmap / not provided
 
 - Deprecated: the machine-global jobs dir (`PI_BGRUN_GLOBAL_DIR`, `~/.pi-bgrun/jobs`) — see [deprecation](#deprecated-machine-global-jobs-dir). Supported until a future major.
-- `bgkill` — not implemented; to stop a running job, use `kill -- -<pid>` (kill the process group — the child is spawned detached). The pid is the last `--`-separated segment of the job id (e.g. `unit-tests-1726680000-12345` → pid `12345`); it is not shown as a separate field in `bgstatus` output.
+- `bgkill` shipped: `bgkill <id>` stops a running job (process group; `force: true` for SIGKILL). The by-hand equivalent is still `kill -- -<pid>`, where the pid is the last `--`-separated segment of the job id (e.g. `unit-tests-1726680000-12345` → pid `12345`); it is not shown as a separate field in `bgstatus` output.
 - `bgwait` — not implemented; the wake mechanism makes blocking on a job unnecessary in the normal flow.
 - **A job started inside a subagent** (`task`/`eval` child) wakes *that* child, not
   the parent. Its completion wake is addressed to the session that spawned it, so
