@@ -27,12 +27,13 @@
 
 import {
   CONFIG_DIR_NAME,
+  getAgentDir,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Box, Text } from "@earendil-works/pi-tui";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   appendFileSync,
   closeSync,
@@ -54,12 +55,259 @@ import { homedir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import {
   DIGEST_PRESET_IDS,
+  digestNoMatchWakeLine,
   digestNoMatchWarning,
+  digestTypes,
   selectDigestEntry,
   type DigestEntry,
   type DigestJobTarget,
   type DigestMatch,
 } from "./digestPresets.ts";
+
+// ── Diagnostics ─────────────────────────────────────────────────────────────
+//
+// oh-my-pi (omp) exposes a rotating file logger at `pi.logger` and owns the
+// terminal — a raw stderr write from an extension can corrupt the TUI. Upstream
+// pi exposes no logger at all, so the sink starts on the console and is rebound
+// to the host logger during extension load when one exists (installHostLogger).
+// Module-level config helpers run through the same sink, since they can be
+// reached before/without a factory (unit tests import them directly).
+type WriteLog = (message: string) => void;
+let logWarn: WriteLog = (message) => console.error(message);
+let logError: WriteLog = (message) => console.error(message);
+
+/** Rebind diagnostics to the host's logger. Hosts without one keep the console. */
+export function installHostLogger(logger: {
+  warn: WriteLog;
+  error: WriteLog;
+}): void {
+  logWarn = (message) => logger.warn(message);
+  logError = (message) => logger.error(message);
+}
+
+/**
+ * Extension-API fields that only one of the two hosts declares. oh-my-pi adds a
+ * file logger and composer-shape registration and has no entry-renderer concept;
+ * upstream pi has the entry renderer and the tool-definition prompt fields.
+ * Casting the API object once to this intersection lets the capability probes
+ * read a field the other host's type omits without trusting an unchecked shape
+ * at each access site.
+ */
+interface HostExtensionApi {
+  logger?: { warn: WriteLog; error: WriteLog };
+  registerComposerShape?: (definition: unknown) => void;
+  registerEntryRenderer?: unknown;
+}
+
+/**
+ * Managed-timer surface oh-my-pi adds to ExtensionContext. Its callbacks are
+ * throw-contained (a raw timer's throw is process-fatal there) and are cleared
+ * on session shutdown; upstream pi exposes neither method.
+ */
+interface HostTimers {
+  setInterval?: (callback: () => void, ms: number) => unknown;
+  clearTimer?: (timer: unknown) => void;
+}
+
+/**
+ * oh-my-pi backgrounds long `bash` calls itself (`bash.autoBackground`, and an
+ * explicit `async: true`) and tracks them in an in-process job manager. Those
+ * jobs are NOT bgrun jobs: they have their own ids (`bg_1`), their output goes
+ * to an artifact plus a delivered `async-result` message, and they are cancelled
+ * on session transitions. Upstream pi has no such manager, so this is
+ * capability-probed and reads as empty there.
+ */
+interface NativeJob {
+  id: string;
+  type: string;
+  /** `running` | `completed` | `failed` | `cancelled` */
+  status: string;
+  label: string;
+  startTime: number;
+}
+
+/** Read-only native-job surface oh-my-pi adds to ExtensionContext. */
+interface HostAsyncJobs {
+  getAsyncJobSnapshot?: () => {
+    running?: unknown;
+    recent?: unknown;
+    /** Delivery queue state: jobs settled but whose result is not injected yet. */
+    delivery?: unknown;
+  } | null;
+}
+
+/**
+ * `customType` of the message a host delivers when a native background job
+ * finishes (`session/async-job-delivery.ts` in oh-my-pi). Watching for it is
+ * how the panel learns a native job is gone without polling.
+ */
+const NATIVE_RESULT_MESSAGE_TYPE = "async-result";
+
+/**
+ * Whether this context can report host-owned background jobs. A documented
+ * boundary rather than a bare check: it is what gates the panel refresh hooks,
+ * so hosts without the API (upstream pi) pay nothing for native-job support.
+ */
+export function supportsNativeJobSnapshot(ctx: ExtensionContext | undefined): boolean {
+  return (
+    typeof (ctx as (ExtensionContext & HostAsyncJobs) | undefined)
+      ?.getAsyncJobSnapshot === "function"
+  );
+}
+
+/**
+ * The raw native snapshot, or undefined on hosts without the API (and for a host
+ * that throws from it — a broken snapshot must not break a status query or the
+ * panel). Single-sourced so every reader shares one failure rule.
+ */
+function readNativeSnapshot(
+  ctx: ExtensionContext | undefined,
+): { running?: unknown; recent?: unknown; delivery?: unknown } | undefined {
+  if (!ctx) return undefined;
+  let snapshot: { running?: unknown; recent?: unknown; delivery?: unknown } | null | undefined;
+  try {
+    snapshot = (ctx as ExtensionContext & HostAsyncJobs).getAsyncJobSnapshot?.();
+  } catch {
+    return undefined;
+  }
+  return snapshot && typeof snapshot === "object" ? snapshot : undefined;
+}
+
+/**
+ * The session's native (host-owned) background jobs. `[]` on hosts without the
+ * snapshot API, so every caller degrades to bgrun-only behavior. Read-only
+ * throughout: bgrun never adopts, resumes, or cancels these — it only reports
+ * them, so one panel and one status line cover both kinds of background work.
+ */
+export function nativeJobs(
+  ctx: ExtensionContext | undefined,
+  which: "running" | "recent" = "running",
+): NativeJob[] {
+  const snapshot = readNativeSnapshot(ctx);
+  if (!snapshot) return [];
+  const list = which === "running" ? snapshot.running : snapshot.recent;
+  if (!Array.isArray(list)) return [];
+  const out: NativeJob[] = [];
+  for (const raw of list) {
+    // Untrusted shape: this crosses a host API boundary, so every field is
+    // checked rather than asserted.
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    if (typeof item.id !== "string" || !item.id) continue;
+    out.push({
+      // Both are host text that reaches the panel, the status line and tool
+      // output, and oh-my-pi builds `label` verbatim from the command line — so
+      // the control-byte strip happens here, at the boundary, rather than at
+      // each of the four surfaces that render them. `id` stays raw: it is a key
+      // for lookups and is sanitized only where it is displayed.
+      id: stripControlChars(item.id),
+      type: typeof item.type === "string" ? stripControlChars(item.type) : "job",
+      status: typeof item.status === "string" ? stripControlChars(item.status) : "running",
+      label: typeof item.label === "string" ? stripControlChars(item.label) : "",
+      // 0, not now(): a host that omits startTime must not look like a job that
+      // started this instant — the value is also the discriminator that tells a
+      // recycled id apart from the job whose artifact we recorded.
+      startTime: typeof item.startTime === "number" ? item.startTime : 0,
+    });
+  }
+  return out;
+}
+
+/** One-line description of a native job row (label + kind), capped for the panel. */
+function nativeJobLabel(job: NativeJob): string {
+  const label = job.label.length > 40 ? job.label.slice(0, 37) + "…" : job.label;
+  return label ? `${label} · native ${job.type}` : `native ${job.type}`;
+}
+
+/**
+ * Native jobs that have settled but whose `async-result` the host has not
+ * injected yet. They are neither running nor in the transcript, so a count that
+ * ignored them would read as "nothing is happening" for exactly the window in
+ * which the agent is waiting for a result it has already earned.
+ */
+export function nativePendingDeliveries(ctx: ExtensionContext | undefined): string[] {
+  const delivery = readNativeSnapshot(ctx)?.delivery as
+    | { pendingJobIds?: unknown }
+    | undefined;
+  if (!delivery || typeof delivery !== "object") return [];
+  const ids = delivery.pendingJobIds;
+  if (!Array.isArray(ids)) return [];
+  return ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+}
+
+/**
+ * Cheap identity of the host's job set: which jobs it reports and in which
+ * state, plus how many results are still waiting to be delivered. Used to skip
+ * a panel rebuild when a host-driven refresh cannot have anything new to show.
+ */
+function nativeSignature(ctx: ExtensionContext): string {
+  const running = nativeJobs(ctx, "running")
+    .map((job) => `${job.id}:${job.status}`)
+    .join(",");
+  return `${running}|${nativePendingDeliveries(ctx).join(",")}`;
+}
+
+/**
+ * One native job by id, running first (a live job with a reused id wins over a
+ * settled one). Used where a caller has an id and needs the host's view of it.
+ */
+function findNativeJob(ctx: ExtensionContext, id: string): NativeJob | undefined {
+  return [...nativeJobs(ctx, "running"), ...nativeJobs(ctx, "recent")].find(
+    (job) => job.id === id,
+  );
+}
+
+/**
+ * What to say when an id does not resolve to a bgrun job. Names the expected
+ * shape, and — for a native id — says where that job's output goes and how to
+ * inspect or kill it, so a `bg_N` id can't dead-end a session the way it did in
+ * practice. The remedy is the host's own (`hub`), not a bgrun tool: those jobs
+ * are not ours to steer.
+ */
+export function unknownJobHint(id: string, hostHasNativeJobs = true): string {
+  const bgrunShape =
+    "bgrun job ids look like `<name>-<epoch>-<pid>`; run `bgstatus` with no id to list this session's jobs.";
+  // The native manager mints `bg_<n>`; bgrun mints `<slug>-<epoch>-<pid>`. The
+  // caller passes whether this host has such a manager at all: on upstream pi the
+  // shape alone would earn an explanation of a job manager that does not exist,
+  // and instructions to cancel it with a `hub` tool that does not exist either.
+  if (!hostHasNativeJobs || !/^bg_\d+$/.test(id)) return bgrunShape;
+  return (
+    `"${id}" looks like a native background job (the host backgrounds long bash calls itself). ` +
+    "Its output is delivered automatically as an async result; when the host spilled it, " +
+    `bgtail ${id} reads it back from the artifact. ` +
+    `The host owns it: cancel it with oh-my-pi's own \`hub cancel ids:["${id}"]\`, and list it with ` +
+    "`hub jobs` (humans: `/jobs`). " +
+    bgrunShape
+  );
+}
+
+/**
+ * Interval timer that prefers the host's managed timers. Falls back to a raw
+ * `setInterval`, `unref`'d so a watch loop never keeps the process alive.
+ * Returns a handle whose `clear()` stops the timer on either path.
+ * Exported for tests, like formatSince.
+ */
+export function scheduleManagedInterval(
+  ctx: ExtensionContext,
+  callback: () => void,
+  ms: number,
+): { clear: () => void } {
+  const timers = ctx as ExtensionContext & HostTimers;
+  const setManaged = timers.setInterval;
+  if (typeof setManaged === "function") {
+    const clearManaged = timers.clearTimer;
+    const handle = setManaged.call(ctx, callback, ms);
+    return {
+      clear: () => {
+        if (typeof clearManaged === "function") clearManaged.call(ctx, handle);
+      },
+    };
+  }
+  const raw = setInterval(callback, ms);
+  raw.unref();
+  return { clear: () => clearInterval(raw) };
+}
 
 // Exit marker appended to every log so the file is self-describing: the exit
 // code survives pi restarting. `;` (not `&&`) ensures the printf runs even when
@@ -110,7 +358,7 @@ const LOG_SCAN_LINES_MAX = 500_000;
 
 const DEFAULT_CLEANUP_DAYS = 7;
 const STALE_POLL_MS = 30_000; // re-check interval for jobs with no live child handle
-/** Default jobs dir inside a recognizable project root (`.git` or `.pi`). */
+/** Default jobs dir inside a recognizable project root (`.git` or `$CONFIG_DIR`). */
 const PROJECT_LOCAL_JOBS_REL = ".pi-bgrun/jobs";
 
 // Files a spawn stages in the jobs dir under one shared
@@ -466,9 +714,135 @@ function readLastLineFromContent(content: string, maxLen = 200): string | null {
 }
 
 function validateJobId(id: string, tool: string): void {
-  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
+  // The single gate in front of every id. It rejects:
+  //   * a path shape — an id can never address a file outside the jobs dir;
+  //   * control bytes — every consumer echoes the id into tool output and the
+  //     transcript, where ESC/BEL would inject terminal sequences;
+  //   * an implausible length.
+  // JSON.stringify in the error keeps the rejected value printable without
+  // letting it become an argument.
+  if (
+    !id ||
+    id.length > 200 ||
+    id.includes("/") ||
+    id.includes("\\") ||
+    id.includes("..") ||
+    /[\u0000-\u001F\u007F-\u009F]/.test(id)
+  ) {
     throw new Error(`${tool}: invalid job id ${JSON.stringify(id)}`);
   }
+}
+
+/**
+ * The id shape both sides of the native map accept. Deliberately the same rule
+ * for writing an entry and for reading one: a key that could never be looked up
+ * (separators, traversal, control bytes, absurd length) is never stored.
+ */
+function isSafeJobId(id: string): boolean {
+  return /^[A-Za-z0-9_.-]{1,64}$/.test(id);
+}
+
+/** Whether `target` sits inside `dir` (both resolved), for host-supplied paths. */
+function isInsideDir(dir: string, target: string): boolean {
+  const resolvedDir = safeRealpath(dir) ?? dir;
+  const resolvedTarget = safeRealpath(target) ?? target;
+  if (resolvedTarget === resolvedDir) return false;
+  return resolvedTarget.startsWith(resolvedDir.endsWith(sep) ? resolvedDir : resolvedDir + sep);
+}
+
+/**
+ * The epoch second a bgrun id encodes (`<slug>-<epoch>-<pid>`), or undefined when
+ * the id does not carry a plausible one. Used to reason about a job's age when the
+ * only thing naming its process is a file name.
+ */
+function jobEpochFromId(id: string): number | undefined {
+  const parts = id.split("-");
+  if (parts.length < 3) return undefined;
+  const epoch = Number(parts[parts.length - 2]);
+  if (!Number.isInteger(epoch)) return undefined;
+  const now = Math.floor(Date.now() / 1000);
+  // A unix second, not a version or a counter: keeps `notes-1-12345` out.
+  return epoch > 1_600_000_000 && epoch < now + 86_400 ? epoch : undefined;
+}
+
+/**
+ * How long the process at `pid` has been alive, in seconds — or undefined when the
+ * OS will not say (no `ps`, an unparseable format, the process is gone). Undefined
+ * means "cannot check", never "mismatch": this guards against signalling a
+ * stranger, it is not a precondition for stopping a job.
+ */
+function processAgeSeconds(pid: number): number | undefined {
+  const out = spawnSync("ps", ["-o", "etime=", "-p", String(pid)], {
+    encoding: "utf8",
+  });
+  if (out.status !== 0 || !out.stdout) return undefined;
+  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(out.stdout.trim());
+  if (!m) return undefined;
+  const [, days, hours, minutes, seconds] = m;
+  return (
+    Number(days ?? 0) * 86_400 +
+    Number(hours ?? 0) * 3_600 +
+    Number(minutes ?? 0) * 60 +
+    Number(seconds ?? 0)
+  );
+}
+
+/** Outcome of a signal attempt: which scope was reached, or why nothing was. */
+type SignalOutcome =
+  | { ok: true; scope: "group" | "pid" }
+  | { ok: false; code: string };
+
+/**
+ * Signal a whole process group by leader pid. bgrun spawns detached, so the job's
+ * wrapper leads its own group and `-pid` is what reaches the command *and* the
+ * children it started; a bare pid kill would leave a compiler or test binary
+ * running.
+ *
+ * Two deliberate limits, both learned from review:
+ *   * **ESRCH is never retried as a single pid.** "No process group with that id"
+ *     means the wrapper is gone — the pid may already belong to an unrelated
+ *     process, and signalling it would kill a stranger while reporting a group
+ *     signal that never happened.
+ *   * The single-pid fallback exists only for platforms that cannot signal groups
+ *     (process groups are POSIX-only), and it says so in its result, because the
+ *     job's children can survive it.
+ */
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): SignalOutcome {
+  try {
+    process.kill(-pid, signal);
+    return { ok: true, scope: "group" };
+  } catch (err) {
+    const groupCode = (err as NodeJS.ErrnoException).code ?? "unknown";
+    if (groupCode === "ESRCH") return { ok: false, code: "ESRCH" };
+    if (groupCode === "EINVAL" || groupCode === "ENOSYS" || groupCode === "ENOTSUP") {
+      try {
+        process.kill(pid, signal);
+        return { ok: true, scope: "pid" };
+      } catch (fallbackErr) {
+        return { ok: false, code: (fallbackErr as NodeJS.ErrnoException).code ?? "unknown" };
+      }
+    }
+    return { ok: false, code: groupCode };
+  }
+}
+
+/**
+ * Every string this extension puts on a terminal-interpreted surface (widget
+ * panel, status line, toast, tool output) passes through here first: C0/C1
+ * control bytes become spaces, so a value can neither forge extra panel rows nor
+ * inject ANSI/OSC sequences (window titles, hyperlinks, screen clears). The
+ * extension already applied this to its own job names; the same rule now covers
+ * the host's strings, because oh-my-pi takes a native job's `label` verbatim
+ * from the command line (tools/bash.ts) and the panel, status line and `bgstatus`
+ * all render it.
+ */
+function stripControlChars(text: string): string {
+  return text.replace(/[\u0000-\u001F\u007F-\u009F]/g, " ");
+}
+
+/** A host string on its way to a terminal surface: stripped, collapsed, capped. */
+function sanitizeHostText(text: string, cap = 120): string {
+  return stripControlChars(text).replace(/\s+/g, " ").trim().slice(0, cap);
 }
 
 function isRunningPid(pid: number): boolean {
@@ -629,11 +1003,17 @@ function ensureJobsDirMarker(jobsDir: string): void {
   }
 }
 
-function logReadError(id: string, logPath: string): string {
+function logReadError(
+  id: string,
+  logPath: string,
+  hostHasNativeJobs = true,
+): string {
   if (existsSync(logPath)) {
     return `Log for job ${id} at ${logPath} exists but could not be read (file may be too large or unreadable)`;
   }
-  return `No log found for job ${id} at ${logPath}`;
+  // Name the expected shape, and — for a host-minted native id — say where that
+  // job's output actually is, so the id can't dead-end the caller.
+  return `No log found for job ${id} at ${logPath}. ${unknownJobHint(id, hostHasNativeJobs)}`;
 }
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -718,11 +1098,11 @@ function readConfigFile(path: string): BgrunConfigFile {
     const raw = JSON.parse(text);
     if (raw && typeof raw === "object" && !Array.isArray(raw))
       return raw as BgrunConfigFile;
-    console.error(
+    logWarn(
       `[pi-bgrun] config ${path} is not a JSON object — ignoring its contents`,
     );
   } catch (err) {
-    console.error(
+    logWarn(
       `[pi-bgrun] config ${path} is malformed JSON (${(err as Error).message}) — ignoring its contents`,
     );
   }
@@ -848,14 +1228,14 @@ export function cappedWrapper(maxBytes: number): string {
 // ── Project-local jobs dir ──────────────────────────────────────────────────
 //
 // By default, when the session cwd is inside a recognizable project root
-// (`.git` or `.pi`), logs land at `<project>/.pi-bgrun/jobs`. The root is found
+// (`.git` or `$CONFIG_DIR`), logs land at `<project>/.pi-bgrun/jobs`. The root is found
 // by walking up from the cwd, so a session started in a subdirectory still
 // resolves project-locally. With no project root the default falls back to the
 // machine-global `~/.pi-bgrun/jobs`. An explicit RELATIVE `jobsDir` (from any
 // config layer, or PI_BGRUN_DIR) resolves the same way; an absolute path is
 // used as-is (migration-safe). Project-local logs stay inside the workspace
-// sandbox so analysis tools confined to the project root (e.g. context-mode's
-// ctx_execute_file/ctx_index) can process whole logs without flooding context.
+// sandbox, so analysis tooling confined to the project root can process whole
+// logs without flooding context.
 
 function isProjectRootLike(dir: string): boolean {
   // Cheap heuristic: a directory holding .git or pi's config dir is a project.
@@ -1021,7 +1401,7 @@ function appendExcludePattern(
 
 // Digest config validation: invalid values are dropped from the resolved
 // config (best-effort — a malformed digest section must never break a wake or
-// the whole config), but the human gets one console.error per distinct invalid
+// the whole config), but the human gets one warning per distinct invalid
 // field so typos are discoverable without flooding the log. The field set is a
 // fixed, code-defined list (preset / command / match / type / ...), so the
 // dedupe set is naturally bounded.
@@ -1039,7 +1419,7 @@ function warnDigestInvalid(field: string, value: unknown): void {
     " — digest takes an object or an array of { type, match, label, preset, command } entries";
   // field "" means the whole `digest` section was unusable (wrong shape).
   const where = field ? `digest.${field}` : "digest";
-  console.error(
+  logWarn(
     `[pi-bgrun] ignoring invalid ${where} in pi-bgrun.json: ${JSON.stringify(value)}${hint}${shapeHint}`,
   );
 }
@@ -1207,6 +1587,28 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   return out;
 }
 
+// The host's agent directory — `~/.omp/agent` under oh-my-pi (profile-aware),
+// `~/.pi/agent` under upstream pi. Both hosts export `getAgentDir`, so the
+// fallback below covers a *runtime* failure (a host whose helper throws, e.g. an
+// unresolvable profile), not a missing export: that would fail module linking
+// before any catch could run.
+function defaultUserConfigPath(): string {
+  try {
+    const dir = getAgentDir();
+    if (typeof dir === "string" && dir) return join(dir, "pi-bgrun.json");
+    logWarn(
+      "[pi-bgrun] host getAgentDir() returned no directory — falling back to $HOME",
+    );
+  } catch (err) {
+    // Not silent: the fallback is the DEFAULT profile's agent dir, so a
+    // profile-scoped user config would otherwise be ignored without a trace.
+    logWarn(
+      `[pi-bgrun] host getAgentDir() failed (${(err as Error).message}) — falling back to $HOME`,
+    );
+  }
+  return join(homeDir(), CONFIG_DIR_NAME, "agent", "pi-bgrun.json");
+}
+
 // Resolved per call (cheap: at most two small file reads) so env/config
 // changes are picked up without module reloads — and tests can isolate.
 // Exported for tests, like formatSince.
@@ -1218,19 +1620,20 @@ export function resolveConfig(ctx?: {
   // os.homedir().
   userConfigPath?: string;
 }): BgrunConfig {
-  // User config: $HOME/.pi/agent/pi-bgrun.json. Overridable by an explicit
+  // User config: <host agent dir>/pi-bgrun.json. Overridable by an explicit
   // test seam (ctx.userConfigPath) and by PI_BGRUN_USER_CONFIG (mirrors the
   // PI_BGRUN_DIR escape hatch).
   const user = readConfigFile(
     ctx?.userConfigPath ??
       process.env.PI_BGRUN_USER_CONFIG ??
-      join(homeDir(), ".pi", "agent", "pi-bgrun.json"),
+      defaultUserConfigPath(),
   );
   let project: BgrunConfigFile = {};
   try {
     if (ctx?.isProjectTrusted?.()) {
       // Read the project config from the same root resolveJobsDirPath uses, so
-      // a session started in a subdirectory still picks up <root>/.pi config.
+      // a session started in a subdirectory still picks up <root>/<CONFIG_DIR_NAME>
+      // config.
       const cwd = ctx.cwd ?? process.cwd();
       const projectRoot = projectRootFor(cwd);
       project = readConfigFile(
@@ -1410,10 +1813,97 @@ interface BgStatusDetails {
   type?: string;
   count?: number;
   recovered?: boolean;
+  /** The id resolved to a host-managed background job, not a bgrun job. */
+  native?: boolean;
+  /** Host-managed background jobs included in a listing. */
+  nativeCount?: number;
+  /** Readable path for a native job: the host's spill of its full output. */
+  logPath?: string;
+  /** Artifact id backing that path. */
+  artifactId?: string;
 }
 
 export default function (pi: ExtensionAPI) {
+  // One widened view of the host API — see HostExtensionApi for why the cast is
+  // needed and which fields each host provides.
+  const hostApi = pi as ExtensionAPI & HostExtensionApi;
+
+  // Route diagnostics to the host's file logger when it has one (oh-my-pi);
+  // upstream pi writes to the console as before.
+  const hostLogger = hostApi.logger;
+  if (
+    hostLogger &&
+    typeof hostLogger.warn === "function" &&
+    typeof hostLogger.error === "function"
+  ) {
+    installHostLogger(hostLogger);
+  }
+
+  // Host identity probe, used only to decide where tool guidance is emitted.
+  //
+  // Two independent signals, OR'd because their failure modes are asymmetric:
+  // mis-detecting pi as omp merely duplicates the bullets (they still appear
+  // in promptGuidelines), while mis-detecting omp as pi drops them silently.
+  //   * `CONFIG_DIR_NAME` is `.omp` on oh-my-pi and `.pi` on upstream pi — a
+  //     constant the extension already depends on for every config path, so a
+  //     host where it lies is already visibly broken rather than quietly so.
+  //   * `registerComposerShape` is an oh-my-pi-only extension surface.
+  const HOST_IS_OMP =
+    CONFIG_DIR_NAME !== ".pi" ||
+    typeof hostApi.registerComposerShape === "function";
+
+  // Does the host render `appendEntry` records in the transcript? Upstream pi
+  // does (via the entry renderer below); oh-my-pi has no entry-renderer concept
+  // — it renders only `custom_message` entries, through registerMessageRenderer.
+  const HOST_HAS_ENTRY_RENDERER =
+    typeof hostApi.registerEntryRenderer === "function";
+
+  // Tool guidance the host will actually surface. omp drops the
+  // `promptSnippet`/`promptGuidelines` fields, so on omp the bullets ride in the
+  // description — emitted once per host, never duplicated.
+  function toolDescription(
+    description: string,
+    guidelines: readonly string[],
+  ): string {
+    if (!HOST_IS_OMP || guidelines.length === 0) return description;
+    return `${description}\n\n${guidelines.map((g) => `- ${g}`).join("\n")}`;
+  }
+
+  // omp unmounts any tool that does not declare `loadMode: "essential"` and
+  // re-exposes it as an `xd://` device — callable, but only through a discovery
+  // `read` plus `write xd://<tool>`. Upstream pi has no such field (and no device
+  // transport), so the property is spread in rather than written literally: a
+  // literal would trip pi's excess-property check against its ToolDefinition.
+  const ESSENTIAL_TOOL = { loadMode: "essential" as const };
+
   const jobs = new Map<string, JobRecord>();
+
+  // Native job id → the host's spilled full-output artifact, when one exists.
+  //
+  // oh-my-pi bounds what it hands the model and mirrors the full sanitized
+  // output of a long bash run to a per-session artifact, advertising the id on
+  // the delivered async result (`details.jobs[].meta.truncation.artifactId`).
+  // Resolving it is what lets bgtail/bggrep answer for a `bg_N` id — the same
+  // bounded readers, applied to the host's own spill instead of a bgrun log.
+  //
+  // In-memory by construction: `bg_N` ids are process-scoped (they restart at
+  // bg_1) and artifact ids are session-scoped, so a persisted mapping could
+  // point at a *different* job's output after a restart. Only a delivery this
+  // process saw is ever resolvable, which makes a stale hit impossible.
+  const nativeOutputs = new Map<
+    string,
+    { artifactId: string; path: string; startTime: number }
+  >();
+  // Bounds on that map: at most one entry per delivered job, capped, and a batch
+  // larger than this is treated as not-ours (see recordNativeOutputs).
+  // Slack for the pid-attribution check: a wrapper starts within a moment of the
+  // id being minted, and the two facts come from different clocks (the id carries
+  // whole seconds, `ps` reports whole seconds). Generous on purpose — this exists
+  // to catch a pid that cannot be this job's, not to argue about seconds.
+  const PID_AGE_TOLERANCE_S = 60;
+  const NATIVE_OUTPUT_CAP = 64;
+  const NATIVE_OUTPUT_BATCH_CAP = 64;
+
   // bgtail's delta-tailing bookmarks: one entry per job id ever tailed, holding
   // the high-water mark of what the caller has already had the opportunity to
   // see. Declared here, ahead of the cleanup helpers, so removing a log can
@@ -1429,13 +1919,22 @@ export default function (pi: ExtensionAPI) {
     bytes: number;
     first: string;
     window: number;
+    /**
+     * The resolved path this bookmark was taken against. An id can outlive its
+     * file: a `bg_N` id reused by the host after a session transition, or a
+     * native delivery that remaps it to a different artifact. Without the path, a
+     * new file whose first line happens to match and whose size did not shrink
+     * looks like "the same log, appended" — and the head of the new file is
+     * silently dropped. See the pathChanged reset in bgtailCore.
+     */
+    path: string;
   };
   const tailBookmarks = new Map<string, TailBookmark>();
   // Poller for stale job records — anything running with no live ChildProcess
   // handle (adopted foreign jobs + jobs reconstructed from transcript entries
   // after a restart). No exit event exists for those, so their logs/pids are
   // re-checked on an interval instead.
-  let stalePoller: ReturnType<typeof setInterval> | undefined;
+  let stalePoller: { clear: () => void } | undefined;
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1455,8 +1954,7 @@ export default function (pi: ExtensionAPI) {
   // (newlines, tabs, escape/ANSI bytes) so a name can never forge extra lines
   // in the wake, widget, toast, or transcript; collapse whitespace; cap length.
   function sanitizeName(name: string | undefined): string | undefined {
-    const trimmed = (name ?? "")
-      .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
+    const trimmed = stripControlChars(name ?? "")
       .replace(/\s+/g, " ")
       .trim();
     if (!trimmed) return undefined;
@@ -1554,7 +2052,33 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ── Live status widget ────────────────────────────────────────────────────
+  // ── Live status panel + status line ───────────────────────────────────────
+  //
+  // Two host-neutral surfaces carry what the pi-only transcript card shows, at
+  // zero context cost:
+  //   * the editor widget — RUNNING jobs only, present only while something is
+  //     running (no permanent editor space), self-limited to the 10 lines both
+  //     hosts cap a string[] at. A list of finished jobs is deliberately not
+  //     shown: above the editor it competes with the work in progress, and
+  //     `bgstatus` answers "what ran" on demand;
+  //   * the status line — one always-visible line: the running count while jobs
+  //     are in flight, else how the most recent job ended. This is what keeps a
+  //     job's outcome visible after the panel is gone.
+
+  // Both hosts cap a string[] widget at 10 lines and append their own
+  // "... (widget truncated)" note past that (pi `MAX_WIDGET_LINES`, oh-my-pi
+  // the same). Bounding here keeps the two hosts byte-identical and spends the
+  // budget on the panel's own content instead of the host's truncation line.
+  const WIDGET_LINE_BUDGET = 10;
+
+  /** Compact one-line label for a job: its name, else the command. */
+  function jobLabel(rec: JobRecord): string {
+    // `name` was sanitized at spawn; `cmd` is whatever the caller passed, and it
+    // reaches the widget, the status line and wake text, so it is stripped here
+    // (one place, every surface).
+    const cmd = sanitizeHostText(rec.cmd, 40);
+    return rec.name ? `${rec.name} · ${cmd}` : cmd;
+  }
 
   function updateWidget(
     ctx: ExtensionContext,
@@ -1563,23 +2087,95 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     revalidateStaleJobs({ persist: opts.persistRevalidate ?? true });
     const running: JobRecord[] = [];
+    // The newest finished record exists only for the status line.
+    let lastDone: JobRecord | undefined;
     for (const rec of jobs.values()) {
-      if (rec.exitCode === undefined) running.push(rec);
+      if (rec.exitCode === undefined) {
+        running.push(rec);
+        continue;
+      }
+      const when = rec.exitedAt ?? rec.started;
+      if (!lastDone || when > (lastDone.exitedAt ?? lastDone.started)) {
+        lastDone = rec;
+      }
     }
-    if (running.length === 0) {
+    // The host's own background jobs (omp auto-backgrounds long bash calls) are
+    // read-only to us, but they belong in the same panel: one place to see what
+    // is running, and the `(native)` tag is what tells the human — and the
+    // agent reading the same id later — that its output is delivered rather
+    // than logged here.
+    const native = nativeJobs(ctx, "running");
+
+    // The status line is independent of whether the panel shows, so it is set
+    // first: live count while running, else the newest outcome.
+    setStatusLine(ctx, lastDone);
+
+    if (running.length === 0 && native.length === 0) {
+      // No live activity: the panel goes away, which is what an idle editor
+      // expects. The status line keeps the outcome.
       ctx.ui.setWidget("bgrun", undefined);
       return;
     }
-    const lines = [`📊 bgrun: ${running.length} running`];
-    for (const rec of running) {
-      const startedAt = formatSince(rec.started);
-      const cmd = rec.cmd.length > 40 ? rec.cmd.slice(0, 37) + "…" : rec.cmd;
-      const label = rec.name ? `${rec.name} · ${cmd}` : cmd;
+
+    const header = native.length
+      ? running.length
+        ? `📊 bgrun: ${running.length} running · ${native.length} native`
+        : `📊 bgrun: ${native.length} native running`
+      : `📊 bgrun: ${running.length} running`;
+    const lines = [header];
+    // Reserve the header and a possible overflow line before slicing the rows,
+    // so the panel never reaches a host's own truncation note.
+    const maxRows = WIDGET_LINE_BUDGET - 2;
+    const rows = running.map((rec) => {
       const tag = rec.adopted ? " (adopted)" : "";
       // Full id (not truncated) so it can be copied straight into /bgtail <id>.
-      lines.push(`  ${rec.id}  ${label}  (since ${startedAt})${tag}`);
+      return `  ${rec.id}  ${jobLabel(rec)}  (since ${formatSince(rec.started)})${tag}`;
+    });
+    for (const job of native) {
+      rows.push(
+        `  ${job.id}  ${nativeJobLabel(job)}  (since ${formatSince(job.startTime)})`,
+      );
     }
+    lines.push(...rows.slice(0, maxRows));
+    const hidden = rows.length - Math.min(rows.length, maxRows);
+    if (hidden > 0) lines.push(`  … ${hidden} more running`);
     ctx.ui.setWidget("bgrun", lines);
+  }
+
+  /** Always-visible one-liner: live count while running, else the last outcome. */
+  function setStatusLine(ctx: ExtensionContext, lastDone?: JobRecord): void {
+    let running = 0;
+    for (const rec of jobs.values()) {
+      if (rec.exitCode === undefined) running++;
+    }
+    // Native jobs belong in the count too — "1 running" that ignores a
+    // backgrounded bash call would be wrong from the human's point of view.
+    const nativeRunning = nativeJobs(ctx, "running").length;
+    // ...and a settled native job whose result has not been injected yet is
+    // neither running nor visible anywhere else, so it gets its own clause.
+    const pending = nativePendingDeliveries(ctx).length;
+    const live = running + nativeRunning;
+    if (live > 0) {
+      ctx.ui.setStatus(
+        "bgrun",
+        pending > 0 ? `⏳ ${live} running · ${pending} result pending` : `⏳ ${live} running`,
+      );
+      return;
+    }
+    if (pending > 0) {
+      ctx.ui.setStatus("bgrun", `⏳ ${pending} result pending`);
+      return;
+    }
+    if (!lastDone) {
+      ctx.ui.setStatus("bgrun", undefined);
+      return;
+    }
+    const icon = lastDone.exitCode === 0 ? "✅" : "❌";
+    const label = (lastDone.name ?? jobLabel(lastDone)).slice(0, 30);
+    ctx.ui.setStatus(
+      "bgrun",
+      `${icon} ${label} exit=${lastDone.exitCode ?? "?"}`,
+    );
   }
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
@@ -1906,80 +2502,110 @@ export default function (pi: ExtensionAPI) {
 
   function ensureStalePoller(ctx: ExtensionContext): void {
     if (stalePoller !== undefined || !hasUnsupervisedRunning()) return;
-    stalePoller = setInterval(() => {
-      revalidateStaleJobs();
-      updateWidget(ctx);
-      if (!hasUnsupervisedRunning()) stopStalePoller();
-    }, STALE_POLL_MS);
-    stalePoller.unref();
+    // The callback runs outside handler dispatch. oh-my-pi treats an uncaught
+    // throw there as process-fatal (it tears the whole session down), so it is
+    // wrapped, and the timer itself is scheduled through the host's managed
+    // timers when they exist (omp contains the throw and unrefs automatically).
+    const tick = () => {
+      try {
+        revalidateStaleJobs();
+        updateWidget(ctx);
+        if (!hasUnsupervisedRunning()) stopStalePoller();
+      } catch (err) {
+        logWarn(
+          `[pi-bgrun] stale-job poll failed: ${(err as Error).message}`,
+        );
+      }
+    };
+    stalePoller = scheduleManagedInterval(ctx, tick, STALE_POLL_MS);
   }
 
   function stopStalePoller(): void {
     if (stalePoller !== undefined) {
-      clearInterval(stalePoller);
+      stalePoller.clear();
       stalePoller = undefined;
     }
   }
 
   // ── Entry renderer: job cards in the transcript ───────────────────────────
+  //
+  // Upstream pi only. oh-my-pi has no entry renderer at all — it renders
+  // `custom_message` entries (pi.sendMessage) through registerMessageRenderer,
+  // never the `custom` records pi.appendEntry writes. The job entries are still
+  // persisted and replayed by session_start on both hosts; only the transcript
+  // card is pi-only. Calling the missing method would throw and abort the whole
+  // extension load on omp, so it is registered conditionally.
 
-  pi.registerEntryRenderer<BgrunJobEntryData>(
-    "bgrun-job",
-    (entry, { expanded }, theme) => {
-      const d =
-        entry.data ??
-        ({
-          id: "?",
-          cmd: "",
-          started: 0,
-          logPath: "",
-          state: "running",
-        } as BgrunJobEntryData);
-      const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-      const icon = d.state === "done" ? (d.exitCode === 0 ? "✅" : "❌") : "🔄";
-      const exitStr = d.state === "done" ? ` exit=${d.exitCode ?? "?"}` : "";
-      const namePrefix = d.name ? `"${d.name}" ` : "";
-      box.addChild(
-        new Text(
-          `${icon} ${theme.fg("accent", "bgrun")} ${namePrefix}${d.id}${exitStr}`,
-          0,
-          0,
-        ),
-      );
-      const cmdPreview = d.cmd.length > 60 ? d.cmd.slice(0, 57) + "…" : d.cmd;
-      box.addChild(new Text(theme.fg("dim", `  $ ${cmdPreview}`), 0, 0));
-      if (expanded) {
-        box.addChild(new Text(theme.fg("dim", `  log: ${d.logPath}`), 0, 0));
+  if (HOST_HAS_ENTRY_RENDERER) {
+    pi.registerEntryRenderer<BgrunJobEntryData>(
+      "bgrun-job",
+      (entry, { expanded }, theme) => {
+        const d =
+          entry.data ??
+          ({
+            id: "?",
+            cmd: "",
+            started: 0,
+            logPath: "",
+            state: "running",
+          } as BgrunJobEntryData);
+        const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+        const icon = d.state === "done" ? (d.exitCode === 0 ? "✅" : "❌") : "🔄";
+        const exitStr = d.state === "done" ? ` exit=${d.exitCode ?? "?"}` : "";
+        const namePrefix = d.name ? `"${d.name}" ` : "";
         box.addChild(
           new Text(
-            theme.fg(
-              "dim",
-              `  started: ${new Date(d.started).toLocaleString()}`,
-            ),
+            `${icon} ${theme.fg("accent", "bgrun")} ${namePrefix}${d.id}${exitStr}`,
             0,
             0,
           ),
         );
-        if (d.exitedAt) {
+        const cmdPreview = d.cmd.length > 60 ? d.cmd.slice(0, 57) + "…" : d.cmd;
+        box.addChild(new Text(theme.fg("dim", `  $ ${cmdPreview}`), 0, 0));
+        if (expanded) {
+          box.addChild(new Text(theme.fg("dim", `  log: ${d.logPath}`), 0, 0));
           box.addChild(
             new Text(
               theme.fg(
                 "dim",
-                `  finished: ${new Date(d.exitedAt).toLocaleString()}`,
+                `  started: ${new Date(d.started).toLocaleString()}`,
               ),
               0,
               0,
             ),
           );
+          if (d.exitedAt) {
+            box.addChild(
+              new Text(
+                theme.fg(
+                  "dim",
+                  `  finished: ${new Date(d.exitedAt).toLocaleString()}`,
+                ),
+                0,
+                0,
+              ),
+            );
+          }
         }
-      }
-      return box;
-    },
-  );
+        return box;
+      },
+    );
+  }
 
   // ── session_start: reconstruct Map from entries + auto-cleanup ────────────
 
-  pi.on("session_start", async (_event, ctx) => {
+  /**
+   * Re-index this transcript's jobs: rebuild the in-memory Map from its
+   * `bgrun-job` entries, adopt still-running jobs found on disk when the config
+   * asks for that, and re-point the panel/poller at the result.
+   *
+   * Split out of session_start because oh-my-pi does not re-emit session_start
+   * when the transcript changes: `/new`, `/resume`, a fork and a tree branch all
+   * fire `session_switch` / `session_branch` instead (the host's own internal
+   * bridge re-initialises on all three). A plugin that only listened for
+   * session_start kept rendering the previous transcript's jobs.
+   */
+  function reindexSession(ctx: ExtensionContext): void {
     // Reconstruct the in-memory Map from this session's bgrun-job entries.
     // Only the current session's entries are visible; jobs from other sessions
     // remain discoverable via the filesystem scan in bgstatus.
@@ -2018,9 +2644,8 @@ export default function (pi: ExtensionAPI) {
         });
       }
     } catch (err) {
-      console.error(
-        "[pi-bgrun] session_start reconstruction failed:",
-        (err as Error).message,
+      logError(
+        `[pi-bgrun] session_start reconstruction failed: ${(err as Error).message}`,
       );
     }
 
@@ -2049,10 +2674,6 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // One-shot digest nudge (toast only, never the LLM context). All of its
-    // failure modes are swallowed inside — it must never break session_start.
-    maybeNudgeDigest(ctx);
-
     // Show the widget if anything is now running. revalidateStaleJobs()
     // inside clears zombies — reconstructed jobs that finished while pi was
     // down — before they ever render. Then start the stale poller for
@@ -2060,9 +2681,97 @@ export default function (pi: ExtensionAPI) {
     // resumed sessions live tracking of their still-running jobs).
     updateWidget(ctx);
     ensureStalePoller(ctx);
+  }
+
+  // `tool_execution_end` fires on *every* tool call on hosts that have the
+  // snapshot API, so the host-driven rebuild is gated on the host's job set
+  // actually differing: rebuilding per call would re-run the stale revalidation
+  // (a 256 KiB tail read per record with no live child handle) and two host-side
+  // UI re-renders for no new information. A native job moving between states
+  // always changes this signature — a completion drops it from `running` — and
+  // bgrun's own jobs are driven by its own events plus the stale poller.
+  let lastNativeSignature = "";
+  function refreshForNative(ctx: ExtensionContext): void {
+    const signature = nativeSignature(ctx);
+    if (signature === lastNativeSignature) return;
+    lastNativeSignature = signature;
+    updateWidget(ctx, { persistRevalidate: false });
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    reindexSession(ctx);
+    // One-shot digest nudge (toast only, never the LLM context). All of its
+    // failure modes are swallowed inside — it must never break session_start.
+    maybeNudgeDigest(ctx);
     // Auto-cleanup of old logs, throttled to one sweep per cleanupDays via a
     // marker in the jobs dir (see autoCleanJobs). Also runs on session_shutdown.
     autoCleanJobs(ctx);
+  });
+
+  // oh-my-pi changes the transcript without a session_start: `/new`, `/resume`,
+  // a fork and a tree branch each fire `session_switch` / `session_branch` (the
+  // host's own internal event bridge re-initialises on all three). Re-index
+  // there too, or the panel and status line keep reporting the jobs of a
+  // transcript that is no longer on screen. Registered unconditionally: a host
+  // that never emits these (upstream pi) simply never calls the handler.
+  const onTranscriptChanged = (_event: unknown, ctx: ExtensionContext): void => {
+    // Finished jobs belong to the transcript that ran them — the new one has its
+    // own entries, and re-indexing below re-adds them if it really does. Running
+    // jobs stay: they are alive on disk, they exist nowhere else once dropped,
+    // and their wake is still ours to deliver into whichever session is live now.
+    for (const [id, rec] of jobs) {
+      if (rec.exitCode !== undefined) jobs.delete(id);
+    }
+    reindexSession(ctx);
+    // The native id→artifact bindings do not survive the transition either:
+    // oh-my-pi cancels and evicts its jobs on `/new`/resume/fork, then mints ids
+    // from the first free slot, so the new session's `bg_1` is routinely the old
+    // session's id — and the old artifact file is still on disk. Keeping the
+    // binding would answer for the *new* job with the *previous* session's
+    // output. The host drops the prior session's undelivered results at the
+    // transition, so nothing here can still be needed.
+    nativeOutputs.clear();
+    // Refresh even with nothing running, so a stale "✅ <job> exit=0" cannot
+    // outlive the session that ran it. The next host-driven refresh must not be
+    // skipped by a signature the pre-switch session left behind.
+    lastNativeSignature = "";
+    updateWidget(ctx, { persistRevalidate: false });
+  };
+  // `pi.on` is a method on the host's api facade — oh-my-pi implements it as a
+  // class method that reads `this.extension` (loader.ts), so it must be *called
+  // on the api object*: a detached reference throws inside the host and aborts
+  // the whole extension load. Hence `.call(pi, …)`, not a bare saved reference.
+  const registerHostEvent = (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void,
+  ): void => {
+    (pi.on as unknown as (e: string, h: unknown) => void).call(pi, event, handler);
+  };
+  registerHostEvent("session_switch", onTranscriptChanged);
+  registerHostEvent("session_branch", onTranscriptChanged);
+
+  // Host-owned background jobs change with no bgrun event at all: the host
+  // backgrounds a `bash` call on its own (the tool result is the start notice),
+  // and delivers the outcome later as an `async-result` message. Without these
+  // two hooks the panel would keep showing the count from whenever bgrun last
+  // acted. Both are no-ops on hosts without the snapshot API (upstream pi).
+  pi.on("tool_execution_end", (_event, ctx) => {
+    if (!ctx.hasUI || !supportsNativeJobSnapshot(ctx)) return;
+    refreshForNative(ctx);
+  });
+
+  pi.on("message_start", async (event, ctx) => {
+    if (!supportsNativeJobSnapshot(ctx)) return;
+    // Only the async-result delivery ends a native job; ignore every other
+    // message rather than doing work on each one.
+    if (!event.message || !("customType" in event.message)) return;
+    if (event.message.customType !== NATIVE_RESULT_MESSAGE_TYPE) return;
+    // Before the panel refresh: a delivery is the one moment the host tells us
+    // where a native job's full output went, which is what makes `bg_N` IDs
+    // readable by bgtail/bggrep afterwards.
+    await recordNativeOutputs(event.message, ctx);
+    if (!ctx.hasUI) return;
+    refreshForNative(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -2078,24 +2787,33 @@ export default function (pi: ExtensionAPI) {
 
   // ── bgrun tool ────────────────────────────────────────────────────────────
 
+  // Guidance the model needs before it reaches for the wrong tool. Read by
+  // upstream pi from `promptGuidelines`; on oh-my-pi it is folded into the
+  // description (see toolDescription).
+  const BGRUN_GUIDELINES = [
+    "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
+    "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
+    "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard — bgrun's `started:` line names them when you omit it.",
+    "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
+    "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search, or read the log's path directly for whole-log analysis.",
+  ];
+
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bgrun",
     label: "Run in Background",
-    description:
+    description: toolDescription(
       "Run a long shell command detached in the background. Returns 'started: <job-id>' immediately. " +
-      "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
-      "expected to run >30s or emit >100 lines (tests, builds, linters). Optionally pass `name` for a " +
-      "short human-readable label used in the job id, status output, and wake messages, and `type` to " +
-      "select the project's digest scorecard.",
+        "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
+        "expected to run >30s or emit >100 lines (tests, builds, linters) — and whenever the output must " +
+        "outlive the session, since the job's log survives a restart and stays greppable. Optionally pass " +
+        "`name` for a short human-readable label used in the job id, status output, and wake messages, and " +
+        "`type` to select the project's digest scorecard.",
+      BGRUN_GUIDELINES,
+    ),
     promptSnippet:
       "Run a long command detached in the background; get woken on completion",
-    promptGuidelines: [
-      "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
-      "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
-      "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard; the vocabulary comes from the project's `.pi/pi-bgrun.json` digest entries.",
-      "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
-      "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search or ctx_execute_file on the log path for whole-log analysis.",
-    ],
+    promptGuidelines: BGRUN_GUIDELINES,
     parameters: Type.Object({
       command: Type.String({
         description:
@@ -2112,8 +2830,8 @@ export default function (pi: ExtensionAPI) {
         Type.String({
           description:
             "Optional job type used to select the project's digest scorecard (e.g. 'test', 'build', 'lint'). " +
-            "The vocabulary comes from the `type` fields in the project's `digest` config entries in " +
-            "`.pi/pi-bgrun.json`; when the project's digest config defines types, prefer passing the matching one.",
+            "When the project's digest config defines types, pass the matching one — bgrun's `started:` line " +
+            "names them when you leave this out.",
         }),
       ),
     }),
@@ -2203,9 +2921,8 @@ export default function (pi: ExtensionAPI) {
           renameSync(tmpPath, finalLogPath);
           logPath = finalLogPath;
         } catch (err) {
-          console.error(
-            `[pi-bgrun] rename to final log path failed:`,
-            (err as Error).message,
+          logWarn(
+            `[pi-bgrun] rename to final log path failed: ${(err as Error).message}`,
           );
         }
 
@@ -2273,9 +2990,8 @@ export default function (pi: ExtensionAPI) {
             try {
               pi.sendUserMessage(wake, { deliverAs: "followUp" });
             } catch (e2) {
-              console.error(
-                `[pi-bgrun] wake failed for job ${id}:`,
-                (e2 as Error).message,
+              logError(
+                `[pi-bgrun] wake failed for job ${id}: ${(e2 as Error).message}`,
               );
             }
           }
@@ -2354,6 +3070,11 @@ export default function (pi: ExtensionAPI) {
           // nothing appends nothing, and the exit code / universal part above are
           // never affected.
           let digestBlock: { label: string; text: string } | undefined;
+          // Set when a NEW distinct mismatch is recorded (bounded by
+          // DIGEST_NO_MATCH_WARN_CAP): the same fact has to reach the agent, who
+          // is the only party that can fix a wrong `type`. The host log alone is
+          // not enough — oh-my-pi routes it to a file the agent never reads.
+          let digestNoMatchNote: string | undefined;
           try {
             // First matching entry wins, in config order. The label defaults to
             // the entry's label, the entry's type, a matched `match.name`, then
@@ -2389,11 +3110,17 @@ export default function (pi: ExtensionAPI) {
               if (!digestNoMatchWarned.has(warning)) {
                 if (digestNoMatchWarned.size < DIGEST_NO_MATCH_WARN_CAP) {
                   digestNoMatchWarned.add(warning);
-                  console.error(warning);
+                  logWarn(warning);
+                  // Same facts, phrased for the model, on the wake it reads.
+                  // One occurrence per distinct mismatch keeps this bounded.
+                  digestNoMatchNote = digestNoMatchWakeLine(
+                    digestTarget,
+                    digestEntries,
+                  );
                 } else if (!digestNoMatchSuppressed) {
                   // Don't silently drop further distinct mismatches.
                   digestNoMatchSuppressed = true;
-                  console.error(
+                  logWarn(
                     `[pi-bgrun] further digest no-match diagnostics suppressed (cap ${DIGEST_NO_MATCH_WARN_CAP})`,
                   );
                 }
@@ -2401,9 +3128,8 @@ export default function (pi: ExtensionAPI) {
             }
           } catch (e) {
             // Silent-fail: a broken digest never breaks a wake (ground rule 3).
-            console.error(
-              `[pi-bgrun] digest failed for job ${id}:`,
-              (e as Error).message,
+            logWarn(
+              `[pi-bgrun] digest failed for job ${id}: ${(e as Error).message}`,
             );
           }
 
@@ -2415,6 +3141,8 @@ export default function (pi: ExtensionAPI) {
           if (lastLine) wake += `Last output: ${lastLine}\n`;
           if (digestBlock) {
             wake += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
+          } else if (digestNoMatchNote) {
+            wake += `${digestNoMatchNote}\n`;
           }
           wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
           try {
@@ -2427,9 +3155,8 @@ export default function (pi: ExtensionAPI) {
             try {
               pi.sendUserMessage(wake, { deliverAs: "followUp" });
             } catch (e2) {
-              console.error(
-                `[pi-bgrun] wake failed for job ${id}:`,
-                (e2 as Error).message,
+              logError(
+                `[pi-bgrun] wake failed for job ${id}: ${(e2 as Error).message}`,
               );
             }
           }
@@ -2448,13 +3175,26 @@ export default function (pi: ExtensionAPI) {
         });
 
         child.on("error", (err) => {
-          console.error(`[pi-bgrun] spawn error for job ${id}:`, err.message);
+          logError(`[pi-bgrun] spawn error for job ${id}: ${err.message}`);
           finishSpawnFailure(err);
         });
 
         const startedLines = [`started: ${id}`];
         if (name) startedLines.push(`  name: ${name}`);
         if (type) startedLines.push(`  type: ${type}`);
+        // The digest selector keys off `type`, and its vocabulary lives in the
+        // project's config — which the agent has no reason to read. Say it here,
+        // at the one moment it can act on it: the spawn. Costs nothing on the
+        // happy path (no digest, or a type already given), and the config is
+        // already resolved above.
+        if (!type) {
+          const declared = digestTypes(cfg.digest ?? []);
+          if (declared.length > 0) {
+            startedLines.push(
+              `  digest: configured types ${declared.join(", ")} — pass type: "${declared[0]}" to attach a scorecard`,
+            );
+          }
+        }
         startedLines.push(
           `  log: ${logPath}`,
           `  You'll be woken automatically when it finishes.`,
@@ -2630,7 +3370,7 @@ export default function (pi: ExtensionAPI) {
         // best-effort — a marker write failure must never break session_start
       }
     } catch (err) {
-      console.error("[pi-bgrun] digest nudge failed:", (err as Error).message);
+      logWarn(`[pi-bgrun] digest nudge failed: ${(err as Error).message}`);
     }
   }
 
@@ -2650,7 +3390,12 @@ export default function (pi: ExtensionAPI) {
       return l;
     });
     ANSI_RE.lastIndex = 0;
-    // collapse runs of 3+ identical lines (spinner frames, retry spam)
+    // Collapse consecutive identical lines (spinner frames, retry spam) into
+    // one, but only for runs of 3+: that is when the text carries `[xN]`, so the
+    // reader can tell "one line" from "many". A pair is emitted verbatim, twice.
+    // Folding a pair silently drops a line with nothing on screen to say so —
+    // a fidelity bug, not a conservation win, since the count is what makes a
+    // fold legible and a folded pair carries none.
     const collapsed: { text: string; count: number }[] = [];
     let runs = 0;
     for (const l of clean) {
@@ -2664,20 +3409,33 @@ export default function (pi: ExtensionAPI) {
     }
     const out: string[] = [];
     let total = 0;
+    let capped = false;
     for (const c of collapsed) {
-      let line = c.count >= 3 ? `${c.text}  [x${c.count}]` : c.text;
-      if (line.length > LINE_CAP) {
-        line = line.slice(0, LINE_CAP) + ` …[+${line.length - LINE_CAP} chars]`;
-        cappedLines++;
+      // A run of 3+ collapses to one line carrying its count; anything shorter is
+      // emitted once per occurrence, so no line is lost without a marker.
+      const emissions =
+        c.count >= 3 ? [`${c.text}  [x${c.count}]`] : Array.from({ length: c.count }, () => c.text);
+      for (let line of emissions) {
+        if (line.length > LINE_CAP) {
+          line = line.slice(0, LINE_CAP) + ` …[+${line.length - LINE_CAP} chars]`;
+          cappedLines++;
+        }
+        // Budget per emission, not per run: a folded run is one line, an
+        // unfolded one is several, and the cap must count what is actually
+        // pushed or a pair-heavy log overruns it.
+        total += line.length + 1;
+        if (total > TOTAL_CAP) {
+          capped = true;
+          break;
+        }
+        out.push(line);
       }
-      total += line.length + 1;
-      if (total > TOTAL_CAP) {
-        notes.push(
-          `output capped at ${TOTAL_CAP} chars — ${lines.length} raw lines total; raise \`lines\`, use \`raw: true\`, or run ctx_execute_file on the log for whole-log analysis`,
-        );
-        break;
-      }
-      out.push(line);
+      if (capped) break;
+    }
+    if (capped) {
+      notes.push(
+        `output capped at ${TOTAL_CAP} chars — ${lines.length} raw lines total; raise \`lines\`, use \`raw: true\`, or read the log path directly for whole-log analysis`,
+      );
     }
     if (stripped > 0)
       notes.push(
@@ -2713,6 +3471,140 @@ export default function (pi: ExtensionAPI) {
     if (oldest !== undefined && oldest !== id) tailBookmarks.delete(oldest);
   }
 
+  // Reasons a delivery advertised an artifact we would not record, logged once
+  // each (bounded like the digest diagnostics). The bridge refuses anything it
+  // cannot verify, which is the safe direction — but "safe" must not also mean
+  // "silent": if a host upgrade changes the artifact layout or the delivery
+  // shape, the feature stops working with no other trace anywhere.
+  const nativeOutputGaps = new Set<string>();
+  const NATIVE_OUTPUT_GAP_CAP = 3;
+  function noteNativeOutputGap(reason: string): void {
+    if (nativeOutputGaps.has(reason) || nativeOutputGaps.size >= NATIVE_OUTPUT_GAP_CAP) return;
+    nativeOutputGaps.add(reason);
+    logWarn(`[pi-bgrun] native job output not readable: ${reason}`);
+  }
+
+  /**
+   * Learn where a native job's full output landed, from the delivery the host
+   * just made. Best-effort by design: a small output that was delivered inline
+   * has no artifact, a session without an artifact store cannot resolve one, and
+   * a host that fails the lookup is still a host whose job we can list — none of
+   * those may break the delivery path, so they record nothing and move on.
+   */
+  async function recordNativeOutputs(
+    message: unknown,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const details = (message as { details?: unknown } | undefined)?.details;
+    if (!details || typeof details !== "object") return;
+    const delivered = (details as { jobs?: unknown }).jobs;
+    // A delivery carries the jobs it just delivered; a host that hands us a
+    // stream of them is not something to walk inside a message hook. One
+    // `getArtifactPath` per entry is a directory scan on the host side.
+    if (!Array.isArray(delivered) || delivered.length > NATIVE_OUTPUT_BATCH_CAP) {
+      return;
+    }
+    const manager = ctx.sessionManager as
+      | (typeof ctx.sessionManager & {
+          getArtifactPath?: (id: string) => Promise<string | null>;
+          getArtifactsDir?: () => string | null;
+        })
+      | undefined;
+    const resolvePath = manager?.getArtifactPath;
+    if (typeof resolvePath !== "function") return;
+    // Containment root. When the host cannot name one, nothing is recorded: the
+    // id→path binding is the host's word, and a binding outside the session's own
+    // artifact store would let a later `bgtail <id>` read an unrelated file and
+    // be told it is that job's output.
+    const artifactsDir = manager?.getArtifactsDir?.();
+    if (typeof artifactsDir !== "string" || !artifactsDir) {
+      noteNativeOutputGap("the host reported no artifact directory");
+      return;
+    }
+    const root = safeRealpath(artifactsDir) ?? artifactsDir;
+    for (const entry of delivered) {
+      if (!entry || typeof entry !== "object") continue;
+      const { jobId, meta } = entry as { jobId?: unknown; meta?: unknown };
+      // Same predicate the read side applies (validateJobId), so a key that
+      // could never be looked up is never stored either.
+      if (typeof jobId !== "string" || !isSafeJobId(jobId)) continue;
+      const artifactId = (
+        meta as { truncation?: { artifactId?: unknown } } | undefined
+      )?.truncation?.artifactId;
+      if (typeof artifactId !== "string" || !isSafeJobId(artifactId)) continue;
+      try {
+        const path = await resolvePath.call(manager, artifactId);
+        if (typeof path !== "string" || !path) {
+          noteNativeOutputGap(`artifact ${artifactId} did not resolve to a path`);
+          continue;
+        }
+        // existsSync: a resolved-but-missing path is worse than no path, because
+        // every later read would report a broken log rather than the real story.
+        if (!existsSync(path)) {
+          noteNativeOutputGap(`artifact ${artifactId} resolved to a missing path`);
+          continue;
+        }
+        if (!isInsideDir(root, path)) {
+          noteNativeOutputGap(`artifact ${artifactId} resolved outside the session artifact dir`);
+          continue;
+        }
+        // Bound like the tail bookmarks: a long session that retires many native
+        // jobs must not grow this map forever for ids nobody will read.
+        if (nativeOutputs.size >= NATIVE_OUTPUT_CAP && !nativeOutputs.has(jobId)) {
+          const oldest = nativeOutputs.keys().next().value;
+          if (oldest !== undefined) nativeOutputs.delete(oldest);
+        }
+        nativeOutputs.set(jobId, {
+          artifactId,
+          path,
+          // The identity of the job this path belongs to. oh-my-pi mints `bg_N`
+          // from the first free slot and evicts a settled row ~30s after its
+          // result is consumed, while the spilled artifact stays on disk — so the
+          // same id does come back, and it is a *different* job.
+          //
+          // Looked up settled-first on purpose: a delivery describes a job that
+          // has just settled, so `recent` holds its own row. If the id has already
+          // been recycled, `running` holds the newcomer — binding that start time
+          // to this artifact would launder the old output into the new job.
+          startTime:
+            nativeJobs(ctx, "recent").find((job) => job.id === jobId)?.startTime ??
+            findNativeJob(ctx, jobId)?.startTime ??
+            0,
+        });
+      } catch {
+        // Swallowed on purpose: this is enrichment, not the delivery.
+      }
+    }
+  }
+
+  /**
+   * The host's spilled artifact for a native job id, when this process saw that
+   * job's delivery and the id still belongs to it. Entries are dropped the moment
+   * they stop being true: a vanished path (the artifact store moved or pruned),
+   * or an id the host has since recycled onto a different job.
+   */
+  function nativeOutputFor(
+    id: string,
+    ctx?: ExtensionContext,
+  ): { artifactId: string; path: string } | undefined {
+    const rec = nativeOutputs.get(id);
+    if (!rec) return undefined;
+    if (!existsSync(rec.path)) {
+      // Pruned or moved under us (session artifact dirs move on fork/move): drop
+      // the entry rather than claim a path that no longer answers.
+      nativeOutputs.delete(id);
+      return undefined;
+    }
+    // Same id, different start time → a recycled id, not the job we recorded.
+    // Only compare when the host actually reported a start time on both sides.
+    const row = ctx ? findNativeJob(ctx, id) : undefined;
+    if (rec.startTime > 0 && row && row.startTime > 0 && row.startTime !== rec.startTime) {
+      nativeOutputs.delete(id);
+      return undefined;
+    }
+    return rec;
+  }
+
   // Resolve a job's log path and read its bounded slice, single-sourcing the
   // "in-memory record first, then the configured jobs dir" rule shared by
   // bgtail and bggrep. The record's logPath stays correct even if the config
@@ -2727,21 +3619,55 @@ export default function (pi: ExtensionAPI) {
     | { logPath: string; content: string; size: number }
     | { logPath: string; errorText: string; notFound: boolean } {
     validateJobId(id, tool);
+    const native = nativeOutputFor(id, ctx);
+    // A native job whose full output the host spilled is readable through the
+    // same readers: its artifact path stands in for the log we never wrote (the
+    // caller stamps the output as native — see annotateNative).
     const logPath =
-      jobs.get(id)?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
+      jobs.get(id)?.logPath ??
+      native?.path ??
+      join(resolveConfig(ctx).jobsDir, `${id}.log`);
     const slice = readLogSlice(logPath, window);
     if (!slice) {
       return {
         logPath,
-        errorText: logReadError(id, logPath),
+        errorText: logReadError(id, logPath, supportsNativeJobSnapshot(ctx)),
         notFound: !existsSync(logPath),
       };
     }
     return { logPath, content: slice.content, size: slice.size };
   }
 
+  /**
+   * Stamp a read of a native job's spilled artifact as such. It is the host's
+   * file, not a bgrun log: it has no `__BGRUN_EXIT__` marker, bgrun never cleans
+   * it, and the host may drop it with the session — a reader that stayed silent
+   * about that would imply provenance it does not have.
+   */
+  function annotateNative<T extends { content: { type: "text"; text: string }[] }>(
+    result: T,
+    id: string,
+    ctx?: ExtensionContext,
+  ): T {
+    // A failed read must never be stamped: "no log found" plus "read from the
+    // host's artifact" would assert provenance for output nobody read.
+    if ((result as { isError?: boolean }).isError === true) return result;
+    const native = nativeOutputFor(id, ctx);
+    const first = result.content[0];
+    if (!native || !first || first.type !== "text") return result;
+    const note =
+      `\n\n(read from artifact ${native.artifactId} — the host's spill of native job ${id}'s full output, not a bgrun log: ` +
+      `no exit marker, and only the host's retention applies. Path: ${native.path})`;
+    return {
+      ...result,
+      content: [{ ...first, text: first.text + note }, ...result.content.slice(1)],
+    };
+  }
+
   // Shared by the bgtail tool (agent-facing) and the /bgtail slash command
-  // (human-facing).
+  // (human-facing). Returns the read *unstamped*: both callers pass the result
+  // through annotateNative() so a read of a native job's artifact says so — the
+  // stamp needs the job id, which is the caller's parameter, not this one's.
   async function bgtailCore(
     params: { id: string; lines?: number; raw?: boolean; bytes?: number },
     ctx?: ExtensionContext,
@@ -2786,7 +3712,7 @@ export default function (pi: ExtensionAPI) {
     // (a max equal to the cap left its first bytes permanently unreadable).
     const windowNote =
       size > readWindow
-        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(readWindowMax())}) or use ctx_execute_file on the log path)`
+        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(readWindowMax())}) or read the log path directly)`
         : "";
     // Content lines only: wrapper bookkeeping (exit marker, truncation notice)
     // and blanks are filtered BEFORE the window is sliced, so "last N lines"
@@ -2806,12 +3732,19 @@ export default function (pi: ExtensionAPI) {
     const total = rawLines.length;
     const first = rawLines[0]?.slice(0, 200) ?? "";
     const prev = tailBookmarks.get(id);
+    // A different file under the same id (a reused `bg_N`, or a remap to another
+    // artifact) is not "the same log with more lines": it must reset, or a
+    // matching first line + a non-shrinking size would read as a delta and hide
+    // the new file's head. Tested before the replacement heuristic for the same
+    // reason windowChanged is.
+    const pathChanged = prev !== undefined && prev.path !== logPath;
     // Same log, different window: a wider view would look like pages of "new"
     // lines that were only never looked at before, so reset the delta. It also
     // moves the window's first line, so it must be tested BEFORE the
     // replacement heuristic below — otherwise a widened read misreports the log
     // as replaced.
-    const windowChanged = prev !== undefined && prev.window !== readWindow;
+    const windowChanged =
+      prev !== undefined && !pathChanged && prev.window !== readWindow;
     // Append-only logs never mutate earlier lines, so a changed first
     // content line means the log was replaced or rotated — reset to a full
     // tail. Catches same-size replacements the shrink checks cannot see.
@@ -2826,18 +3759,20 @@ export default function (pi: ExtensionAPI) {
     let window: string[];
     let header: string | undefined;
     let newLines: number | undefined;
-    if (raw || prev === undefined || shrank || replaced || windowChanged) {
+    if (raw || prev === undefined || shrank || replaced || windowChanged || pathChanged) {
       // Full tail: first read, raw mode, a shrunken/replaced log, or a changed
       // search window (all resets).
       window = rawLines.slice(-lines);
       if (!raw) {
-        header = shrank
-          ? "log shrank since last read — showing full tail"
-          : replaced
-            ? "log was replaced since last read — showing full tail"
-            : windowChanged
-              ? "search window changed since last read — showing full tail"
-              : undefined;
+        header = pathChanged
+          ? "log path changed since last read (the id now resolves elsewhere) — showing full tail"
+          : shrank
+            ? "log shrank since last read — showing full tail"
+            : replaced
+              ? "log was replaced since last read — showing full tail"
+              : windowChanged
+                ? "search window changed since last read — showing full tail"
+                : undefined;
       }
     } else {
       const fresh = rawLines.slice(prev.lines);
@@ -2848,6 +3783,7 @@ export default function (pi: ExtensionAPI) {
           bytes: size,
           first,
           window: readWindow,
+          path: logPath,
         });
         return {
           content: [
@@ -2879,6 +3815,7 @@ export default function (pi: ExtensionAPI) {
       bytes: size,
       first,
       window: readWindow,
+      path: logPath,
     });
     const shown = window;
     const { text, truncated } = condenseLogLines(shown, { raw });
@@ -2909,10 +3846,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bgtail",
     label: "Tail Background Log",
     description:
-      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. A shrunken, replaced, or differently-windowed log resets to a full tail. Reads only the log's last 2 MiB by default (`bytes` widens it, max 64 MiB) and says so when the log is bigger. For pattern search use bggrep; for whole-log analysis, ctx_execute_file on the log path.",
+      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. A shrunken, replaced, or differently-windowed log resets to a full tail. Reads only the log's last 2 MiB by default (`bytes` widens it, max 64 MiB) and says so when the log is bigger. For pattern search use bggrep; for whole-log analysis, read the log path directly (it is printed by bgstatus and in these notes).",
     promptSnippet: "Read the last N lines of a bgrun job's log",
     parameters: Type.Object({
       id: Type.String({
@@ -2939,7 +3877,7 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      return bgtailCore(params, ctx);
+      return annotateNative(await bgtailCore(params, ctx), params.id, ctx);
     },
   });
 
@@ -2947,8 +3885,8 @@ export default function (pi: ExtensionAPI) {
   //
   // bggrep runs inside the extension, so it resolves the job id to the
   // configured jobs dir itself (no path to reconstruct) and needs no shell
-  // quoting for the regex; ctx_execute_file can read the same file, but you
-  // must hand it the absolute path. Matches are line-numbered (grep -n style),
+  // quoting for the regex; a plain read of the same path is the whole-log
+  // escape hatch. Matches are line-numbered (grep -n style),
   // optionally with context lines, capped at MAX_GREP_MATCHES, and run
   // through the same condenser as bgtail so a search can never flood context.
 
@@ -3010,7 +3948,7 @@ export default function (pi: ExtensionAPI) {
     // it can cover a capped log.
     const windowNote =
       size > readWindow
-        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(readWindowMax())}) or use ctx_execute_file on the log path)`
+        ? `\n\n(searched the last ${formatBytes(readWindow)} of ${formatBytes(size)} — the earlier bytes were not searched; pass a larger \`bytes\` (max ${formatBytes(readWindowMax())}) or read the log path directly)`
         : "";
     // Bound the LINE count before splitting: a window of very short lines is
     // millions of lines in a few MiB, and materializing them costs ~100 bytes
@@ -3132,17 +4070,22 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  const BGGREP_GUIDELINES = [
+    "Never search a bgrun log with the bash tool — uncapped output can flood context, and it needs manual log-path reconstruction and regex shell-quoting; bggrep is bounded by design.",
+    "Prefer bggrep over bash grep or reading a bgrun log — matches are line-numbered, capped, and condensed.",
+    "Pass an explicit pattern when you know the tool's output format; the default only catches common failure signatures.",
+  ];
+
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bggrep",
     label: "Grep Background Log",
-    description:
-      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; ctx_execute_file can read the same file, but needs the absolute path. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+    description: toolDescription(
+      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; reading that path directly is the whole-log escape hatch. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+      BGGREP_GUIDELINES,
+    ),
     promptSnippet: "Search a bgrun job's log for a pattern",
-    promptGuidelines: [
-      "Never search a bgrun log with the bash tool — uncapped output can flood context, and it needs manual log-path reconstruction and regex shell-quoting; bggrep is bounded by design.",
-      "Prefer bggrep over bash grep or reading a bgrun log — matches are line-numbered, capped, and condensed.",
-      "Pass an explicit pattern when you know the tool's output format; the default only catches common failure signatures.",
-    ],
+    promptGuidelines: BGGREP_GUIDELINES,
     parameters: Type.Object({
       id: Type.String({
         description: "Job id (from bgrun's 'started: <id>' response)",
@@ -3169,7 +4112,7 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      return bggrepCore(params, ctx);
+      return annotateNative(await bggrepCore(params, ctx), params.id, ctx);
     },
   });
 
@@ -3225,10 +4168,68 @@ export default function (pi: ExtensionAPI) {
           },
         };
       }
+      // A native job whose delivery this process saw has a readable path: the
+      // host spilled its full output to a session artifact. Report it as such.
+      // The marker-based state below would otherwise call it "running" forever,
+      // since the host's spill carries no `__BGRUN_EXIT__` line.
+      const nativeOutput = nativeOutputFor(id, ctx);
+      if (nativeOutput) {
+        // The caller's id, echoed back: stripped for display (it reached us from
+        // the model or the host and may carry control bytes) while the lookup
+        // above keeps using it raw.
+        const displayId = id;
+        const native = findNativeJob(ctx, id);
+        const state = native?.status ?? "completed";
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${displayId}: ${state} — native background job (${native?.type ?? "bash"}), not a bgrun job.\n` +
+                (native?.label ? `  cmd: ${native.label}\n` : "") +
+                `  output: ${nativeOutput.path} (artifact ${nativeOutput.artifactId} — the host's spill of the full output; bgtail ${displayId} and bggrep ${displayId} read it)\n` +
+                `  cancel: oh-my-pi's \`hub cancel ids:["${displayId}"]\` (the host's own tool)`,
+            },
+          ],
+          details: {
+            id,
+            state,
+            native: true,
+            logPath: nativeOutput.path,
+            artifactId: nativeOutput.artifactId,
+          },
+        };
+      }
       const logPath = join(jobsDir, `${id}.log`);
       if (!existsSync(logPath)) {
+        // A host-owned background job (omp backgrounds long bash calls itself)
+        // is a real answer, just not a bgrun one: report it as such instead of
+        // a bare "not found", which in practice sent a session chasing `bg_5`.
+        const native = findNativeJob(ctx, id);
+        if (native) {
+          const displayId = id;
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `${displayId}: ${native.status} — native background job (${native.type}), not a bgrun job.\n` +
+                  (native.label ? `  cmd: ${native.label}\n` : "") +
+                  "  output: delivered automatically as an async result (no artifact: the host " +
+                  "spills only output it truncated, and only deliveries this session saw resolve)\n" +
+                  `  cancel: oh-my-pi's \`hub cancel ids:["${displayId}"]\` (the host's own tool)`,
+              },
+            ],
+            details: { id, state: native.status, native: true },
+          };
+        }
         return {
-          content: [{ type: "text", text: `No job found with id ${id}` }],
+          content: [
+            {
+              type: "text",
+              text: `No job found with id ${id}. ${unknownJobHint(id, supportsNativeJobSnapshot(ctx))}`,
+            },
+          ],
           details: { id, state: "unknown" },
           isError: true,
         };
@@ -3309,27 +4310,54 @@ export default function (pi: ExtensionAPI) {
         `  (${hiddenOnDisk} more job log(s) on disk — pass includeDone to list, bgclean all to prune)`,
       );
     }
-    if (lines.length === 0) {
+
+    // Host-managed background jobs (omp auto-backgrounds long bash calls) are
+    // listed too, so one call answers "what is running": running always, and
+    // finished ones only when finished jobs were asked for, matching the rule
+    // the bgrun rows above follow. They are not ours to read, clean, or adopt —
+    // the note says where their output goes.
+    const native = [
+      ...nativeJobs(ctx, "running"),
+      ...(showDone ? nativeJobs(ctx, "recent") : []),
+    ];
+    const sections: string[] = [];
+    if (lines.length > 0) sections.push(`bgrun jobs:\n${lines.join("\n")}`);
+    if (native.length > 0) {
+      const rows = native.map(
+        (job) =>
+          `  ${job.id}: ${job.status} — ${nativeJobLabel(job)}`,
+      );
+      sections.push(
+        `native background jobs (host-managed; their output is delivered automatically, and bgtail/bggrep can read it once the host spills it — on oh-my-pi the host's own list is \`hub jobs\` for the agent, \`/jobs\` for a human):\n${rows.join("\n")}`,
+      );
+    }
+    if (sections.length === 0) {
       return {
-        content: [{ type: "text", text: "(no bgrun jobs)" }],
-        details: { count: 0 },
+        content: [{ type: "text", text: "(no background jobs)" }],
+        details: { count: 0, nativeCount: 0 },
       };
     }
     return {
-      content: [{ type: "text", text: `bgrun jobs:\n${lines.join("\n")}` }],
-      details: { count: jobCount },
+      content: [{ type: "text", text: sections.join("\n") }],
+      details: { count: jobCount, nativeCount: native.length },
     };
   }
 
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bgstatus",
     label: "Background Job Status",
     description:
       "Show status of background jobs. With an id: one job's state + exit code. Without: list this session's " +
       "running jobs (finished jobs are hidden by default — pass includeDone or set showCompletedJobs to list " +
       "them). Other sessions' running jobs are listed only when adoptForeignJobs is enabled; finished foreign " +
-      "logs from the shared dir can also appear when finished jobs are included.",
-    promptSnippet: "Check status of bgrun jobs",
+      "logs from the shared dir can also appear when finished jobs are included. Host-managed background jobs " +
+      "(e.g. oh-my-pi's auto-backgrounded bash calls) are listed too, marked native, with where their output " +
+      "goes — they have no log here and are not ours to clean. Note the two job lists are separate: the host's " +
+      "own list (oh-my-pi: `hub jobs`, or /jobs for a human) covers only its jobs and never bgrun's, so use bgstatus for " +
+      "bgrun work and oh-my-pi's `hub cancel` / `bgkill` respectively to stop the two kinds.",
+    promptSnippet:
+      "Check status of background jobs (bgrun jobs plus host-managed ones)",
     parameters: Type.Object({
       id: Type.Optional(
         Type.String({ description: "Optional job id to inspect" }),
@@ -3345,6 +4373,244 @@ export default function (pi: ExtensionAPI) {
       return bgstatusCore(params, ctx);
     },
   });
+
+  pi.registerTool({
+    ...ESSENTIAL_TOOL,
+    name: "bgkill",
+    label: "Kill Background Job",
+    description:
+      "Stop a running bgrun job (SIGTERM by default; force: true for SIGKILL). Signals the job's whole " +
+      "process group — the command and anything it started — because the job was spawned detached. Refuses " +
+      "when the job already finished (its log stays readable) and when the id is not a bgrun job (a " +
+      "host-managed `bg_N` job belongs to the host: cancel it with oh-my-pi's `hub cancel`). A job started by " +
+      "another " +
+      "session needs includeForeign: true. It refuses a pid that cannot be the job's — one that is already " +
+      "gone, unusable, or recycled onto an unrelated process — because signalling a stranger is worse than " +
+      "failing. It reports the signal it sent, not a guess at the outcome: the authoritative result is the " +
+      "wake that follows (or the stale-check, for a foreign job).",
+    promptSnippet: "Stop a running bgrun job",
+    parameters: Type.Object({
+      id: Type.String({
+        description: "Job id (from bgrun's 'started: <id>' response, or bgstatus)",
+      }),
+      force: Type.Optional(
+        Type.Boolean({
+          description: "Send SIGKILL instead of SIGTERM (for a process that ignores the polite signal)",
+        }),
+      ),
+      includeForeign: Type.Optional(
+        Type.Boolean({
+          description:
+            "Allow stopping a job another session started (an adopted job); refused by default",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return bgkillCore(params, ctx);
+    },
+  });
+
+  // ── bgkill: stop a running job ────────────────────────────────────────────
+  //
+  // The one destructive verb over a job. The child is spawned detached, so it
+  // leads its own process group: signalling the *group* is what stops the
+  // command's children too (a bare pid kill leaves a compiler or test binary
+  // running). Before signalling, the job is resolved and its state checked, so
+  // "killed" is never reported for something that had already finished — and a
+  // job another session owns needs an explicit opt-in, matching bgclean's
+  // session-scoped default.
+
+  async function bgkillCore(
+    params: { id: string; includeForeign?: boolean; force?: boolean },
+    ctx?: ExtensionContext,
+  ): Promise<{
+    content: { type: "text"; text: string }[];
+    details: Record<string, unknown>;
+    isError?: boolean;
+  }> {
+    const { id, includeForeign = false, force = false } = params;
+    validateJobId(id, "bgkill");
+    const signal = force ? "SIGKILL" : "SIGTERM";
+    const cfg = resolveConfig(ctx);
+    const rec = jobs.get(id);
+    const scanned = rec
+      ? undefined
+      : scanJobsDir(cfg.jobsDir).find((entry) => entry.id === id);
+
+    if (!rec && !scanned) {
+      // A native id is a real answer, and the one case where the kill belongs to
+      // the host rather than to us.
+      const native = ctx ? findNativeJob(ctx, id) : undefined;
+      const text = native
+        ? `"${id}" is a host-managed background job, not a bgrun job — bgrun never signals it. ` +
+          `Cancel it with \`hub cancel ids:["${id}"]\` (oh-my-pi's own tool).`
+        : `No running bgrun job with id ${id}. ${unknownJobHint(id, supportsNativeJobSnapshot(ctx))}`;
+      return {
+        content: [{ type: "text", text }],
+        details: { id, state: "unknown", native: native !== undefined },
+        isError: true,
+      };
+    }
+
+    // Only a record we adopted from the jobs dir is foreign: `adopted` is unset
+    // (not false) on our own records, so it cannot be defaulted with `??`.
+    const adopted = rec ? rec.adopted === true : true;
+    const pid = rec && rec.pid > 0 ? rec.pid : (pidFromId(id) ?? -1);
+    const exit = rec?.exitCode ?? scanned?.exit ?? null;
+
+    if (exit !== null && exit !== undefined) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${id} already finished (exit=${exit}) — nothing to kill. Its log is still on disk; \`bgtail ${id}\` reads it.`,
+          },
+        ],
+        details: { id, state: "done", exitCode: exit },
+        isError: true,
+      };
+    }
+    if (adopted && !includeForeign) {
+      const text =
+        `${id} was not started by this session (adopted from the jobs dir), so bgkill leaves it alone. ` +
+        "Pass includeForeign: true if you really mean to stop another session's job.";
+      return {
+        content: [{ type: "text", text }],
+        details: { id, state: "foreign", adopted: true },
+        isError: true,
+      };
+    }
+    if (pid <= 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${id} has no recorded pid (its wrapper never wrote one, or the id is not a bgrun id) — kill it by hand if a process is still attached.`,
+          },
+        ],
+        details: { id, state: "nopid" },
+        isError: true,
+      };
+    }
+    if (pid === 1) {
+      // `kill(-1, sig)` is POSIX for "every process I may signal" — the caller's
+      // shell, editor and the agent itself. A bgrun job's child is never pid 1.
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `${id} resolves to pid 1, which is the init process and never a bgrun job — nothing was ` +
+              "signalled. That id names no job of ours.",
+          },
+        ],
+        details: { id, state: "unknown", pid },
+        isError: true,
+      };
+    }
+
+    // A pid we did not record from our own spawn is only *claimed* by an id or a
+    // file name: pids are recycled, and the jobs dir is a plain directory that a
+    // job's own command can write to. Before anything is signalled, that claim is
+    // checked against the job it claims to be — the id must carry our shape, and
+    // the process must be about as old as the job (the wrapper starts with it), so
+    // a recycled pid *and* a name pointing at some unrelated process are refused.
+    if (!rec || rec.child === undefined) {
+      const epoch = jobEpochFromId(id);
+      const claimedStartMs = rec ? rec.started : (epoch ?? 0) * 1_000;
+      if (claimedStartMs <= 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${id} is not a bgrun job id (expected \`<name>-<epoch>-<pid>\`), so bgkill will not ` +
+                "signal whatever process its name happens to point at. " +
+                unknownJobHint(id, supportsNativeJobSnapshot(ctx)),
+            },
+          ],
+          details: { id, state: "unknown" },
+          isError: true,
+        };
+      }
+      const age = processAgeSeconds(pid);
+      if (age !== undefined) {
+        const jobAge = Math.max(0, Math.round((Date.now() - claimedStartMs) / 1_000));
+        if (Math.abs(age - jobAge) > PID_AGE_TOLERANCE_S) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `${id} names pid ${pid}, but that process is ${age}s old while the job is ${jobAge}s old — ` +
+                  "so the pid does not belong to this job (it was recycled, or the name points elsewhere). " +
+                  "Nothing was signalled. If the job really is still running, find its pid with `bgstatus` and stop it by hand.",
+              },
+            ],
+            details: { id, state: "stale-pid", pid, processAgeSeconds: age, jobAgeSeconds: jobAge },
+            isError: true,
+          };
+        }
+      }
+    }
+    if (!isRunningPid(pid)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `${id}: pid ${pid} is not running, so nothing was signalled. If its log carries no ` +
+              "`__BGRUN_EXIT__` marker, the wrapper died before writing one — `bgstatus` settles that on its next stale-check.",
+          },
+        ],
+        details: { id, state: "gone", pid },
+      };
+    }
+
+    const outcome = signalProcessGroup(pid, signal);
+    if (!outcome.ok && outcome.code !== "ESRCH") {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Could not signal the process group of ${pid} (${outcome.code}). ` +
+              `Kill it directly if you need it gone: kill -${force ? "9" : "TERM"} -- -${pid}`,
+          },
+        ],
+        details: { id, state: "failed", pid, error: outcome.code },
+        isError: true,
+      };
+    }
+    const signalled = outcome.ok;
+
+    // No liveness probe after the signal: a group that has just been signalled
+    // still reads as alive for the few milliseconds the signal is pending (seen
+    // on the real host), and a "retry with force" that fires on a job already
+    // dying is worse than no hint at all. The deterministic answer is the wake
+    // the wrapper's exit triggers — or, for a foreign job, the stale-check.
+    const reached = signalled ? (outcome as { ok: true; scope: "group" | "pid" }).scope : undefined;
+    const lines = [
+      !signalled
+        ? `${id}: no process group with id ${pid} — the wrapper is gone, so nothing was signalled.`
+        : reached === "group"
+          ? `${id}: ${signal} sent to process group ${pid}.`
+          : `${id}: ${signal} sent to pid ${pid} only — this platform cannot signal process groups, so ` +
+            "children the command started may survive.",
+      adopted
+        ? "It belongs to another session: the stale-check settles its state here (no wake is sent to you)."
+        : "You will be woken with its exit code.",
+    ];
+    if (!force) {
+      lines.push(
+        `If it is still running when you next look — some processes ignore ${signal} — retry with force: true.`,
+      );
+    }
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
+      details: { id, state: signalled ? "signalled" : "gone", pid, signal, ...(adopted ? { foreign: true } : {}) },
+    };
+  }
 
   // ── bgclean: remove old job logs ───────────────────────────────────────────
 
@@ -3406,6 +4672,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerTool({
+    ...ESSENTIAL_TOOL,
     name: "bgclean",
     label: "Clean Old Background Jobs",
     description:
@@ -3473,8 +4740,15 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const n = Number(tokens[1]);
-      const res = await bgtailCore(
-        { id, lines: Number.isFinite(n) && n > 0 ? n : undefined },
+      // Stamped like the tool path: a native job's artifact is the host's file
+      // and the reader must say so. Both callers apply annotateNative() — see
+      // bgtailCore's note.
+      const res = annotateNative(
+        await bgtailCore(
+          { id, lines: Number.isFinite(n) && n > 0 ? n : undefined },
+          ctx,
+        ),
+        id,
         ctx,
       );
       if (ctx.hasUI) {
@@ -3505,6 +4779,23 @@ export default function (pi: ExtensionAPI) {
         if (ctx.hasUI) {
           ctx.ui.notify(String(err), "error");
         }
+      }
+    },
+  });
+
+  pi.registerCommand("bgkill", {
+    description: "Stop a running background job (/bgkill <id> [force])",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const id = tokens[0];
+      const force = tokens.some((t) => t.toLowerCase() === "force");
+      if (!id) {
+        if (ctx.hasUI) ctx.ui.notify("usage: /bgkill <job-id> [force]", "error");
+        return;
+      }
+      const res = await bgkillCore({ id, force }, ctx);
+      if (ctx.hasUI) {
+        ctx.ui.notify(res.content[0].text, res.isError ? "error" : "info");
       }
     },
   });

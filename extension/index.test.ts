@@ -28,7 +28,7 @@ import {
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   DIGEST_PRESETS,
   DIGEST_PRESET_IDS,
@@ -129,6 +129,10 @@ type FakeTool = Pick<
   ToolDefinition<any, any, any>,
   "name" | "label" | "description" | "parameters" | "promptSnippet"
 > & {
+  /** pi-only guidance field — read by pi, absent (and folded into `description`) on omp. */
+  promptGuidelines?: string[];
+  /** omp-only presentation field — keeps the tool out of the `xd://` device mount. */
+  loadMode?: "essential" | "discoverable";
   execute(
     toolCallId: string,
     params: any,
@@ -180,6 +184,23 @@ interface FakePiHandles {
   handlers: Map<string, FakeHandler[]>;
   fireSessionStart: () => Promise<void>;
   fireSessionShutdown: () => Promise<void>;
+  /** Fire any registered event handler, for hooks beyond session_start/shutdown. */
+  fireEvent: (event: string, payload: unknown) => Promise<void>;
+  /** Messages the extension routed to the host logger (omp path). */
+  hostLogs: string[];
+}
+
+/**
+ * Which host shape the fake presents. `pi` exposes `registerEntryRenderer` and
+ * reads `promptSnippet`/`promptGuidelines`; `omp` (oh-my-pi) has neither, and
+ * instead injects `zod` plus a `logger` — the two differences the extension
+ * probes for at load time.
+ */
+type FakeHostKind = "pi" | "omp";
+
+interface FakeHostExtras {
+  registerComposerShape?: (definition: unknown) => void;
+  logger?: { warn(message: string): void; error(message: string): void };
 }
 
 function makeFakePi(
@@ -187,8 +208,10 @@ function makeFakePi(
     idle?: boolean;
     priorEntries?: CapturedEntry[];
     ctxFields?: Record<string, unknown>;
+    host?: FakeHostKind;
   } = {},
 ): FakePiHandles {
+  const host = opts.host ?? "pi";
   const wakes: CapturedWake[] = [];
   const entries: CapturedEntry[] = opts.priorEntries
     ? [...opts.priorEntries]
@@ -197,6 +220,7 @@ function makeFakePi(
   const commands = new Map<string, FakeCommand>();
   const entryRenderers = new Map<string, FakeRenderer>();
   const handlers = new Map<string, FakeHandler[]>();
+  const hostLogs: string[] = [];
   const idle = opts.idle ?? true;
   const ctx = {
     isIdle: () => idle,
@@ -209,7 +233,8 @@ function makeFakePi(
   // Typed against the real ExtensionAPI members the extension uses — the
   // compile-time drift guard. `as ExtensionAPI` below is the unavoidable seam
   // (the fake is deliberately partial); the *shapes* here are the real ones.
-  const used: UsedExtensionAPI = {
+  // `Partial` because the omp shape legitimately omits the pi-only members.
+  const used: Partial<UsedExtensionAPI> & FakeHostExtras = {
     sendUserMessage(content, options) {
       wakes.push({
         text: content as string,
@@ -223,21 +248,39 @@ function makeFakePi(
         data: data as Record<string, any> | undefined,
       });
     },
-    registerEntryRenderer(customType: string, renderer: EntryRenderer<any>) {
-      entryRenderers.set(customType, renderer as unknown as FakeRenderer);
-    },
     registerTool(def) {
       tools.set(def.name, def as unknown as FakeTool);
     },
     registerCommand(name, options) {
       commands.set(name, options as unknown as FakeCommand);
     },
-    on(event: string, handler: unknown) {
+    on(this: unknown, event: string, handler: unknown) {
+      // The real host implements `on` as a class method that reads
+      // `this.extension` (oh-my-pi loader.ts:200), so a handler registered
+      // through a *detached* reference throws there — and aborts the entire
+      // extension load. Enforce the same receiver rule here or that failure
+      // mode is invisible to the suite.
+      if (this !== used) {
+        throw new TypeError(
+          "undefined is not an object (evaluating 'this.extension')",
+        );
+      }
       const list = handlers.get(event) ?? [];
       list.push(handler as FakeHandler);
       handlers.set(event, list);
     },
   };
+  if (host === "pi") {
+    used.registerEntryRenderer = (customType: string, renderer: EntryRenderer<any>) => {
+      entryRenderers.set(customType, renderer as unknown as FakeRenderer);
+    };
+  } else {
+    used.registerComposerShape = () => {};
+    used.logger = {
+      warn: (message: string) => hostLogs.push(message),
+      error: (message: string) => hostLogs.push(message),
+    };
+  }
   const pi = used as ExtensionAPI;
 
   const fireSessionStart = async () => {
@@ -252,6 +295,11 @@ function makeFakePi(
       await h(event, ctx);
     }
   };
+  const fireEvent = async (event: string, payload: unknown) => {
+    for (const h of handlers.get(event) ?? []) {
+      await h(payload, ctx);
+    }
+  };
   return {
     pi,
     wakes,
@@ -263,6 +311,8 @@ function makeFakePi(
     handlers,
     fireSessionStart,
     fireSessionShutdown,
+    fireEvent,
+    hostLogs,
   };
 }
 
@@ -311,6 +361,46 @@ async function withJobsDir<T>(
 
 // Default below Bun's 5s test timeout so a stuck wait rejects with a clear
 // message instead of racing the harness kill (a flake-masking failure mode).
+// Poll until a process stops *executing*: gone, or a zombie the OS has not reaped
+// (kill(pid, 0) succeeds for a zombie, so liveness alone cannot answer this).
+async function waitUntilNotRunning(pid: number, timeoutMs = 3_000): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    const stat = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" })
+      .stdout.trim();
+    if (!stat || stat.startsWith("Z")) return true;
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+// Poll for a path to appear: fixtures that must be *ready* before the test
+// signals them (see the SIGTERM-trapping process in the bgkill tests).
+async function waitForPath(path: string, timeoutMs = 3_000): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    if (existsSync(path)) return true;
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+// Poll for a process to disappear. Used by the bgkill tests, where the signal is
+// asynchronous: the tool reports liveness at signal time, and the test asserts
+// the eventual state.
+async function waitUntilGone(pid: number, timeoutMs = 3_000): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 function waitForWakes(
   wakes: CapturedWake[],
   count: number,
@@ -559,6 +649,46 @@ test("bgtail: raw=true skips condensing", async () => {
       "raw keeps repeated lines uncollapsed",
     );
     assert.ok((tail.details as any).condensed === false);
+  });
+});
+
+test("bgtail: a repeated pair survives verbatim, runs of 3+ carry their count", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+
+    // dup,dup (a pair) / spinner x3 (a run) / done — through the real surface:
+    // spawn, wake, then read.
+    const res = await bgrun.execute(
+      "call-pair",
+      { command: "printf 'dup\\ndup\\nspinner\\nspinner\\nspinner\\ndone\\n'" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    const tail = await bgtail.execute(
+      "call-pair",
+      { id, lines: 40 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text = tail.content[0].text as string;
+    const body = text.split("\n\n(")[0].trimEnd();
+
+    // The pair is emitted twice — a folded pair would drop a line with nothing
+    // on screen to say so. The triple folds, carrying its count.
+    assert.equal(body, "dup\ndup\nspinner  [x3]\ndone");
+    assert.match(text, /\(1 repeated-line run collapsed\)/);
+    assert.equal(
+      (text.match(/dup/g) ?? []).length,
+      2,
+      "both occurrences of the pair reach the reader",
+    );
   });
 });
 
@@ -4505,7 +4635,7 @@ test("shipped presets: ids are stable and every command ends in head (bounded ou
 test("shipped presets: README and digest-config skill document every preset id", () => {
   const readme = readFileSync(join(process.cwd(), "README.md"), "utf8");
   const skill = readFileSync(
-    join(process.cwd(), "skill", "digest-config", "SKILL.md"),
+    join(process.cwd(), "skills", "digest-config", "SKILL.md"),
     "utf8",
   );
   for (const id of DIGEST_PRESET_IDS) {
@@ -5795,6 +5925,146 @@ test("entry renderer: bgrun-job renders running and done/expanded without throwi
   );
   assert.ok(done, "done + expanded entry renders");
 });
+
+// ── Host contract: oh-my-pi (omp) vs upstream pi ───────────────────────────
+//
+// The hosts differ in four ways the extension must handle:
+//   * omp has no `registerEntryRenderer` at all — calling it aborts the whole
+//     extension load (the original omp porting blocker);
+//   * omp mounts a tool that omits `loadMode: "essential"` as an `xd://` device,
+//     so `bgrun` would stop being directly callable;
+//   * omp ignores `promptSnippet`/`promptGuidelines` on a tool definition, so the
+//     guidance has to reach the model through `description` instead;
+//   * omp exposes a file logger (its TUI owns the terminal), pi does not.
+
+const BG_TOOL_NAMES = ["bgrun", "bgtail", "bggrep", "bgstatus", "bgclean", "bgkill"];
+const BGGREP_HEADLINE = "Never search a bgrun log with the bash tool";
+
+test("host contract (omp): loads without registerEntryRenderer; every tool stays top-level", async () => {
+  const h = makeFakePi({ host: "omp" });
+  await loadExtension(h.pi); // must not throw — regression guard for the load blocker
+  assert.equal(h.entryRenderers.size, 0, "no entry renderer is registered");
+  for (const name of BG_TOOL_NAMES) {
+    const def = h.tools.get(name);
+    assert.ok(def, `${name} is registered`);
+    assert.equal(
+      def.loadMode,
+      "essential",
+      `${name} stays directly callable instead of becoming an xd:// device`,
+    );
+  }
+});
+
+test("host contract (omp): guidance is folded into the description the host actually reads", async () => {
+  const h = makeFakePi({ host: "omp" });
+  await loadExtension(h.pi);
+  assert.match(h.tools.get("bggrep")!.description, new RegExp(BGGREP_HEADLINE));
+  assert.match(
+    h.tools.get("bgrun")!.description,
+    /Use bgrun \(not bash\) for any command expected to run >30s/,
+  );
+});
+
+test("host contract (pi): guidance stays in promptGuidelines and is not duplicated", async () => {
+  const h = makeFakePi();
+  await loadExtension(h.pi);
+  const bggrep = h.tools.get("bggrep")!;
+  assert.ok(h.entryRenderers.has("bgrun-job"), "pi keeps the transcript card");
+  assert.match(bggrep.promptGuidelines!.join("\n"), new RegExp(BGGREP_HEADLINE));
+  assert.doesNotMatch(
+    bggrep.description,
+    new RegExp(BGGREP_HEADLINE),
+    "pi reads promptGuidelines, so the description carries no copy",
+  );
+});
+
+test("host contract (omp): diagnostics go to the host logger, not stderr", async () => {
+  const h = makeFakePi({ host: "omp" });
+  await loadExtension(h.pi);
+  // One unchecked cast for the dynamic module harness: `loadModule()` is typed
+  // loosely because tests reach for whatever the extension exports.
+  const mod = (await loadModule()) as {
+    resolveConfig(ctx: {
+      cwd?: string;
+      isProjectTrusted?: () => boolean;
+      userConfigPath?: string;
+    }): unknown;
+    installHostLogger(logger: {
+      warn(message: string): void;
+      error(message: string): void;
+    }): void;
+  };
+  const userCfg = join(mkTmp("pi-bgrun-user-"), "pi-bgrun.json");
+  writeFileSync(userCfg, "{ not json");
+  const consoleErrors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    consoleErrors.push(args.map(String).join(" "));
+  };
+  try {
+    mod.resolveConfig({
+      cwd: mkTmp("pi-bgrun-proj-"),
+      isProjectTrusted: () => true,
+      userConfigPath: userCfg,
+    });
+  } finally {
+    console.error = originalError;
+    // The sink is module-level: restore console routing for the tests that
+    // follow and assert on console.error.
+    mod.installHostLogger({
+      warn: (m: string) => console.error(m),
+      error: (m: string) => console.error(m),
+    });
+  }
+  assert.ok(
+    h.hostLogs.some((m) => m.includes("malformed")),
+    "the host logger received the config warning",
+  );
+  assert.equal(consoleErrors.length, 0, "nothing was written to stderr");
+});
+
+test("host contract (omp): the stale-job poller uses the host's managed interval and clears it the host's way", async () => {
+  // One unchecked cast for the dynamic module harness, as above.
+  const mod = (await loadModule()) as {
+    scheduleManagedInterval(
+      ctx: unknown,
+      callback: () => void,
+      ms: number,
+    ): { clear: () => void };
+  };
+  const scheduled: { callback: () => void; ms: number }[] = [];
+  const cleared: unknown[] = [];
+  const hostCtx = {
+    setInterval(callback: () => void, ms: number) {
+      scheduled.push({ callback, ms });
+      return "managed-handle";
+    },
+    clearTimer(timer: unknown) {
+      cleared.push(timer);
+    },
+  };
+
+  let ticks = 0;
+  const timer = mod.scheduleManagedInterval(hostCtx, () => ticks++, 250);
+  assert.equal(scheduled.length, 1, "scheduled through the host's managed timer");
+  assert.equal(scheduled[0].ms, 250);
+  scheduled[0].callback();
+  assert.equal(ticks, 1, "the wrapped callback runs");
+  timer.clear();
+  assert.deepEqual(
+    cleared,
+    ["managed-handle"],
+    "stopped through the host's clearTimer, not a raw clearInterval",
+  );
+
+  // A host without managed timers (upstream pi) must still work: raw timer,
+  // unref'd so a running poll never holds the process open, and clearable. This
+  // necessarily constructs a real timer — the fallback IS setInterval — but it
+  // is cleared on the next line, so nothing here waits on the clock and no
+  // fake-timer substitution can exercise the platform path.
+  const raw = mod.scheduleManagedInterval({}, () => {}, 600_000);
+  raw.clear();
+});
 test("bggrep: the match budget trips and reports an error (timeout plumbing)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-bgrun-test-"));
   process.env.PI_BGRUN_DIR = dir;
@@ -7006,5 +7276,1552 @@ test("bgclean: a running job's staging files survive an aggressive sweep", async
   } finally {
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Live panel + status line: what the pi-only transcript card shows ───────
+//
+// oh-my-pi has no entry renderer, so the job card cannot exist there. These two
+// surfaces carry the same information on BOTH hosts at zero context cost: the
+// editor panel is live-only (running jobs — finished and adopted-foreign rows
+// leave it as soon as they end), and the status line keeps the latest outcome
+// visible once the panel is gone.
+
+test("panel + status line: running rows only, and the last outcome once nothing runs", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // Three finished jobs from this session's lineage. They must NOT appear in
+    // the panel (a list of old jobs above the editor competes with live work);
+    // the newest one is what the status line should report.
+    const doneAt = Date.now();
+    const doneEntry = (name: string, exitedAt: number): CapturedEntry => ({
+      type: "custom",
+      customType: "bgrun-job",
+      data: {
+        id: `panel-done-${name}-2000000000-11111`,
+        pid: 11111,
+        cmd: `echo ${name}`,
+        name,
+        started: exitedAt - 5_000,
+        logPath: join(dir, `panel-done-${name}-2000000000-11111.log`),
+        state: "done",
+        exitCode: 0,
+        exitedAt,
+      },
+    });
+    const { pi, wakes, tools, ctx, fireSessionStart } = makeFakePi({
+      priorEntries: [
+        doneEntry("oldest", doneAt - 3_000),
+        doneEntry("newest", doneAt - 1_000),
+        doneEntry("middle", doneAt - 2_000),
+      ],
+    });
+    ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    // Nothing running: no panel (no permanent editor space), but the last
+    // outcome stays visible on the status line.
+    assert.equal(widgetCalls.at(-1), undefined, "idle panel is cleared");
+    assert.equal(statuses.at(-1), "✅ newest exit=0", "status shows the newest outcome");
+
+    await tools
+      .get("bgrun")!
+      .execute("call-panel", { command: "sleep 1", name: "long-one" }, undefined, undefined, ctx);
+
+    const shown = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    const flat = shown.join("\n");
+    assert.match(flat, /bgrun: 1 running/);
+    assert.match(flat, /long-one/);
+    assert.ok(
+      !flat.includes("newest") && !flat.includes("oldest") && !flat.includes("middle"),
+      "finished jobs stay out of the panel",
+    );
+    assert.ok(
+      !/exit=/.test(flat),
+      "the panel reports live state, not past outcomes",
+    );
+    assert.ok(
+      shown.length <= 10,
+      `panel stays inside the host's own cap instead of being truncated by it (${shown.length} lines)`,
+    );
+    assert.equal(statuses.at(-1), "⏳ 1 running", "status counts live jobs");
+
+    // The job finishes: panel goes away, status keeps the outcome.
+    await waitForWakes(wakes, 1);
+    assert.equal(widgetCalls.at(-1), undefined, "panel cleared when nothing runs");
+    assert.equal(statuses.at(-1), "✅ long-one exit=0", "status holds the newest outcome");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("panel: a burst of running jobs is bounded, and says how many it hid", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // Fourteen live jobs: more rows than the budget allows. The panel must say
+    // how many it did not show rather than silently dropping them (or letting a
+    // host truncate the list).
+    const priorEntries: CapturedEntry[] = Array.from({ length: 14 }, (_, i) => ({
+      type: "custom",
+      customType: "bgrun-job",
+      data: {
+        id: `burst-${String(i).padStart(2, "0")}-2000000000-${process.pid}`,
+        pid: process.pid,
+        cmd: `sleep 30 # ${i}`,
+        name: `burst-${i}`,
+        started: Date.now(),
+        logPath: join(dir, `burst-${String(i).padStart(2, "0")}-2000000000-${process.pid}.log`),
+        state: "running",
+      },
+    }));
+    // Each log exists and has no exit marker; the pid is this test process, so
+    // every record revalidates as still running.
+    for (const entry of priorEntries) {
+      writeFileSync(entry.data!.logPath as string, "working\n");
+    }
+
+    const { pi, ctx, fireSessionStart } = makeFakePi({ priorEntries });
+    ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+
+    await loadExtension(pi);
+    await fireSessionStart();
+
+    const shown = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    assert.match(shown[0], /bgrun: 14 running/);
+    assert.ok(shown.length <= 10, `bounded to the host cap (${shown.length} lines)`);
+    assert.match(
+      shown.join("\n"),
+      /… 6 more running/,
+      "the hidden count is stated instead of dropped",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wake digest: a type mismatch reaches the agent once, then stays out of the context", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    // Only a typed entry, so a job that declares the wrong type — or none —
+    // selects nothing. The agent is the only party who can fix that.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ type: "test", preset: "go-test" }],
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute("call-m1", { command: "printf 'x\\n'", name: "mismatch-a" }, undefined, undefined, ctx);
+    await waitForWakes(wakes, 1);
+    await bgrun.execute("call-m2", { command: "printf 'x\\n'", name: "mismatch-a" }, undefined, undefined, ctx);
+    await waitForWakes(wakes, 2);
+
+    assert.match(
+      wakes[0].text,
+      /^digest: no scorecard selected for job name "mismatch-a" — configured types: test/m,
+      "the wake names the job and the configured types",
+    );
+    assert.match(
+      wakes[0].text,
+      /pass the matching `type`/,
+      "the note says how to fix it",
+    );
+    assert.ok(
+      !wakes[1].text.includes("no scorecard selected"),
+      "a repeated mismatch is not re-injected into context",
+    );
+    assert.ok(
+      !wakes[1].text.includes("digest ("),
+      "no scorecard ran for either job",
+    );
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+// ── Native (host-managed) background jobs ──────────────────────────────────
+//
+// omp backgrounds long bash calls itself. Those jobs are not bgrun jobs — they
+// have their own ids (`bg_1`), their output goes to a delivered async result
+// rather than a log here, and they are cancelled on session transitions. They
+// must still be *visible* in the same surfaces, or the two namespaces collide
+// (observed: `bggrep bg_5` dead-ending a session).
+
+interface NativeSnapshotItem {
+  id: string;
+  type: string;
+  status: string;
+  label: string;
+  startTime: number;
+}
+
+/**
+ * A fake session manager with the artifact surface omp exposes: an artifacts
+ * directory, a resolver, and the *receiver rule* the real class methods have
+ * (they read `this.#artifactManagerForSession()`, so a detached call throws —
+ * see the detached-`on` guard for the same reason).
+ */
+function artifactsManager(
+  artifactsDir: string,
+  byId: Record<string, string>,
+): Record<string, unknown> {
+  const manager: Record<string, unknown> = {
+    getEntries: () => [],
+    getArtifactsDir(this: unknown) {
+      if (this !== manager) throw new TypeError("detached getArtifactsDir");
+      return artifactsDir;
+    },
+    async getArtifactPath(this: unknown, id: string) {
+      if (this !== manager) throw new TypeError("detached getArtifactPath");
+      return byId[id] ?? null;
+    },
+  };
+  return manager;
+}
+
+function nativeSnapshotCtxFields(
+  running: NativeSnapshotItem[],
+  recent: NativeSnapshotItem[] = [],
+): Record<string, unknown> {
+  return { getAsyncJobSnapshot: () => ({ running, recent }) };
+}
+
+const NATIVE_RUNNING: NativeSnapshotItem = {
+  id: "bg_9",
+  type: "bash",
+  status: "running",
+  label: "make its",
+  startTime: Date.now() - 60_000,
+};
+const NATIVE_DONE: NativeSnapshotItem = {
+  id: "bg_8",
+  type: "bash",
+  status: "completed",
+  label: "make lint",
+  startTime: Date.now() - 300_000,
+};
+
+test("native jobs: the panel and status line cover host-managed background work", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const h = makeFakePi({
+      ctxFields: nativeSnapshotCtxFields([NATIVE_RUNNING]),
+    });
+    h.ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    h.ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+
+    // Nothing of ours is running, but the host has a job: the panel must still
+    // appear — that is the point of one shared view.
+    const onlyNative = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    assert.match(onlyNative[0], /bgrun: 1 native running/);
+    assert.match(onlyNative.join("\n"), /bg_9.*make its · native bash/);
+    assert.equal(statuses.at(-1), "⏳ 1 running", "the status line counts host jobs");
+
+    await h.tools
+      .get("bgrun")!
+      .execute("call-native", { command: "sleep 1", name: "ours" }, undefined, undefined, h.ctx);
+
+    const both = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    assert.match(both[0], /bgrun: 1 running · 1 native/);
+    const flat = both.join("\n");
+    assert.ok(
+      flat.indexOf("ours") < flat.indexOf("bg_9"),
+      "bgrun rows come first, host rows after",
+    );
+    assert.equal(statuses.at(-1), "⏳ 2 running", "both kinds count as running");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hosts without the native snapshot API are unaffected (upstream pi)", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // No getAsyncJobSnapshot on the ctx at all.
+    const h = makeFakePi();
+    h.ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    h.ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+    assert.equal(widgetCalls.at(-1), undefined, "idle panel stays cleared");
+    assert.equal(statuses.at(-1), undefined, "no phantom status line");
+
+    const list = await h.tools
+      .get("bgstatus")!
+      .execute("c1", {}, undefined, undefined, h.ctx);
+    assert.equal(list.content[0].text, "(no background jobs)");
+
+    // A `bg_N`-shaped id on this host is just an unknown bgrun id: there is no
+    // job manager to explain, no artifact to read back, and no `hub` to cancel
+    // it with. Telling the agent otherwise would be four false clauses and one
+    // instruction it cannot follow.
+    const hint = (
+      await h.tools
+        .get("bggrep")!
+        .execute("c2", { id: "bg_5", pattern: "x" }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.match(hint, /bgrun job ids look like/);
+    assert.ok(!hint.includes("hub cancel"), "no hub remedy on a host without hub");
+    assert.ok(
+      !hint.includes("native background job"),
+      "no job manager is described where none exists",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgstatus: a host-managed id resolves to an explanation, not a dead end", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const h = makeFakePi({
+      ctxFields: nativeSnapshotCtxFields([NATIVE_RUNNING], [NATIVE_DONE]),
+    });
+    await loadExtension(h.pi);
+    const bgstatus = h.tools.get("bgstatus")!;
+
+    const one = await bgstatus.execute("c1", { id: "bg_9" }, undefined, undefined, h.ctx);
+    assert.notEqual(one.isError, true, "a host job is a real answer, not an error");
+    const oneText = one.content[0].text as string;
+    assert.match(oneText, /native background job \(bash\), not a bgrun job/);
+    assert.match(oneText, /delivered automatically/);
+    assert.equal(
+      (one.details as { native?: boolean }).native,
+      true,
+      "the result is marked native",
+    );
+
+    // Listing: running host jobs always, finished ones only when asked.
+    const list = await bgstatus.execute("c2", {}, undefined, undefined, h.ctx);
+    const listText = list.content[0].text as string;
+    assert.match(listText, /native background jobs/);
+    assert.match(listText, /bg_9: running/);
+    assert.ok(!listText.includes("bg_8"), "finished host jobs stay hidden by default");
+
+    const listDone = await bgstatus.execute(
+      "c3",
+      { includeDone: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.match(listDone.content[0].text as string, /bg_8: completed/);
+    assert.equal(
+      (listDone.details as { nativeCount?: number }).nativeCount,
+      2,
+      "both host jobs are reported",
+    );
+
+    // An id that is neither ours nor the host's is still an error.
+    const ghost = await bgstatus.execute("c4", { id: "ghost-1-2" }, undefined, undefined, h.ctx);
+    assert.equal(ghost.isError, true, "an unknown non-native id is still an error");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgtail/bggrep: an unresolvable id names the expected shape and spots a host id", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // A host that *has* a native job manager: a host-minted id says what it is,
+    // where its output went, and how the host kills it.
+    const h = makeFakePi({ ctxFields: nativeSnapshotCtxFields([]) });
+    await loadExtension(h.pi);
+    const bggrep = h.tools.get("bggrep")!;
+
+    const native = await bggrep.execute("c1", { id: "bg_5" }, undefined, undefined, h.ctx);
+    const nativeText = native.content[0].text as string;
+    assert.match(nativeText, /No log found for job bg_5/);
+    assert.match(nativeText, /native background job/);
+    assert.match(nativeText, /hub cancel ids:\["bg_5"\]/, "the host's own kill path");
+    assert.match(nativeText, /<name>-<epoch>-<pid>/, "the bgrun id shape is named");
+
+    // A bgrun-shaped id that simply does not exist: name the shape, but do not
+    // blame the host.
+    const typo = await bggrep.execute("c2", { id: "unit-tests-1-2" }, undefined, undefined, h.ctx);
+    const typoText = typo.content[0].text as string;
+    assert.match(typoText, /<name>-<epoch>-<pid>/);
+    assert.ok(
+      !typoText.includes("native background job"),
+      "a bgrun-shaped id is not blamed on the host",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: the panel refreshes on the host's own start and finish events", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // The host's job set changes underneath us: this stands in for the host
+    // backgrounding a bash call, then delivering its result.
+    let snapshotRunning: NativeSnapshotItem[] = [];
+    const h = makeFakePi({
+      ctxFields: { getAsyncJobSnapshot: () => ({ running: snapshotRunning, recent: [] }) },
+    });
+    h.ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    h.ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+    assert.equal(widgetCalls.at(-1), undefined, "nothing running yet");
+
+    // The host backgrounds a bash call: its tool_result fires, and the panel
+    // must pick the job up even though bgrun did nothing.
+    snapshotRunning = [NATIVE_RUNNING];
+    await h.fireEvent("tool_execution_end", { type: "tool_execution_end", toolName: "bash" });
+    const shown = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    assert.match(shown[0], /bgrun: 1 native running/);
+    assert.equal(statuses.at(-1), "⏳ 1 running");
+
+    // The host delivers the result: the panel clears on that message, not on
+    // the next bgrun event (there may never be one).
+    snapshotRunning = [];
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: { role: "custom", customType: "async-result", content: "done" },
+    });
+    assert.equal(widgetCalls.at(-1), undefined, "panel cleared when the host's job ends");
+
+    // An unrelated message must not rebuild the panel. The host's job set is
+    // changed first, so only the async-result filter can prevent the rebuild —
+    // otherwise the refresh gate (which sees no change) would mask a missing
+    // filter and the assertion could never fail.
+    snapshotRunning = [NATIVE_RUNNING];
+    const before = widgetCalls.length;
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+    });
+    assert.equal(widgetCalls.length, before, "other messages are ignored");
+
+    // The gate itself: `tool_execution_end` fires on every tool call, so a
+    // rebuild per call is what it exists to prevent. One call settles the panel
+    // against the current job set; the next one must not repaint.
+    await h.fireEvent("tool_execution_end", { type: "tool_execution_end", toolName: "bash" });
+    const settled = widgetCalls.length;
+    await h.fireEvent("tool_execution_end", { type: "tool_execution_end", toolName: "bash" });
+    assert.equal(
+      widgetCalls.length,
+      settled,
+      "an unchanged host job set does not repaint the panel",
+    );
+    snapshotRunning = [NATIVE_RUNNING, { ...NATIVE_RUNNING, id: "bg_10" }];
+    await h.fireEvent("tool_execution_end", { type: "tool_execution_end", toolName: "bash" });
+    assert.ok(widgetCalls.length > settled, "a changed job set does repaint");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgrun: the started: line names the project's digest types when none was passed", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [
+        { type: "test", preset: "go-test" },
+        { type: "build", preset: "go-test" },
+        { type: "test", preset: "jest" },
+      ],
+    });
+    const h = makeFakePi();
+    trustCtx(h.ctx, proj, true);
+    await loadExtension(h.pi);
+    const bgrun = h.tools.get("bgrun")!;
+
+    // No type: the vocabulary is named, once per distinct type, at the moment
+    // it can still be used.
+    const noType = await bgrun.execute(
+      "call-hint",
+      { command: "printf 'x\\n'", name: "unit-tests" },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    const text = noType.content[0].text as string;
+    assert.match(text, /^ {2}digest: configured types test, build — pass type: "test" to attach a scorecard$/m);
+
+    // A type was given: nothing to suggest.
+    const withType = await bgrun.execute(
+      "call-hint-2",
+      { command: "printf 'x\\n'", name: "unit-tests", type: "build" },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.ok(
+      !(withType.content[0].text as string).includes("configured types"),
+      "no hint when the caller already passed a type",
+    );
+
+    await waitForWakes(h.wakes, 2);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("bgrun: no digest type hint when the project has no typed entries", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    // Only an untyped default entry: it matches every job, so there is nothing
+    // to pass and nothing to say.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: [{ label: "always", command: "echo x" }],
+    });
+    const h = makeFakePi();
+    trustCtx(h.ctx, proj, true);
+    await loadExtension(h.pi);
+
+    const res = await h.tools
+      .get("bgrun")!
+      .execute("call-no-hint", { command: "printf 'x\\n'" }, undefined, undefined, h.ctx);
+    assert.ok(
+      !(res.content[0].text as string).includes("configured types"),
+      "an untyped digest needs no type from the caller",
+    );
+    await waitForWakes(h.wakes, 1);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("native jobs: a delivered result makes the host's spilled output readable", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  const artifacts = mkTmp("pi-bgrun-artifacts-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // Stands in for the host's own spill of a truncated bash job's full output,
+    // inside the session's artifact directory the way omp lays it out
+    // (`<artifacts dir>/<id>.<toolType>.log`).
+    const spilled = join(artifacts, "3.bash.log");
+    writeFileSync(spilled, "building...\nFAIL: TestFoo\n3 specs, 1 failure\n");
+    // A file that exists and is readable but is *not* the job's spill: the host
+    // (or a forged delivery) naming it must not be believed.
+    const outside = join(mkTmp("pi-bgrun-outside-"), "secret.txt");
+    writeFileSync(outside, "OUTSIDE-ARTIFACT-CONTENT\n");
+    // Mutable so a later artifact can be registered: the isError-skip assertion
+    // below only discriminates if the mapping it would stamp actually exists.
+    const artifactsById: Record<string, string> = { "3": spilled, "4": outside };
+    const h = makeFakePi({
+      ctxFields: {
+        ...nativeSnapshotCtxFields([], [NATIVE_DONE]),
+        sessionManager: artifactsManager(artifacts, artifactsById),
+      },
+    });
+    await loadExtension(h.pi);
+
+    // Before the delivery there is nothing to read — and the id says so
+    // instead of dead-ending on a path that will never exist.
+    const before = await h.tools
+      .get("bgtail")!
+      .execute("c1", { id: "bg_8" }, undefined, undefined, h.ctx);
+    assert.equal(before.isError, true);
+    assert.match(before.content[0].text as string, /native background job/);
+
+    // The host delivers the job's result, advertising the artifact it spilled.
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done",
+        details: { jobs: [{ jobId: "bg_8", meta: { truncation: { artifactId: "3" } } }] },
+      },
+    });
+
+    const t = await h.tools
+      .get("bgtail")!
+      .execute("c2", { id: "bg_8" }, undefined, undefined, h.ctx);
+    const tText = t.content[0].text as string;
+    assert.match(tText, /FAIL: TestFoo/, "bgtail reads the host's spill");
+    assert.match(
+      tText,
+      /artifact 3 — the host's spill of native job bg_8's full output, not a bgrun log/,
+      "and stamps it as the host's file, not ours",
+    );
+
+    const g = await h.tools
+      .get("bggrep")!
+      .execute("c3", { id: "bg_8", pattern: "FAIL" }, undefined, undefined, h.ctx);
+    assert.match(g.content[0].text as string, /FAIL: TestFoo/);
+
+    // The human path reads the same artifact, and must say so too: `/bgtail`
+    // calls the same core, so an unstamped toast would claim bgrun provenance
+    // for the host's file. Content-wise this is a delta read — the tool call
+    // above already advanced the shared bookmark — so only the stamp is asserted.
+    const notes: { text: string }[] = [];
+    h.ctx.hasUI = true;
+    h.ctx.ui.notify = (text: string) => notes.push({ text });
+    await h.commands.get("bgtail")!.handler("bg_8 5", h.ctx);
+    assert.match(
+      notes.at(-1)!.text,
+      /the host's spill of native job bg_8's full output, not a bgrun log/,
+    );
+
+    const s = await h.tools
+      .get("bgstatus")!
+      .execute("c4", { id: "bg_8" }, undefined, undefined, h.ctx);
+    const sText = s.content[0].text as string;
+    assert.match(sText, /native background job \(bash\), not a bgrun job/);
+    assert.ok(sText.includes(spilled), "bgstatus names the path it will read from");
+    assert.match(sText, /hub cancel ids:\["bg_8"\]/, "and the host's own kill path");
+
+    // A delivery naming a readable file *outside* the session artifact directory is
+    // ignored: the host's word about a path is not evidence that the file is the
+    // job's output. The earlier, contained mapping must survive it.
+    const outsideName = outside.split("/").pop()!;
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done",
+        details: { jobs: [{ jobId: "bg_8", meta: { truncation: { artifactId: "4" } } }] },
+      },
+    });
+    const afterOutside = (
+      await h.tools
+        .get("bgtail")!
+        .execute("c5", { id: "bg_8", raw: true }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.ok(
+      !afterOutside.includes("OUTSIDE-ARTIFACT-CONTENT"),
+      "an out-of-directory artifact is not read",
+    );
+    const outsideStatus = (
+      await h.tools
+        .get("bgstatus")!
+        .execute("c6", { id: "bg_8" }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.ok(
+      !outsideStatus.includes(outsideName),
+      "nor advertised as the job's output path",
+    );
+
+    // A read that fails must not be stamped as the host's spill: bggrep trips its
+    // own wall-clock budget here, and the error carries no provenance note.
+    const bigSpill = join(artifacts, "5.bash.log");
+    writeFileSync(bigSpill, Array.from({ length: 4_000 }, (_, i) => `line ${i}`).join("\n"));
+    artifactsById["5"] = bigSpill;
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done",
+        details: { jobs: [{ jobId: "bg_9", meta: { truncation: { artifactId: "5" } } }] },
+      },
+    });
+    const previousBudget = process.env.PI_BGRUN_GREP_TIMEOUT_MS;
+    process.env.PI_BGRUN_GREP_TIMEOUT_MS = "1";
+    try {
+      const timedOut = await h.tools
+        .get("bggrep")!
+        .execute("c7", { id: "bg_9", pattern: "line" }, undefined, undefined, h.ctx);
+      assert.equal(timedOut.isError, true, "the budget trips");
+      assert.ok(
+        !(timedOut.content[0].text as string).includes("read from artifact"),
+        "a failed read is never stamped as the host's spill",
+      );
+    } finally {
+      if (previousBudget === undefined) delete process.env.PI_BGRUN_GREP_TIMEOUT_MS;
+      else process.env.PI_BGRUN_GREP_TIMEOUT_MS = previousBudget;
+    }
+
+    // A second delivery for the same id must not corrupt the mapping.
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done again",
+        details: { jobs: [{ jobId: "bg_8", meta: { truncation: { artifactId: "3" } } }] },
+      },
+    });
+    const again = await h.tools
+      .get("bgtail")!
+      .execute("c5", { id: "bg_8", raw: true }, undefined, undefined, h.ctx);
+    assert.match(again.content[0].text as string, /FAIL: TestFoo/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: a settled result still waiting for delivery is counted", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    let pending = ["bg_8"];
+    const h = makeFakePi({
+      ctxFields: {
+        getAsyncJobSnapshot: () => ({
+          running: [],
+          recent: [NATIVE_DONE],
+          delivery: { queued: pending.length, delivering: false, pendingJobIds: pending },
+        }),
+      },
+    });
+    h.ctx.hasUI = true;
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+    // Settled but not yet injected: not "running", and not in the transcript
+    // either — a blank status line here would read as idle.
+    assert.equal(statuses.at(-1), "⏳ 1 result pending");
+
+    pending = [];
+    await h.fireEvent("tool_execution_end", { type: "tool_execution_end", toolName: "bash" });
+    assert.equal(statuses.at(-1), undefined, "delivered and done: the line clears");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: a transcript change re-indexes instead of reporting the old session", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const doneEntry: CapturedEntry = {
+      type: "custom",
+      customType: "bgrun-job",
+      data: {
+        id: "old-job-1-1",
+        pid: 1,
+        cmd: "echo old",
+        started: Date.now(),
+        logPath: join(dir, "old-job-1-1.log"),
+        state: "done",
+        exitCode: 0,
+        exitedAt: Date.now(),
+      },
+    };
+    let entries: CapturedEntry[] = [doneEntry];
+    const artifacts = mkTmp("pi-bgrun-artifacts-");
+    const spill = join(artifacts, "7.bash.log");
+    writeFileSync(spill, "PREVIOUS SESSION OUTPUT\n");
+    // Mutate the manager rather than spreading it: the fake's methods check their
+    // owner (`this`), the way the host's class methods do, so a spread would make
+    // every call look detached.
+    const sessionManager = artifactsManager(artifacts, { "7": spill });
+    sessionManager.getEntries = () => entries;
+    const h = makeFakePi({
+      ctxFields: {
+        ...nativeSnapshotCtxFields([]),
+        sessionManager,
+      },
+    });
+    h.ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    h.ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+    assert.match(statuses.at(-1)!, /echo old/, "the resumed transcript's job is reported");
+
+    // `/new`: a different transcript, with none of the previous session's jobs.
+    entries = [];
+    await h.fireEvent("session_switch", { type: "session_switch", reason: "new" });
+    assert.equal(
+      statuses.at(-1),
+      undefined,
+      "a fresh transcript must not inherit the previous session's outcome",
+    );
+
+    // A native artifact recorded before the switch must not answer after it: the host
+    // evicts its jobs on a transition and mints the same `bg_N` again for the next
+    // one, so a binding that outlived the transcript would serve the previous
+    // session's output as the new job's.
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done",
+        details: { jobs: [{ jobId: "bg_1", meta: { truncation: { artifactId: "7" } } }] },
+      },
+    });
+    const beforeSwitch = (
+      await h.tools.get("bgtail")!.execute("call-a1", { id: "bg_1", raw: true }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.match(beforeSwitch, /PREVIOUS SESSION OUTPUT/, "the spill is readable before it");
+
+    entries = [];
+    await h.fireEvent("session_switch", { type: "session_switch", reason: "new" });
+    const afterSwitch = (
+      await h.tools.get("bgtail")!.execute("call-a2", { id: "bg_1", raw: true }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.ok(
+      !afterSwitch.includes("PREVIOUS SESSION OUTPUT"),
+      "and is not served after the transcript changed",
+    );
+
+    // A job that is genuinely still running survives the switch: it is alive on
+    // disk, exists nowhere else once dropped, and its wake is still ours.
+    await h.tools
+      .get("bgrun")!
+      .execute("call-run", { command: "sleep 1", name: "survivor" }, undefined, undefined, h.ctx);
+    // A branch lands on a *different* transcript, which is what makes this
+    // assertion about the handler rather than about the state it already had:
+    // only re-indexing can turn the branched-to job into the reported outcome.
+    entries = [
+      {
+        type: "custom",
+        customType: "bgrun-job",
+        data: {
+          id: "branched-job-2-2",
+          pid: 2,
+          cmd: "echo branched",
+          started: Date.now(),
+          logPath: join(dir, "branched-job-2-2.log"),
+          state: "done",
+          exitCode: 1,
+          exitedAt: Date.now(),
+        },
+      },
+    ];
+    await h.fireEvent("session_branch", { type: "session_branch" });
+    const listed = await h.tools.get("bgstatus")!.execute("c1", {}, undefined, undefined, h.ctx);
+    assert.match(listed.content[0].text as string, /survivor/, "a running job is not forgotten");
+    // The branched-to job is in memory only because the handler re-indexed that
+    // transcript; nothing else could have put it there, and its log was never
+    // written, so the on-disk scan cannot explain its presence either.
+    const done = await h.tools
+      .get("bgstatus")!
+      .execute("c2", { includeDone: true }, undefined, undefined, h.ctx);
+    assert.match(
+      done.content[0].text as string,
+      /branched-job-2-2/,
+      "the branched-to transcript's jobs are indexed",
+    );
+
+    await waitForWakes(h.wakes, 1);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: a recycled bg_N id does not serve the previous job's artifact", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  const artifacts = mkTmp("pi-bgrun-artifacts-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const oldSpill = join(artifacts, "3.bash.log");
+    writeFileSync(oldSpill, "OLD JOB OUTPUT: FAIL: previous\n");
+    // The host's view of `bg_1`, which changes under us: first the job that
+    // spilled the artifact, then — after its row was evicted and the id minted
+    // again — a completely different job. The artifact file stays on disk.
+    const oldJob: NativeSnapshotItem = {
+      id: "bg_1",
+      type: "bash",
+      status: "completed",
+      label: "make test",
+      startTime: 1_700_000_000_000,
+    };
+    const recycled: NativeSnapshotItem = {
+      id: "bg_1",
+      type: "bash",
+      status: "running",
+      label: "seq 1 30000",
+      startTime: 1_700_000_999_000,
+    };
+    let running: NativeSnapshotItem[] = [];
+    let recent: NativeSnapshotItem[] = [oldJob];
+    const h = makeFakePi({
+      ctxFields: {
+        getAsyncJobSnapshot: () => ({ running, recent }),
+        sessionManager: artifactsManager(artifacts, { "3": oldSpill }),
+      },
+    });
+    await loadExtension(h.pi);
+
+    // The delivery for the job that really did spill artifact 3…
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done",
+        details: { jobs: [{ jobId: "bg_1", meta: { truncation: { artifactId: "3" } } }] },
+      },
+    });
+
+    // …and then the id comes back as a different job.
+    running = [recycled];
+    recent = [];
+
+    // …is not readable as the *new* bg_1's output: the id now belongs to another
+    // job, and answering with the previous job's log would be a fabrication.
+    const tail = await h.tools
+      .get("bgtail")!
+      .execute("c1", { id: "bg_1" }, undefined, undefined, h.ctx);
+    const text = tail.content[0].text as string;
+    assert.ok(!text.includes("OLD JOB OUTPUT"), "the stale artifact is not served");
+    assert.match(text, /native background job/, "the id still explains itself");
+
+    const status = await h.tools
+      .get("bgstatus")!
+      .execute("c2", { id: "bg_1" }, undefined, undefined, h.ctx);
+    assert.ok(
+      !(status.content[0].text as string).includes(oldSpill),
+      "and bgstatus does not advertise the stale path",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: a remapped artifact resets the delta tail instead of hiding its head", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  const artifacts = mkTmp("pi-bgrun-artifacts-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const first = join(artifacts, "3.bash.log");
+    writeFileSync(first, "SAME FIRST LINE\nold line 2\nold line 3\n");
+    // Same job (same start time) but its full output now resolves elsewhere —
+    // e.g. a re-delivery after the host spilled a second time. Without the path
+    // in the bookmark, the matching first line plus a non-shrinking size read as
+    // "the same log with 1 new line", silently dropping this file's head.
+    const second = join(artifacts, "4.bash.log");
+    writeFileSync(second, "SAME FIRST LINE\nNEW HEAD 2\nNEW HEAD 3\nNEW HEAD 4\n");
+    const job: NativeSnapshotItem = {
+      id: "bg_7",
+      type: "bash",
+      status: "completed",
+      label: "make test",
+      startTime: 1_700_000_000_000,
+    };
+    const h = makeFakePi({
+      ctxFields: {
+        ...nativeSnapshotCtxFields([], [job]),
+        sessionManager: artifactsManager(artifacts, { "3": first, "4": second }),
+      },
+    });
+    await loadExtension(h.pi);
+    const deliver = async (artifactId: string) => {
+      await h.fireEvent("message_start", {
+        type: "message_start",
+        message: {
+          role: "custom",
+          customType: "async-result",
+          content: "done",
+          details: { jobs: [{ jobId: "bg_7", meta: { truncation: { artifactId } } }] },
+        },
+      });
+    };
+    const bgtail = h.tools.get("bgtail")!;
+
+    await deliver("3");
+    assert.match(
+      (await bgtail.execute("c1", { id: "bg_7" }, undefined, undefined, h.ctx)).content[0].text as string,
+      /old line 3/,
+    );
+
+    await deliver("4");
+    const after = (
+      await bgtail.execute("c2", { id: "bg_7" }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.match(after, /log path changed since last read/, "a new file is not a delta");
+    assert.match(after, /NEW HEAD 3/, "and its head is not hidden");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: a hostile label or id cannot reach the panel, status line or tool output", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // A host string with the tricks that matter: escape sequences that would set
+    // a window title, plant a hyperlink, or clear the screen, plus a newline that
+    // would forge an extra panel row. oh-my-pi takes a bash job's label verbatim
+    // from the command line, so this is reachable without a hostile host.
+    const esc = "\u001b";
+    const hostile = `${esc}[2J${esc}]0;pwned\u0007label\nsecond row ${esc}]8;;http://evil.example/\u0007x`;
+    const h = makeFakePi({
+      ctxFields: nativeSnapshotCtxFields([
+        {
+          id: "bg_1",
+          type: `bash${esc}[35m`,
+          status: `running${esc}[2J`,
+          label: hostile,
+          startTime: Date.now(),
+        },
+      ]),
+    });
+    h.ctx.hasUI = true;
+    const widgetCalls: (string[] | undefined)[] = [];
+    h.ctx.ui.setWidget = (_ns: string, lines: string[] | undefined) =>
+      widgetCalls.push(lines);
+    const statuses: (string | undefined)[] = [];
+    h.ctx.ui.setStatus = (_key: string, text: string | undefined) =>
+      statuses.push(text);
+
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+
+    // The by-id path renders host `status` and `type` too, not just the label a
+    // sibling assertion already covers.
+    const byId = await h.tools
+      .get("bgstatus")!
+      .execute("c2", { id: "bg_1" }, undefined, undefined, h.ctx);
+    const byIdText = byId.content[0].text as string;
+    assert.ok(!byIdText.includes(esc) && !byIdText.includes("\u0007"), "tool output is inert");
+
+    const panel = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
+    const flat = panel.join("\n");
+    assert.ok(!flat.includes(esc), "no escape sequence reaches the widget");
+    assert.ok(!flat.includes("\u0007"), "no BEL reaches the widget");
+    assert.equal(
+      panel.filter((l) => l.startsWith("📊")).length,
+      1,
+      "the header row cannot be forged",
+    );
+    assert.equal(
+      panel.length,
+      2,
+      "header + one job row: a newline in a label cannot forge a row of its own",
+    );
+    assert.ok(
+      panel[1].includes("second row") && panel[1].includes("label"),
+      "the label stays on its own row, newline flattened to a space",
+    );
+    assert.ok(statuses.at(-1)!.indexOf(esc) === -1, "nor the status line");
+
+    // The same data reaches the model through tool output; it must be inert there
+    // too (an escape-laden line is also how instructions hide in a transcript).
+    const listed = await h.tools
+      .get("bgstatus")!
+      .execute("c1", { includeDone: true }, undefined, undefined, h.ctx);
+    const rows = listed.content[0].text as string;
+    assert.ok(!rows.includes(esc) && !rows.includes("\u0007"), "tool output is inert");
+    assert.ok(rows.includes("label"), "and still carries the readable text");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native jobs: the stale poller uses the host's managed timers where they exist", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // An unsupervised running job (reconstructed from the transcript: no child
+    // handle) is what starts the poller. Its pid is this test process, so it is
+    // genuinely alive and the revalidation leaves it running.
+    const logPath = join(dir, "rebuilt-job-1-1.log");
+    writeFileSync(logPath, "still working\n");
+    const scheduled: { ms: number }[] = [];
+    const cleared: unknown[] = [];
+    const h = makeFakePi({
+      priorEntries: [
+        {
+          type: "custom",
+          customType: "bgrun-job",
+          data: {
+            id: "rebuilt-job-1-1",
+            pid: process.pid,
+            cmd: "make test",
+            started: Date.now(),
+            logPath,
+            state: "running",
+          },
+        },
+      ],
+      ctxFields: {
+        setInterval(_cb: () => void, ms: number) {
+          scheduled.push({ ms });
+          return "managed-handle";
+        },
+        clearTimer(timer: unknown) {
+          cleared.push(timer);
+        },
+      },
+    });
+    await loadExtension(h.pi);
+    await h.fireSessionStart();
+    assert.equal(scheduled.length, 1, "the poller is scheduled through the host");
+    assert.equal(scheduled[0].ms, 30_000, "at the stale-check interval");
+
+    await h.fireSessionShutdown();
+    assert.deepEqual(cleared, ["managed-handle"], "and cleared on shutdown");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgkill: stops a running job by signalling its process group", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgkill = tools.get("bgkill")!;
+    const bgstatus = tools.get("bgstatus")!;
+
+    const started = await bgrun.execute(
+      "call-k1",
+      { command: "sleep 30", name: "victim" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (started.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    const jobPid = Number(id.split("-").pop());
+    try {
+    const killed = await bgkill.execute("call-k2", { id }, undefined, undefined, ctx);
+    assert.notEqual(killed.isError, true, "stopping a running job is a normal outcome");
+    assert.match(
+      killed.content[0].text as string,
+      /SIGTERM sent to process group \d+/,
+      "the whole group is signalled, not just the wrapper",
+    );
+
+    // The wrapper records the exit as it dies, so the normal wake path reports
+    // the outcome — bgkill does not have to invent one.
+    await waitForWakes(wakes, 1);
+    const after = await bgstatus.execute("call-k3", { id }, undefined, undefined, ctx);
+    assert.match(after.content[0].text as string, /done/, "the job is finished");
+    } finally {
+      // A failure before the kill lands must not leave a detached `sleep 30` behind.
+      try {
+        process.kill(-jobPid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  });
+});
+
+test("bgkill: refuses finished ids, unknown ids and host-managed ids", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const native = makeFakePi({ ctxFields: nativeSnapshotCtxFields([NATIVE_RUNNING]) });
+    await loadExtension(native.pi);
+
+    // A host-managed job is the host's to stop: the refusal names its kill switch
+    // and never claims to have signalled anything.
+    const bgkill = native.tools.get("bgkill")!;
+    const hostJob = await bgkill.execute("c1", { id: "bg_9" }, undefined, undefined, native.ctx);
+    assert.equal(hostJob.isError, true);
+    const hostText = hostJob.content[0].text as string;
+    assert.match(hostText, /host-managed/, "it names why bgrun will not touch it");
+    assert.match(hostText, /hub cancel ids:\["bg_9"\]/, "the host's own remedy");
+    assert.ok(!hostText.includes("SIGTERM"), "and no claim of having signalled it");
+    assert.equal(
+      (hostJob.details as { native?: boolean }).native,
+      true,
+      "and the result is marked native, not merely 'unknown id'",
+    );
+
+    // An id that names nothing.
+    const unknown = await bgkill.execute(
+      "c2",
+      { id: "unit-tests-1-2" },
+      undefined,
+      undefined,
+      native.ctx,
+    );
+    assert.equal(unknown.isError, true);
+    assert.match(unknown.content[0].text as string, /bgrun job ids look like/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgkill = tools.get("bgkill")!;
+    const started = await bgrun.execute(
+      "call-k4",
+      { command: "true", name: "finished" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (started.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    const late = await bgkill.execute("call-k5", { id }, undefined, undefined, ctx);
+    assert.equal(late.isError, true, "nothing to kill");
+    assert.match(late.content[0].text as string, /already finished \(exit=0\)/);
+    assert.match(
+      late.content[0].text as string,
+      /bgtail/,
+      "and it says where the output still is",
+    );
+
+    // The human path reports the same refusal as an error toast rather than
+    // throwing into the command handler.
+    const notices: { text: string; kind: string }[] = [];
+    ctx.hasUI = true;
+    ctx.ui.notify = (text: string, kind: string) => notices.push({ text, kind });
+    await h.commands.get("bgkill")!.handler(id, ctx);
+    assert.equal(notices.at(-1)!.kind, "error");
+  });
+});
+
+
+test("bgkill: signals the job's group, not just its leader (and refuses a recycled pid)", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  const readyFile = join(dir, ".leader-ready");
+  const childFile = join(dir, ".leader-child");
+  // A *detached* fixture is its own process group leader (a plain background job
+  // inherits the runner's group, which would let a single-pid kill look like a
+  // group kill). It ignores SIGTERM so `force` is exercised, and it leaves a
+  // grandchild in the same group: after a real group signal the leader survives
+  // (it traps) while the grandchild dies — that asymmetry is what proves the
+  // group was reached.
+  // `trap - TERM` in the grandchild is load-bearing: signal dispositions are
+  // inherited, so a plain `sleep 300 &` would *also* ignore the group's TERM and
+  // the test would prove nothing.
+  const leader = spawn("bash", [
+    "-c",
+    `trap '' TERM; (trap - TERM; exec sleep 300) & echo $! > '${childFile}'; touch '${readyFile}'; while true; do sleep 1; done`,
+  ], { detached: true, stdio: "ignore" });
+  const pid = leader.pid!;
+  const id = `group-leader-${Math.floor(Date.now() / 1000)}-${pid}`;
+  writeFileSync(join(dir, `${id}.log`), "leader job\n");
+  try {
+    assert.equal(await waitForPath(readyFile), true, "fixture ready");
+    const pgid = spawnSync("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" })
+      .stdout.trim();
+    assert.equal(Number(pgid), pid, "fixture leads its own process group");
+
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const bgkill = h.tools.get("bgkill")!;
+
+    // A pid that cannot be this job's is refused before any signal. The log claims
+    // an hour-old job while the process is seconds old: a recycled pid.
+    const staleId = `stale-claim-${Math.floor(Date.now() / 1000) - 3_600}-${pid}`;
+    writeFileSync(join(dir, `${staleId}.log`), "stale claim\n");
+    const stale = await bgkill.execute(
+      "call-g1",
+      { id: staleId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.equal(stale.isError, true);
+    assert.match(stale.content[0].text as string, /does not belong to this job/);
+    assert.equal((stale.details as { state?: string }).state, "stale-pid");
+    assert.doesNotThrow(() => process.kill(pid, 0), "the stranger is untouched");
+
+    // Another session's job is refused until asked for, and the refusal leaves it
+    // running (the group test's fixture is in our jobs dir but not our record).
+    const refused = await bgkill.execute("call-g0", { id }, undefined, undefined, h.ctx);
+    assert.equal(refused.isError, true);
+    assert.match(refused.content[0].text as string, /includeForeign/);
+    assert.doesNotThrow(() => process.kill(pid, 0), "still running after the refusal");
+
+    // A real group signal: the leader traps TERM, the grandchild does not.
+    const term = await bgkill.execute(
+      "call-g2",
+      { id, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.notEqual(term.isError, true);
+    assert.match(term.content[0].text as string, /SIGTERM sent to process group/);
+    const grandchild = Number(readFileSync(childFile, "utf8").trim());
+    assert.equal(
+      await waitUntilNotRunning(grandchild),
+      true,
+      "the grandchild stopped with the group (it may be an unreaped zombie — kill(0) would call that alive)",
+    );
+    assert.doesNotThrow(() => process.kill(pid, 0), "the trapping leader survived TERM");
+
+    const kill = await bgkill.execute(
+      "call-g3",
+      { id, includeForeign: true, force: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.match(kill.content[0].text as string, /SIGKILL sent to process group/);
+    assert.equal(await waitUntilGone(pid), true, "SIGKILL ended the leader");
+  } finally {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgkill: pid 1 is never a job, and a pid the name cannot support is refused", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // `kill(-1, sig)` is POSIX for "every process I may signal" — the caller's
+    // shell, editor and the agent itself. A file name ending in `-1` must never
+    // reach it.
+    const broadcastId = `stray-${Math.floor(Date.now() / 1000)}-1`;
+    writeFileSync(join(dir, `${broadcastId}.log`), "not a job\n");
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const bgkill = h.tools.get("bgkill")!;
+    const attempt = await bgkill.execute(
+      "call-p1",
+      { id: broadcastId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.equal(attempt.isError, true);
+    assert.match(attempt.content[0].text as string, /init process and never a bgrun job/);
+    assert.doesNotMatch(attempt.content[0].text as string, /sent to process group/);
+
+    // An id with no job shape at all: nothing to attribute a process to.
+    const shapelessId = "notes-1-12345";
+    writeFileSync(join(dir, `${shapelessId}.log`), "just a file\n");
+    const shapeless = await bgkill.execute(
+      "call-p2",
+      { id: shapelessId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.equal(shapeless.isError, true);
+    assert.match(shapeless.content[0].text as string, /not a bgrun job id/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("job ids with control bytes are refused before anything echoes them", async () => {
+  const h = makeFakePi();
+  await loadExtension(h.pi);
+  const esc = "\u001b";
+  for (const tool of ["bgstatus", "bgtail", "bggrep", "bgkill"]) {
+    const params =
+      tool === "bggrep"
+        ? { id: `x${esc}[2J`, pattern: "x" }
+        : { id: `x${esc}[2J` };
+    await assert.rejects(
+      () => h.tools.get(tool)!.execute("call-c", params, undefined, undefined, h.ctx),
+      /invalid job id/,
+      `${tool} rejects a control-byte id`,
+    );
+  }
+});
+
+test("bgkill: a job whose pid is dead or unusable is reported, not signalled", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const epoch = Math.floor(Date.now() / 1000);
+    // A running entry whose pid no longer exists: the wrapper died without writing
+    // its exit marker (kill -9, a crash). Reporting "not running, nothing was
+    // signalled" is the honest answer — a regression here claims a kill that never
+    // happened.
+    const deadId = `dead-pid-${epoch}-999999`;
+    writeFileSync(join(dir, `${deadId}.log`), "no marker yet\n");
+    // An id whose pid segment is not a number at all: nothing to signal.
+    const noPidId = `no-pid-${epoch}-abc`;
+    writeFileSync(join(dir, `${noPidId}.log`), "no pid\n");
+
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const bgkill = h.tools.get("bgkill")!;
+
+    const gone = await bgkill.execute(
+      "call-d1",
+      { id: deadId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.notEqual(gone.isError, true, "an already-dead job is not an error, just a no-op");
+    assert.match(gone.content[0].text as string, /is not running, so nothing was signalled/);
+    assert.equal((gone.details as { state?: string }).state, "gone");
+
+    const noPid = await bgkill.execute(
+      "call-d2",
+      { id: noPidId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.equal(noPid.isError, true);
+    assert.match(noPid.content[0].text as string, /has no recorded pid/);
+    assert.equal((noPid.details as { state?: string }).state, "nopid");
+
+    // The usage path, which must not throw into the command handler.
+    const notices: { text: string; kind: string }[] = [];
+    h.ctx.hasUI = true;
+    h.ctx.ui.notify = (text: string, kind: string) => notices.push({ text, kind });
+    await h.commands.get("bgkill")!.handler("", h.ctx);
+    assert.match(notices.at(-1)!.text, /usage: \/bgkill/);
+    assert.equal(notices.at(-1)!.kind, "error");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgkill: a live pid with no process group of that id is refused, not signalled", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  // Deliberately *not* detached: it inherits this runner's process group, so there
+  // is no group with its pid — the state a crashed wrapper leaves behind, where the
+  // pid may already belong to something else. A fallback to a single-pid signal
+  // would kill this stranger and report a group signal that never happened.
+  const stranger = spawn("bash", ["-c", "sleep 300"], { stdio: "ignore" });
+  const pid = stranger.pid!;
+  const id = `no-group-${Math.floor(Date.now() / 1000)}-${pid}`;
+  writeFileSync(join(dir, `${id}.log`), "claim without a group\n");
+  try {
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const bgkill = h.tools.get("bgkill")!;
+    const refused = await bgkill.execute(
+      "call-n1",
+      { id, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    // A report, not an error — like a job whose pid is already gone: there is
+    // nothing of ours to signal, and the tool says exactly that.
+    assert.notEqual(refused.isError, true);
+    assert.match(
+      refused.content[0].text as string,
+      /no process group with id \d+ — the wrapper is gone, so nothing was signalled/,
+      "it says nothing was signalled instead of claiming a group signal",
+    );
+    assert.equal((refused.details as { state?: string }).state, "gone");
+    assert.doesNotThrow(() => process.kill(pid, 0), "the stranger is untouched");
+  } finally {
+    stranger.kill("SIGKILL");
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+    void dir;
+  }
+});
+
+test("native jobs: an artifact the host advertises but we cannot use is logged, not swallowed", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  const artifacts = mkTmp("pi-bgrun-artifacts-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const good = join(artifacts, "3.bash.log");
+    writeFileSync(good, "in-dir spill\n");
+    const outside = join(mkTmp("pi-bgrun-outside-"), "elsewhere.txt");
+    writeFileSync(outside, "not a spill\n");
+    // host: "omp" gives the fake a logger, which is where diagnostics go there.
+    const h = makeFakePi({
+      host: "omp",
+      ctxFields: {
+        ...nativeSnapshotCtxFields([], [NATIVE_DONE]),
+        sessionManager: artifactsManager(artifacts, { "3": good, "4": outside }),
+      },
+    });
+    await loadExtension(h.pi);
+    const deliver = async (artifactId: string) => {
+      await h.fireEvent("message_start", {
+        type: "message_start",
+        message: {
+          role: "custom",
+          customType: "async-result",
+          content: "done",
+          details: { jobs: [{ jobId: "bg_8", meta: { truncation: { artifactId } } }] },
+        },
+      });
+    };
+
+    // A contained artifact is ordinary enrichment: nothing to report.
+    await deliver("3");
+    assert.equal(
+      h.hostLogs.filter((m) => m.includes("native job output not readable")).length,
+      0,
+      "a usable artifact is not a diagnostic",
+    );
+
+    // A path outside the artifact dir is refused — and now leaves a trace, so a
+    // host upgrade that changes the layout cannot make the bridge silently stop
+    // working with nothing anywhere to grep.
+    await deliver("4");
+    const gaps = h.hostLogs.filter((m) => m.includes("native job output not readable"));
+    assert.equal(gaps.length, 1, "the refusal is logged once");
+    assert.match(gaps[0], /outside the session artifact dir/);
+
+    // Repeating the same cause stays quiet: diagnostics must not become noise.
+    await deliver("4");
+    assert.equal(
+      h.hostLogs.filter((m) => m.includes("native job output not readable")).length,
+      1,
+      "one line per distinct reason",
+    );
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
   }
 });

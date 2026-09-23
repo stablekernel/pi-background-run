@@ -1,43 +1,89 @@
 # pi-background-run
 
 Run long shell commands (test suites, builds, linters) as detached background jobs
-so your pi agent session stays unblocked and its context stays clean. Output lands
+so your agent session stays unblocked and its context stays clean. Output lands
 on disk — the full log plus a trailing exit marker — so nothing large ever enters
 the conversation; the command returns immediately. When the job finishes,
 pi-background-run **wakes the live agent session** so it proactively reads a
 condensed digest of the results and continues — no polling, no human intervention.
 
-Built as a [pi](https://github.com/earendil-works/pi-coding-agent) extension. No
+Built as an extension for both [pi](https://github.com/earendil-works/pi-coding-agent)
+and [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`). No
 shell runner and no external daemon — the extension spawns the job in-process,
 detects completion via the child `exit` event, and calls `pi.sendUserMessage` to wake
 the agent. The log file is self-describing (full output + a trailing
-`__BGRUN_EXIT__=N` marker), so exit codes survive pi restarting. Two small pieces
-exist beyond the spawn: a 30s timer that only re-checks jobs whose live child handle
-is gone (reconstructed from a restart, or adopted from another session), and a
+`__BGRUN_EXIT__=N` marker), so exit codes survive the agent restarting. Two small
+pieces exist beyond the spawn: a 30s timer that only re-checks jobs whose live child
+handle is gone (reconstructed from a restart, or adopted from another session), and a
 `.last-clean` marker that throttles the **global** orphan sweep (the
 session-scoped sweep is unthrottled).
 
 ## Install
 
 ```bash
-pi install npm:pi-background-run
+pi install npm:pi-background-run        # pi
+omp plugin install npm:pi-background-run  # oh-my-pi
 ```
 
 The scoped alias `@stablekernel/pi-background-run` is the same package (permanent
 namespace claim, published in lockstep). Prefer the unscoped name; the alias is
 not deprecated, so both stay installable and receive every release.
 
-Restart pi after install so the extension loads.
+Restart the agent after install so the extension loads.
+
+### Host differences
+
+One extension serves both hosts. Paths in this README are written against two
+host-supplied names:
+
+| Name | pi | oh-my-pi |
+| --- | --- | --- |
+| `$AGENT_DIR` — the user-level agent directory | `~/.pi/agent` | `~/.omp/agent` (profile-aware) |
+| `$CONFIG_DIR` — the project config directory | `.pi` | `.omp` |
+
+The host also decides several details, all handled internally:
+
+- **Tool visibility.** `omp` mounts any tool that does not opt out as an
+  `xd://` device (`write xd://bgrun {…}`); bgrun declares `loadMode: "essential"`
+  so all six tools stay directly callable, exactly as on pi.
+- **Tool guidance.** pi reads the tool definition's `promptSnippet` /
+  `promptGuidelines` into the system prompt; omp reads only `description`, so on
+  omp the same bullets are folded into the description instead of being dropped.
+- **Job cards.** pi renders an `bgrun-job` card per job in the transcript. omp has
+  no entry renderer (`pi.appendEntry` records are never rendered — it renders only
+  `pi.sendMessage` entries), so on omp the job card is skipped. The entries are
+  still persisted on both hosts, and the index is rebuilt from them on
+  `session_start` and on omp's `session_switch` / `session_branch` (which is how
+  omp announces `/new`, `/resume`, a fork and a tree branch).
+  The card's job — "what is running, and how did the last one end" — is covered on
+  both hosts by the editor panel and the status line (see
+  [What the human sees](#what-the-human-sees)) at no context cost and without an
+  entry renderer; the transcript still anchors each job through the `bgrun` tool
+  card and the wake message, and `bgstatus` has the full history on demand.
+- **Host-managed background jobs.** omp backgrounds long `bash` calls itself and
+  exposes its in-process job list to extensions (`getAsyncJobSnapshot`), so bgrun
+  reports those jobs alongside its own — in the panel, the status line and
+  `bgstatus` (see [What the human sees](#what-the-human-sees)) — and reads back
+  the artifact the host spills a truncated job's full output to. pi has no job
+  manager, no snapshot API and no session artifacts, so every one of those paths
+  degrades to bgrun-only. Nothing here is ever adopted, cancelled or cleaned by
+  bgrun: those jobs are the host's, and `hub` is how the agent steers them.
+- **Diagnostics.** Warnings and errors go to `pi.logger` when the host has one
+  (omp writes `~/.omp/logs/omp.<date>.<pid>.log`; the TUI owns the terminal, so
+  a raw stderr write would corrupt it) and to the console on pi. Anything the
+  *agent* may need to act on is not left there: the digest type-mismatch note
+  rides the wake instead (see [Multiple scorecards](#multiple-scorecards-one-per-job-type)).
 
 ## Tools registered
 
 | Tool | Purpose |
 | ------ | --------- |
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
-| `bgstatus` | Show job status. With an id: any job's state + exit code. Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`). Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
-| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB), **condensed for context**: ANSI escapes stripped, repeated lines collapsed, long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). |
-| `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
+| `bgstatus` | Show job status. With an id: any job's state + exit code — a `bg_N` id (the host's own background job on omp) is answered with its state, where its output went and how to cancel it, rather than "not found". Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`), then the host's background jobs under their own heading. Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
+| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB + 4 KiB of wrapper overhead), **condensed for context**: ANSI escapes stripped, repeated lines collapsed (a run of 3+ folds into one line carrying its `[xN]` count; a pair is kept as two lines — a fold needs its count to stay legible), long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). On omp, a native `bg_N` job's spilled output is read the same way, stamped as the host's file. |
+| `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB + 4 KiB of wrapper overhead; on omp, a native `bg_N` job's spilled output is searchable the same way): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days); `days` must be a positive number (`days: 0` is rejected rather than purging everything). Never removes a running job's log. |
+| `bgkill` | Stop a running job. Optional `force: true` sends `SIGKILL` instead of `SIGTERM`. Signals the job's **whole process group** (the child is spawned detached, so the command and anything it started go together; where a platform cannot signal groups, it falls back to the single pid and says so). Refuses an id that already finished, one that is not a bgrun job (`bg_N` belongs to the host — `hub cancel`), another session's job unless `includeForeign: true`, and a pid that cannot be the job's — gone, unusable, or recycled onto an unrelated process. It reports the signal it sent, not a guess at the outcome: the authoritative result is the wake, or the stale-check for a foreign job. |
 
 ## Slash commands
 
@@ -51,6 +97,7 @@ up as `/` commands):
 | `/bgstatus [id] [done]` | One job's status by id, or the session listing (`done`/`all` includes finished jobs). |
 | `/bgtail <id> [lines]` | Tail a job's log (condensed, same as the tool). |
 | `/bgclean [days] [all]` | Remove old logs — session-scoped by default; `all` sweeps every session's. |
+| `/bgkill <id> [force]` | Stop a running job (its process group; `force` sends SIGKILL). |
 
 `/bgrun` is deliberately not a command — starting jobs (and reacting to their
 wake messages) is the agent's workflow.
@@ -58,8 +105,19 @@ wake messages) is the agent's workflow.
 ## Roadmap / not provided
 
 - Deprecated: the machine-global jobs dir (`PI_BGRUN_GLOBAL_DIR`, `~/.pi-bgrun/jobs`) — see [deprecation](#deprecated-machine-global-jobs-dir). Supported until a future major.
-- `bgkill` — not implemented; to stop a running job, use `kill -- -<pid>` (kill the process group — the child is spawned detached). The pid is the last `--`-separated segment of the job id (e.g. `unit-tests-1726680000-12345` → pid `12345`); it is not shown as a separate field in `bgstatus` output.
+- `bgkill` shipped: `bgkill <id>` stops a running job (process group; `force: true` for SIGKILL). The by-hand equivalent is still `kill -- -<pid>`, where the pid is the last `--`-separated segment of the job id (e.g. `unit-tests-1726680000-12345` → pid `12345`); it is not shown as a separate field in `bgstatus` output.
 - `bgwait` — not implemented; the wake mechanism makes blocking on a job unnecessary in the normal flow.
+- **A job started inside a subagent** (`task`/`eval` child) wakes *that* child, not
+  the parent. Its completion wake is addressed to the session that spawned it, so
+  a long job outliving the child's run wakes nobody. The **log is not lost**: it
+  lands in the shared jobs dir, so `bgstatus <id>` / `bgtail <id>` read it from
+  any session in the project. Start long jobs from the main session (`bgrun` is
+  available to subagents on both hosts; this is about where the wake lands).
+  oh-my-pi's own async machinery would fix it, but it is not reachable from an
+  extension: `ctx` exposes only a read-only `getAsyncJobSnapshot()`, the
+  registering `AsyncJobManager` lives on the internal `ToolSession`, and the
+  built-in `bash` background mode that does register is not delegatable
+  (`ctx.invokeTool` is same-name only).
 
 ## How it works
 
@@ -79,13 +137,63 @@ child 'exit' event fires:
   → pi.sendUserMessage(wake) when idle (triggers a turn)
      or pi.sendUserMessage(wake, { deliverAs: 'followUp' }) when busy
   → ctx.ui.notify(...)  — toast for the human
-  → ctx.ui.setWidget("bgrun", ...)  — updates/clears the live status widget
+  → ctx.ui.setWidget("bgrun", ...)  — live panel: the running jobs
+  → ctx.ui.setStatus("bgrun", ...) — one-line outcome that outlives the panel
 ```
 
-The child writes the log directly via its own stdout fd (no pipe to pi), so the job
-survives pi crashing and the log completes on disk. The trailing
+The child writes the log directly via its own stdout fd (no pipe to the agent), so the job
+survives the agent crashing and the log completes on disk. The trailing
 `__BGRUN_EXIT__=N` marker makes the log self-describing — `bgstatus` recovers the
 exit code even after a restart.
+
+### What the human sees
+
+Both hosts get the same two surfaces, so a job's progress and outcome are
+visible without the conversation having to carry them:
+
+- **Editor panel** (only while something is running — it never takes editor
+  space when idle): a header with the running count, then a row per running job
+  (full id, label, elapsed). Deliberately nothing else — a list of finished jobs
+  above the editor competes with the work in progress, and `bgstatus` answers
+  "what ran" on demand. Rows are bounded to the 10 lines both hosts cap a widget
+  at, with `… N more running` instead of a silently dropped tail.
+- **Status line** (always visible): `⏳ N running` while jobs are in flight,
+  then `✅ <name> exit=0` for the most recent finish, cleared when the session
+  has neither.
+
+Both surfaces also cover the **host's own** background jobs — oh-my-pi
+backgrounds long `bash` calls itself (`bash.autoBackground`, or `async: true`)
+and delivers their output as an async result. Those are not bgrun jobs: their ids
+look like `bg_1`, they have no log here, and they are cancelled when the session
+is switched or replaced. The panel tags them `native` and `bgstatus` lists them
+under their own heading, so one glance (or one call) covers all background work
+in the session, and an id from either namespace explains itself — `bggrep bg_5`
+names what `bg_5` is, where its output went, and how to kill it (oh-my-pi's own
+`hub cancel ids:["bg_5"]`), instead of a bare "no log found".
+
+When the host truncated a native job's output it spills the full text to a
+session artifact, and the delivery advertises the id. bgrun resolves it, so
+`bgtail bg_5` / `bggrep bg_5` read the host's own spill through the same bounded
+readers used for bgrun logs — the same condensation, caps and grep budgets, with
+the output stamped as the host's file (no exit marker, not ours to clean). That
+mapping is deliberately in-memory: `bg_N` ids restart at 1 and artifact ids are
+session-scoped, so a persisted one could point at a different job's output after
+a restart. A native job whose output was small enough to deliver inline has no
+artifact, and bgrun says so rather than inventing a path.
+
+The panel and status line are also re-indexed when oh-my-pi changes the
+transcript: `/new`, `/resume`, a fork and a tree branch emit
+`session_switch`/`session_branch` instead of `session_start`, so listening only
+for `session_start` left a fresh session reporting the jobs of the one before it.
+Finished jobs are dropped with the transcript that ran them; jobs that are still
+running stay, since they outlive it.
+
+On pi a `bgrun-job` card is also drawn in the transcript (an entry renderer),
+which omp cannot render — hence these two surfaces. Neither is a history view:
+the panel is live-only and the status line keeps just the latest outcome (plus
+`N result pending` when the host has settled a job but not yet injected its
+result); use `bgstatus includeDone: true` when you need the full list. See
+[Host differences](#host-differences).
 
 ## Reading results without flooding context
 
@@ -94,7 +202,7 @@ Two-tier read model — the log file itself stays on disk, capped (see
 ever enter the conversation:
 
 - **Quick peek:** `bgtail <id>` — condensed newest lines (ANSI stripped, repeats
-  collapsed, ~2KB/line and ~8KB caps). The first read is the last-40-lines tail; each later
+  collapsed only where the count can be shown, ~2KB/line and ~8KB caps). The first read is the last-40-lines tail; each later
   read returns only what was appended since, so repeated polling is nearly
   free. The wake message itself already carries the exit code and the log's
   last line, so many turns need no follow-up read at all.
@@ -146,7 +254,7 @@ default **64 MiB**, `0` = unlimited):
   the readers that depend on the exit marker staying last. A job past 64 MiB is
   almost always a runaway, so the head is the useful part.
 - The ceiling lives **inside the detached process tree**, so it still holds
-  after pi exits or crashes — it is not a pi-side watchdog.
+  after the agent exits or crashes — it is not an agent-side watchdog.
 - The job is **not** killed, and its real exit code is preserved: bytes past the
   cap are drained and discarded instead of SIGPIPE'ing the producer into `141`.
 - It is **not silent**. The log carries
@@ -169,7 +277,8 @@ default **64 MiB**, `0` = unlimited):
   job as "unknown", not "no failures".
 - Reading a capped log stays readable-whole: the widest `bytes` window is the
   ceiling **plus 4 KiB** (not the ceiling itself, which a capped log always
-  exceeds by its notices and marker), so `bytes: 67108864` still spans the whole
+  exceeds by its notices and marker), so `bytes: 67112960` (ceiling + the wrapper's
+  4 KiB) is what spans the whole
   kept log. Windows are additionally limited to their last 500 000 lines —
   materializing a 64 MiB window of one-character lines would cost gigabytes of
   strings — and when that line bound trims a window, `bgtail`/`bggrep` say so in
@@ -187,26 +296,27 @@ default **64 MiB**, `0` = unlimited):
 ## Configuration
 
 The jobs dir defaults to `<project>/.pi-bgrun/jobs` when the session cwd is
-inside a recognizable project root (`.git` or `.pi`, found by walking up from
+inside a recognizable project root (`.git` or `$CONFIG_DIR`, found by walking up from
 the cwd); otherwise it falls back to `~/.pi-bgrun/jobs`. **Warning:** a
 `jobsDir` (or a `PI_BGRUN_GLOBAL_DIR` target) equal to your home directory is
 dangerous — cleanup removes matching `*.log` files directly there. The home
-directory itself is never treated as a project root — pi's global `~/.pi/agent`
-dir would otherwise make every cwd under `$HOME` resolve to `$HOME` (a symlinked
+directory itself is never treated as a project root — the host's global agent
+dir (`$AGENT_DIR`) would otherwise make every cwd under `$HOME` resolve to `$HOME` (a symlinked
 is still recognized). Override via `jobsDir` / `PI_BGRUN_DIR`. Within a project,
-the dir is shared by every pi session working in that checkout — that sharing
+the dir is shared by every agent session working in that checkout — that sharing
 enables cross-session job lookup, session-restart reconstruction, and
 per-project cleanup. By default each session only *tracks its own jobs*: the
-widget and `bgstatus` listings show this session's running jobs, and finished
-jobs are hidden (ask for them explicitly with `bgstatus includeDone: true`).
-Jobs started by other sessions can still be inspected by id, but they don't
-clutter your widget.
+panel and `bgstatus` listings show this session's running jobs, and `bgstatus`
+keeps finished jobs out of its listing unless asked (`bgstatus includeDone:
+true`) — the panel never shows finished work at all. The status line holds the
+latest outcome. Jobs started by other sessions can still be inspected by id, but
+they don't clutter your panel.
 
 Configuration is layered (later wins): **defaults ← user config file ← project
 config file (trusted projects only) ← environment variables**.
 
-- User: `~/.pi/agent/pi-bgrun.json`
-- Project: `<project>/.pi/pi-bgrun.json`
+- User: `$AGENT_DIR/pi-bgrun.json`
+- Project: `<project>/$CONFIG_DIR/pi-bgrun.json`
 
 The project file is per-contributor state, not shared policy: it is read only for
 a trusted project, it changes what every `bgrun` job in that checkout does, and a
@@ -244,7 +354,7 @@ Benefits:
 - The dir is auto-added to the repo's `.git/info/exclude` (local-only — the
   tracked `.gitignore` is never touched), so logs never pollute `git status`.
   This happens on the first `bgrun`; at session start it also happens for
-  **trusted** projects only, so merely opening pi in an untrusted repo neither
+  **trusted** projects only, so merely opening the agent in an untrusted repo neither
   edits `.git/info/exclude` nor creates the dir. Works in linked worktrees too
   (writes to the common git dir, resolved via the worktree's `commondir` file).
 
@@ -264,7 +374,7 @@ Rules and migration notes:
   `bgclean all` do not also touch `~/.pi-bgrun/jobs`). Set
   `"jobsDir": "~/.pi-bgrun/jobs"` (or any absolute path) to keep using the
   machine-global dir inside a repo.
-- If the cwd has no `.git`/`.pi` at or above it, the default falls back to
+- If the cwd has no `.git`/`$CONFIG_DIR` at or above it, the default falls back to
   `~/.pi-bgrun/jobs`; a relative override also falls back to the global dir
   rather than scattering logs across arbitrary directories.
 - Tools resolve a job's log from the session's job record first, so jobs
@@ -321,7 +431,7 @@ Environment variables (same knobs, handy for one-off overrides):
 | `PI_BGRUN_MAX_LOG_BYTES` | `67108864` (64 MiB) | Byte ceiling for a job's log (stdout+stderr). `0` disables it (unlimited). See [Log size ceiling](#log-size-ceiling). |
 | `PI_BGRUN_GLOBAL_AUTO_CLEAN` | `true` | Set `0`/`false` to disable the automatic orphan sweep (see below). |
 | `PI_BGRUN_GREP_TIMEOUT_MS` | `2000` | Wall-clock budget for a `bggrep` match. A caller-supplied regex that exceeds it is aborted (its worker terminated) and reported as an error instead of hanging — see [Bounded matching](#bounded-matching). |
-| `PI_BGRUN_USER_CONFIG` | `~/.pi/agent/pi-bgrun.json` | Override the user-level config file path (see [Configuration](#configuration)). |
+| `PI_BGRUN_USER_CONFIG` | `$AGENT_DIR/pi-bgrun.json` | Override the user-level config file path (see [Configuration](#configuration)). |
 
 ### Digest scorecard (opt-in)
 
@@ -362,7 +472,7 @@ Three ways, easiest first — pick the first one you're comfortable with:
    projects see on session start ("no digest configured") — once per project
    that has run a bgrun job — is pointing at this same skill.
 2. **One-line preset if you know your stack.** Create
-   `<project>/.pi/pi-bgrun.json` (or merge into an existing one):
+   `<project>/$CONFIG_DIR/pi-bgrun.json` (or merge into an existing one):
 
    ```json
    { "digest": { "preset": "go-test" } }
@@ -435,11 +545,19 @@ bgrun(command: "go test ./...", name: "unit-tests", type: "test")
 ```
 
 `type` is an optional `bgrun` parameter. The vocabulary is defined by the
-`type` fields of the project's digest config in `.pi/pi-bgrun.json`; when the
-project's digest config defines types, prefer passing the matching one. If a
-job's `type` (or name/command) selects no entry, pi-bgrun logs a one-line
-diagnostic naming the job and the configured types — so a mismatched type is
-visible instead of silently scorecard-less.
+`type` fields of the project's digest config in `$CONFIG_DIR/pi-bgrun.json`. You do
+not have to read that file to use it: when a digest with typed entries is
+configured and the job is started **without** a `type`, `bgrun`'s `started:` line
+names the configured types and the one to pass — the one moment the answer is
+still actionable. If a job's `type` (or name/command) selects no entry, the
+**wake itself** carries a line naming the job and the configured types, with the
+fix (`pass the matching type on the next bgrun call`) — the agent is the only
+party who can correct it, and on oh-my-pi a log-only diagnostic would be
+invisible to it. The same fact goes to the
+host log. It is emitted **once per distinct mismatch** (at most 3 per
+session, then suppressed), so a project that never passes the right type cannot
+grow the context per job — a mismatched type is visible without being
+scorecard-less *and* without becoming noise.
 
 Selection order (exactly one entry, or none):
 
@@ -473,7 +591,7 @@ a scorecard.
 The legacy single-object form still works unchanged — `{ "digest": { "preset":
 "go-test" } }` is a one-entry list with no matchers.
 
-Opt in per project via `<project>/.pi/pi-bgrun.json` (read only for trusted
+Opt in per project via `<project>/$CONFIG_DIR/pi-bgrun.json` (read only for trusted
 projects). If both `preset` and `command` are set within one entry, the preset
 wins. An empty list (or one where every entry is invalid) counts as *not
 configured*.
@@ -508,7 +626,7 @@ Shell safety: the command comes from trust-gated config and runs with your
 own privileges — the same trust boundary as the `jobsDir` setting.
 
 A user-level default digest works too: set `digest` in
-`~/.pi/agent/pi-bgrun.json` (path overridable via `PI_BGRUN_USER_CONFIG`), and
+`$AGENT_DIR/pi-bgrun.json` (path overridable via `PI_BGRUN_USER_CONFIG`), and
 any project without its own digest inherits it. The project `digest` section
 overrides the user-level one **wholesale** (no per-key merge).
 

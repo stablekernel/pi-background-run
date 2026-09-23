@@ -1,7 +1,7 @@
 # Dogfooding bgrun in this repo
 
 This repo's maintainers run pi-bgrun on its own test suite. The setup is a
-*personal* project config, not repo policy: `<project>/.pi/pi-bgrun.json` is read
+*personal* project config, not repo policy: `<project>/$CONFIG_DIR/pi-bgrun.json` is read
 only for a trusted project, it changes what every `bgrun` job in the checkout
 does, and one of its keys runs a shell command at wake time. So it is gitignored
 here — copy the example below into your own working copy if you want the same.
@@ -22,8 +22,9 @@ here — copy the example below into your own working copy if you want the same.
 
 ## What it does
 
-- `showCompletedJobs: true` — finished jobs stay in the widget and in
-  `bgstatus` instead of disappearing (the extension's default is `false`).
+- `showCompletedJobs: true` — finished jobs stay in `bgstatus` instead of
+  disappearing (the extension's default is `false`). The live panel shows only
+  running jobs; the status line holds the latest outcome.
 - `digest[0]` — a **scorecard**: at wake time, for a job whose `type` is `test`
   *and* whose command matches `*bun test*`, the `command` runs with `$1` set to
   the job's log path, and its stdout is appended to the wake as
@@ -62,7 +63,7 @@ through to the type-less/glob pass (and, with no entry there, gets no scorecard)
 
 Config layers are `defaults ← user ← project ← env`, so an environment variable
 beats the file (`PI_BGRUN_SHOW_COMPLETED=0`, `PI_BGRUN_MAX_LOG_BYTES=0`). To drop
-the setup, delete `.pi/pi-bgrun.json`; nothing else depends on it.
+the setup, delete `$CONFIG_DIR/pi-bgrun.json`; nothing else depends on it.
 
 ## See also
 

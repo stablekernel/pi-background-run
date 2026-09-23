@@ -28,7 +28,7 @@ jobs:
       # listing), so a Node toolchain here would be dead weight. The one thing a
       # Node job would add is the V8/worker_threads side of bggrep's bounded
       # matching — verified by hand with `node --test extension/index.test.ts`
-      # (193 pass, ~20s). Re-run that by hand after touching the bggrep worker.
+      # (214 pass, ~20s). Re-run that by hand after touching the bggrep worker.
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:

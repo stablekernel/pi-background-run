@@ -222,20 +222,31 @@ function labelFromMatchName(pattern: string): string {
 }
 
 /**
- * One-line diagnostic for the silent no-digest case: a digest IS configured
- * but no entry selected for this job. The usual causes are a `type` the agent
- * never passes (or spells differently) and a `match` glob that never fires.
- * Pure — the wake path decides whether to log it.
+ * The distinct `type` values a digest config declares, in config order. Empty
+ * when no entry is typed. Single-sourced because three surfaces report the same
+ * vocabulary — the no-match log line, the wake note, and bgrun's spawn hint —
+ * and they must never disagree about what the project offers.
  */
-export function digestNoMatchWarning(
- target: DigestJobTarget,
- entries: DigestEntry[],
-): string {
- const declaredTypes = [
-  ...new Set(
-   entries.map((e) => e.type).filter((t): t is string => typeof t === "string"),
-  ),
- ];
+export function digestTypes(entries: readonly DigestEntry[]): string[] {
+  return [
+    ...new Set(
+      entries
+        .map((e) => e.type)
+        .filter((t): t is string => typeof t === "string"),
+    ),
+  ];
+}
+
+/**
+ * The no-match diagnostic's shared facts: how the job was identified and which
+ * types the config declares. Both the log line and the wake note are built from
+ * these, so the two can never describe different things.
+ */
+function digestNoMatchParts(
+  target: DigestJobTarget,
+  entries: DigestEntry[],
+): { job: string; types: string } {
+  const declaredTypes = digestTypes(entries);
  const job =
   target.type === undefined
    ? target.name === undefined
@@ -245,7 +256,39 @@ export function digestNoMatchWarning(
  const types = declaredTypes.length
   ? ` — configured types: ${declaredTypes.join(", ")}`
   : "";
+ return { job, types };
+}
+
+/**
+ * One-line diagnostic for the silent no-digest case: a digest IS configured
+ * but no entry selected for this job. The usual causes are a `type` the agent
+ * never passes (or spells differently) and a `match` glob that never fires.
+ * Pure — the wake path decides whether to log it.
+ */
+export function digestNoMatchWarning(
+ target: DigestJobTarget,
+ entries: DigestEntry[],
+): string {
+ const { job, types } = digestNoMatchParts(target, entries);
  return `[pi-bgrun] digest configured but selected no entry for ${job}${types}`;
+}
+
+/**
+ * Agent-facing form of the same diagnostic, for the wake message. oh-my-pi
+ * routes `pi.logger` output to a file the *agent* never reads, so a bare log
+ * line would leave a mismatched `type` invisible to the only party that can fix
+ * it. Phrased as an instruction rather than a log line; the wake path emits it
+ * at most once per distinct mismatch (see DIGEST_NO_MATCH_WARN_CAP).
+ */
+export function digestNoMatchWakeLine(
+ target: DigestJobTarget,
+ entries: DigestEntry[],
+): string {
+ const { job, types } = digestNoMatchParts(target, entries);
+ return (
+  `digest: no scorecard selected for ${job}${types} — ` +
+  "pass the matching `type` on the next bgrun call to get one"
+ );
 }
 
 /**
