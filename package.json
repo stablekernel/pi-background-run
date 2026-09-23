@@ -1,6 +1,6 @@
 {
   "name": "pi-background-run",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Run long shell commands detached in the background for pi and oh-my-pi (omp); get woken on completion. Output lands in a file; context stays clean.",
   "type": "module",
   "engines": {

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/stablekernel/pi-background-run/compare/v0.6.0...v0.7.0) (2026-09-23)
+
+
+### Features
+
+* run on oh-my-pi, unify both hosts' background jobs, and add bgkill ([#19](https://github.com/stablekernel/pi-background-run/issues/19)) ([fbb15e6](https://github.com/stablekernel/pi-background-run/commit/fbb15e63c014dc81009aaa03486a9c297b0e1716))
+
 ## [0.6.0](https://github.com/stablekernel/pi-background-run/compare/v0.5.0...v0.6.0) (2026-09-20)
 
 
