@@ -28,7 +28,7 @@ import {
 import { join, dirname } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   DIGEST_PRESETS,
   DIGEST_PRESET_IDS,
@@ -361,6 +361,19 @@ async function withJobsDir<T>(
 
 // Default below Bun's 5s test timeout so a stuck wait rejects with a clear
 // message instead of racing the harness kill (a flake-masking failure mode).
+// Poll until a process stops *executing*: gone, or a zombie the OS has not reaped
+// (kill(pid, 0) succeeds for a zombie, so liveness alone cannot answer this).
+async function waitUntilNotRunning(pid: number, timeoutMs = 3_000): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    const stat = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" })
+      .stdout.trim();
+    if (!stat || stat.startsWith("Z")) return true;
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 // Poll for a path to appear: fixtures that must be *ready* before the test
 // signals them (see the SIGTERM-trapping process in the bgkill tests).
 async function waitForPath(path: string, timeoutMs = 3_000): Promise<boolean> {
@@ -5924,7 +5937,7 @@ test("entry renderer: bgrun-job renders running and done/expanded without throwi
 //     guidance has to reach the model through `description` instead;
 //   * omp exposes a file logger (its TUI owns the terminal), pi does not.
 
-const BG_TOOL_NAMES = ["bgrun", "bgtail", "bggrep", "bgstatus", "bgclean"];
+const BG_TOOL_NAMES = ["bgrun", "bgtail", "bggrep", "bgstatus", "bgclean", "bgkill"];
 const BGGREP_HEADLINE = "Never search a bgrun log with the bash tool";
 
 test("host contract (omp): loads without registerEntryRenderer; every tool stays top-level", async () => {
@@ -7831,10 +7844,13 @@ test("native jobs: a delivered result makes the host's spilled output readable",
     // (or a forged delivery) naming it must not be believed.
     const outside = join(mkTmp("pi-bgrun-outside-"), "secret.txt");
     writeFileSync(outside, "OUTSIDE-ARTIFACT-CONTENT\n");
+    // Mutable so a later artifact can be registered: the isError-skip assertion
+    // below only discriminates if the mapping it would stamp actually exists.
+    const artifactsById: Record<string, string> = { "3": spilled, "4": outside };
     const h = makeFakePi({
       ctxFields: {
         ...nativeSnapshotCtxFields([], [NATIVE_DONE]),
-        sessionManager: artifactsManager(artifacts, { "3": spilled, "4": outside }),
+        sessionManager: artifactsManager(artifacts, artifactsById),
       },
     });
     await loadExtension(h.pi);
@@ -7894,6 +7910,68 @@ test("native jobs: a delivered result makes the host's spilled output readable",
     assert.match(sText, /native background job \(bash\), not a bgrun job/);
     assert.ok(sText.includes(spilled), "bgstatus names the path it will read from");
     assert.match(sText, /hub cancel ids:\["bg_8"\]/, "and the host's own kill path");
+
+    // A delivery naming a readable file *outside* the session artifact directory is
+    // ignored: the host's word about a path is not evidence that the file is the
+    // job's output. The earlier, contained mapping must survive it.
+    const outsideName = outside.split("/").pop()!;
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done",
+        details: { jobs: [{ jobId: "bg_8", meta: { truncation: { artifactId: "4" } } }] },
+      },
+    });
+    const afterOutside = (
+      await h.tools
+        .get("bgtail")!
+        .execute("c5", { id: "bg_8", raw: true }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.ok(
+      !afterOutside.includes("OUTSIDE-ARTIFACT-CONTENT"),
+      "an out-of-directory artifact is not read",
+    );
+    const outsideStatus = (
+      await h.tools
+        .get("bgstatus")!
+        .execute("c6", { id: "bg_8" }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.ok(
+      !outsideStatus.includes(outsideName),
+      "nor advertised as the job's output path",
+    );
+
+    // A read that fails must not be stamped as the host's spill: bggrep trips its
+    // own wall-clock budget here, and the error carries no provenance note.
+    const bigSpill = join(artifacts, "5.bash.log");
+    writeFileSync(bigSpill, Array.from({ length: 4_000 }, (_, i) => `line ${i}`).join("\n"));
+    artifactsById["5"] = bigSpill;
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done",
+        details: { jobs: [{ jobId: "bg_9", meta: { truncation: { artifactId: "5" } } }] },
+      },
+    });
+    const previousBudget = process.env.PI_BGRUN_GREP_TIMEOUT_MS;
+    process.env.PI_BGRUN_GREP_TIMEOUT_MS = "1";
+    try {
+      const timedOut = await h.tools
+        .get("bggrep")!
+        .execute("c7", { id: "bg_9", pattern: "line" }, undefined, undefined, h.ctx);
+      assert.equal(timedOut.isError, true, "the budget trips");
+      assert.ok(
+        !(timedOut.content[0].text as string).includes("read from artifact"),
+        "a failed read is never stamped as the host's spill",
+      );
+    } finally {
+      if (previousBudget === undefined) delete process.env.PI_BGRUN_GREP_TIMEOUT_MS;
+      else process.env.PI_BGRUN_GREP_TIMEOUT_MS = previousBudget;
+    }
 
     // A second delivery for the same id must not corrupt the mapping.
     await h.fireEvent("message_start", {
@@ -7969,8 +8047,19 @@ test("native jobs: a transcript change re-indexes instead of reporting the old s
       },
     };
     let entries: CapturedEntry[] = [doneEntry];
+    const artifacts = mkTmp("pi-bgrun-artifacts-");
+    const spill = join(artifacts, "7.bash.log");
+    writeFileSync(spill, "PREVIOUS SESSION OUTPUT\n");
+    // Mutate the manager rather than spreading it: the fake's methods check their
+    // owner (`this`), the way the host's class methods do, so a spread would make
+    // every call look detached.
+    const sessionManager = artifactsManager(artifacts, { "7": spill });
+    sessionManager.getEntries = () => entries;
     const h = makeFakePi({
-      ctxFields: { sessionManager: { getEntries: () => entries } },
+      ctxFields: {
+        ...nativeSnapshotCtxFields([]),
+        sessionManager,
+      },
     });
     h.ctx.hasUI = true;
     const widgetCalls: (string[] | undefined)[] = [];
@@ -7991,6 +8080,34 @@ test("native jobs: a transcript change re-indexes instead of reporting the old s
       statuses.at(-1),
       undefined,
       "a fresh transcript must not inherit the previous session's outcome",
+    );
+
+    // A native artifact recorded before the switch must not answer after it: the host
+    // evicts its jobs on a transition and mints the same `bg_N` again for the next
+    // one, so a binding that outlived the transcript would serve the previous
+    // session's output as the new job's.
+    await h.fireEvent("message_start", {
+      type: "message_start",
+      message: {
+        role: "custom",
+        customType: "async-result",
+        content: "done",
+        details: { jobs: [{ jobId: "bg_1", meta: { truncation: { artifactId: "7" } } }] },
+      },
+    });
+    const beforeSwitch = (
+      await h.tools.get("bgtail")!.execute("call-a1", { id: "bg_1", raw: true }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.match(beforeSwitch, /PREVIOUS SESSION OUTPUT/, "the spill is readable before it");
+
+    entries = [];
+    await h.fireEvent("session_switch", { type: "session_switch", reason: "new" });
+    const afterSwitch = (
+      await h.tools.get("bgtail")!.execute("call-a2", { id: "bg_1", raw: true }, undefined, undefined, h.ctx)
+    ).content[0].text as string;
+    assert.ok(
+      !afterSwitch.includes("PREVIOUS SESSION OUTPUT"),
+      "and is not served after the transcript changed",
     );
 
     // A job that is genuinely still running survives the switch: it is alive on
@@ -8182,7 +8299,13 @@ test("native jobs: a hostile label or id cannot reach the panel, status line or 
     const hostile = `${esc}[2J${esc}]0;pwned\u0007label\nsecond row ${esc}]8;;http://evil.example/\u0007x`;
     const h = makeFakePi({
       ctxFields: nativeSnapshotCtxFields([
-        { id: `bg_1${esc}[31m`, type: "bash", status: "running", label: hostile, startTime: Date.now() },
+        {
+          id: "bg_1",
+          type: `bash${esc}[35m`,
+          status: `running${esc}[2J`,
+          label: hostile,
+          startTime: Date.now(),
+        },
       ]),
     });
     h.ctx.hasUI = true;
@@ -8195,6 +8318,14 @@ test("native jobs: a hostile label or id cannot reach the panel, status line or 
 
     await loadExtension(h.pi);
     await h.fireSessionStart();
+
+    // The by-id path renders host `status` and `type` too, not just the label a
+    // sibling assertion already covers.
+    const byId = await h.tools
+      .get("bgstatus")!
+      .execute("c2", { id: "bg_1" }, undefined, undefined, h.ctx);
+    const byIdText = byId.content[0].text as string;
+    assert.ok(!byIdText.includes(esc) && !byIdText.includes("\u0007"), "tool output is inert");
 
     const panel = [...widgetCalls].reverse().find((l) => Array.isArray(l))!;
     const flat = panel.join("\n");
@@ -8294,7 +8425,8 @@ test("bgkill: stops a running job by signalling its process group", async () => 
       ctx,
     );
     const id = (started.content[0].text as string).match(/^started: ([^\n]+)/)![1];
-
+    const jobPid = Number(id.split("-").pop());
+    try {
     const killed = await bgkill.execute("call-k2", { id }, undefined, undefined, ctx);
     assert.notEqual(killed.isError, true, "stopping a running job is a normal outcome");
     assert.match(
@@ -8308,6 +8440,14 @@ test("bgkill: stops a running job by signalling its process group", async () => 
     await waitForWakes(wakes, 1);
     const after = await bgstatus.execute("call-k3", { id }, undefined, undefined, ctx);
     assert.match(after.content[0].text as string, /done/, "the job is finished");
+    } finally {
+      // A failure before the kill lands must not leave a detached `sleep 30` behind.
+      try {
+        process.kill(-jobPid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
   });
 });
 
@@ -8324,8 +8464,14 @@ test("bgkill: refuses finished ids, unknown ids and host-managed ids", async () 
     const hostJob = await bgkill.execute("c1", { id: "bg_9" }, undefined, undefined, native.ctx);
     assert.equal(hostJob.isError, true);
     const hostText = hostJob.content[0].text as string;
+    assert.match(hostText, /host-managed/, "it names why bgrun will not touch it");
     assert.match(hostText, /hub cancel ids:\["bg_9"\]/, "the host's own remedy");
     assert.ok(!hostText.includes("SIGTERM"), "and no claim of having signalled it");
+    assert.equal(
+      (hostJob.details as { native?: boolean }).native,
+      true,
+      "and the result is marked native, not merely 'unknown id'",
+    );
 
     // An id that names nothing.
     const unknown = await bgkill.execute(
@@ -8375,39 +8521,64 @@ test("bgkill: refuses finished ids, unknown ids and host-managed ids", async () 
   });
 });
 
-test("bgkill: another session's job needs includeForeign, and force kills a stubborn one", async () => {
+
+test("bgkill: signals the job's group, not just its leader (and refuses a recycled pid)", async () => {
   const dir = mkTmp("pi-bgrun-test-");
   process.env.PI_BGRUN_DIR = dir;
-  // A real process outside this session, in its own group and ignoring SIGTERM —
-  // the case a kill tool has to handle rather than hope about.
-  // The readiness file matters: signalling before the trap is installed would
-  // kill the process and make the force step untestable (the first version of
-  // this test raced exactly that way).
-  const readyFile = join(dir, ".stubborn-ready");
-  const spawned = spawnSync("bash", [
+  const readyFile = join(dir, ".leader-ready");
+  const childFile = join(dir, ".leader-child");
+  // A *detached* fixture is its own process group leader (a plain background job
+  // inherits the runner's group, which would let a single-pid kill look like a
+  // group kill). It ignores SIGTERM so `force` is exercised, and it leaves a
+  // grandchild in the same group: after a real group signal the leader survives
+  // (it traps) while the grandchild dies — that asymmetry is what proves the
+  // group was reached.
+  // `trap - TERM` in the grandchild is load-bearing: signal dispositions are
+  // inherited, so a plain `sleep 300 &` would *also* ignore the group's TERM and
+  // the test would prove nothing.
+  const leader = spawn("bash", [
     "-c",
-    `bash -c "trap '' TERM; touch '${readyFile}'; while true; do sleep 1; done" >/dev/null 2>&1 & echo $!`,
-  ]);
-  const pid = Number(spawned.stdout.toString().trim());
-  const id = `foreign-stubborn-${Math.floor(Date.now() / 1000)}-${pid}`;
-  writeFileSync(join(dir, `${id}.log`), "another session's job\n");
+    `trap '' TERM; (trap - TERM; exec sleep 300) & echo $! > '${childFile}'; touch '${readyFile}'; while true; do sleep 1; done`,
+  ], { detached: true, stdio: "ignore" });
+  const pid = leader.pid!;
+  const id = `group-leader-${Math.floor(Date.now() / 1000)}-${pid}`;
+  writeFileSync(join(dir, `${id}.log`), "leader job\n");
   try {
-    assert.ok(pid > 0, "fixture process started");
-    assert.equal(await waitForPath(readyFile), true, "fixture has installed its trap");
+    assert.equal(await waitForPath(readyFile), true, "fixture ready");
+    const pgid = spawnSync("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" })
+      .stdout.trim();
+    assert.equal(Number(pgid), pid, "fixture leads its own process group");
+
     const h = makeFakePi();
     await loadExtension(h.pi);
     const bgkill = h.tools.get("bgkill")!;
 
-    // Not ours: refused, and the process is untouched.
-    const refused = await bgkill.execute("c1", { id }, undefined, undefined, h.ctx);
+    // A pid that cannot be this job's is refused before any signal. The log claims
+    // an hour-old job while the process is seconds old: a recycled pid.
+    const staleId = `stale-claim-${Math.floor(Date.now() / 1000) - 3_600}-${pid}`;
+    writeFileSync(join(dir, `${staleId}.log`), "stale claim\n");
+    const stale = await bgkill.execute(
+      "call-g1",
+      { id: staleId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.equal(stale.isError, true);
+    assert.match(stale.content[0].text as string, /does not belong to this job/);
+    assert.equal((stale.details as { state?: string }).state, "stale-pid");
+    assert.doesNotThrow(() => process.kill(pid, 0), "the stranger is untouched");
+
+    // Another session's job is refused until asked for, and the refusal leaves it
+    // running (the group test's fixture is in our jobs dir but not our record).
+    const refused = await bgkill.execute("call-g0", { id }, undefined, undefined, h.ctx);
     assert.equal(refused.isError, true);
     assert.match(refused.content[0].text as string, /includeForeign/);
     assert.doesNotThrow(() => process.kill(pid, 0), "still running after the refusal");
 
-    // Ours to stop, when asked. It traps SIGTERM, so the honest answer is "still
-    // alive" — and the retry with force is what actually ends it.
+    // A real group signal: the leader traps TERM, the grandchild does not.
     const term = await bgkill.execute(
-      "c2",
+      "call-g2",
       { id, includeForeign: true },
       undefined,
       undefined,
@@ -8415,27 +8586,182 @@ test("bgkill: another session's job needs includeForeign, and force kills a stub
     );
     assert.notEqual(term.isError, true);
     assert.match(term.content[0].text as string, /SIGTERM sent to process group/);
-    assert.match(term.content[0].text as string, /force: true/, "says how to finish it off");
-    // The OS is the witness that SIGTERM did not work, not the tool's prose: the
-    // tool no longer guesses at post-signal liveness (that reading races).
-    assert.equal(await waitUntilGone(pid, 250), false, "the process ignored SIGTERM");
+    const grandchild = Number(readFileSync(childFile, "utf8").trim());
+    assert.equal(
+      await waitUntilNotRunning(grandchild),
+      true,
+      "the grandchild stopped with the group (it may be an unreaped zombie — kill(0) would call that alive)",
+    );
+    assert.doesNotThrow(() => process.kill(pid, 0), "the trapping leader survived TERM");
 
-    const force = await bgkill.execute(
-      "c3",
+    const kill = await bgkill.execute(
+      "call-g3",
       { id, includeForeign: true, force: true },
       undefined,
       undefined,
       h.ctx,
     );
-    assert.match(force.content[0].text as string, /SIGKILL sent to process group/);
-    assert.equal(await waitUntilGone(pid), true, "SIGKILL ends a process that ignored SIGTERM");
+    assert.match(kill.content[0].text as string, /SIGKILL sent to process group/);
+    assert.equal(await waitUntilGone(pid), true, "SIGKILL ended the leader");
   } finally {
     try {
-      process.kill(pid, "SIGKILL");
+      process.kill(-pid, "SIGKILL");
     } catch {
       // already gone
     }
     delete process.env.PI_BGRUN_DIR;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgkill: pid 1 is never a job, and a pid the name cannot support is refused", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    // `kill(-1, sig)` is POSIX for "every process I may signal" — the caller's
+    // shell, editor and the agent itself. A file name ending in `-1` must never
+    // reach it.
+    const broadcastId = `stray-${Math.floor(Date.now() / 1000)}-1`;
+    writeFileSync(join(dir, `${broadcastId}.log`), "not a job\n");
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const bgkill = h.tools.get("bgkill")!;
+    const attempt = await bgkill.execute(
+      "call-p1",
+      { id: broadcastId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.equal(attempt.isError, true);
+    assert.match(attempt.content[0].text as string, /init process and never a bgrun job/);
+    assert.doesNotMatch(attempt.content[0].text as string, /sent to process group/);
+
+    // An id with no job shape at all: nothing to attribute a process to.
+    const shapelessId = "notes-1-12345";
+    writeFileSync(join(dir, `${shapelessId}.log`), "just a file\n");
+    const shapeless = await bgkill.execute(
+      "call-p2",
+      { id: shapelessId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.equal(shapeless.isError, true);
+    assert.match(shapeless.content[0].text as string, /not a bgrun job id/);
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("job ids with control bytes are refused before anything echoes them", async () => {
+  const h = makeFakePi();
+  await loadExtension(h.pi);
+  const esc = "\u001b";
+  for (const tool of ["bgstatus", "bgtail", "bggrep", "bgkill"]) {
+    const params =
+      tool === "bggrep"
+        ? { id: `x${esc}[2J`, pattern: "x" }
+        : { id: `x${esc}[2J` };
+    await assert.rejects(
+      () => h.tools.get(tool)!.execute("call-c", params, undefined, undefined, h.ctx),
+      /invalid job id/,
+      `${tool} rejects a control-byte id`,
+    );
+  }
+});
+
+test("bgkill: a job whose pid is dead or unusable is reported, not signalled", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  try {
+    const epoch = Math.floor(Date.now() / 1000);
+    // A running entry whose pid no longer exists: the wrapper died without writing
+    // its exit marker (kill -9, a crash). Reporting "not running, nothing was
+    // signalled" is the honest answer — a regression here claims a kill that never
+    // happened.
+    const deadId = `dead-pid-${epoch}-999999`;
+    writeFileSync(join(dir, `${deadId}.log`), "no marker yet\n");
+    // An id whose pid segment is not a number at all: nothing to signal.
+    const noPidId = `no-pid-${epoch}-abc`;
+    writeFileSync(join(dir, `${noPidId}.log`), "no pid\n");
+
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const bgkill = h.tools.get("bgkill")!;
+
+    const gone = await bgkill.execute(
+      "call-d1",
+      { id: deadId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.notEqual(gone.isError, true, "an already-dead job is not an error, just a no-op");
+    assert.match(gone.content[0].text as string, /is not running, so nothing was signalled/);
+    assert.equal((gone.details as { state?: string }).state, "gone");
+
+    const noPid = await bgkill.execute(
+      "call-d2",
+      { id: noPidId, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    assert.equal(noPid.isError, true);
+    assert.match(noPid.content[0].text as string, /has no recorded pid/);
+    assert.equal((noPid.details as { state?: string }).state, "nopid");
+
+    // The usage path, which must not throw into the command handler.
+    const notices: { text: string; kind: string }[] = [];
+    h.ctx.hasUI = true;
+    h.ctx.ui.notify = (text: string, kind: string) => notices.push({ text, kind });
+    await h.commands.get("bgkill")!.handler("", h.ctx);
+    assert.match(notices.at(-1)!.text, /usage: \/bgkill/);
+    assert.equal(notices.at(-1)!.kind, "error");
+  } finally {
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bgkill: a live pid with no process group of that id is refused, not signalled", async () => {
+  const dir = mkTmp("pi-bgrun-test-");
+  process.env.PI_BGRUN_DIR = dir;
+  // Deliberately *not* detached: it inherits this runner's process group, so there
+  // is no group with its pid — the state a crashed wrapper leaves behind, where the
+  // pid may already belong to something else. A fallback to a single-pid signal
+  // would kill this stranger and report a group signal that never happened.
+  const stranger = spawn("bash", ["-c", "sleep 300"], { stdio: "ignore" });
+  const pid = stranger.pid!;
+  const id = `no-group-${Math.floor(Date.now() / 1000)}-${pid}`;
+  writeFileSync(join(dir, `${id}.log`), "claim without a group\n");
+  try {
+    const h = makeFakePi();
+    await loadExtension(h.pi);
+    const bgkill = h.tools.get("bgkill")!;
+    const refused = await bgkill.execute(
+      "call-n1",
+      { id, includeForeign: true },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    // A report, not an error — like a job whose pid is already gone: there is
+    // nothing of ours to signal, and the tool says exactly that.
+    assert.notEqual(refused.isError, true);
+    assert.match(
+      refused.content[0].text as string,
+      /no process group with id \d+ — the wrapper is gone, so nothing was signalled/,
+      "it says nothing was signalled instead of claiming a group signal",
+    );
+    assert.equal((refused.details as { state?: string }).state, "gone");
+    assert.doesNotThrow(() => process.kill(pid, 0), "the stranger is untouched");
+  } finally {
+    stranger.kill("SIGKILL");
+    delete process.env.PI_BGRUN_DIR;
+    rmSync(dir, { recursive: true, force: true });
+    void dir;
   }
 });

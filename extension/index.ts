@@ -33,7 +33,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Box, Text } from "@earendil-works/pi-tui";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   appendFileSync,
   closeSync,
@@ -200,9 +200,9 @@ export function nativeJobs(
       // the control-byte strip happens here, at the boundary, rather than at
       // each of the four surfaces that render them. `id` stays raw: it is a key
       // for lookups and is sanitized only where it is displayed.
-      id: item.id,
-      type: typeof item.type === "string" ? item.type : "job",
-      status: typeof item.status === "string" ? item.status : "running",
+      id: stripControlChars(item.id),
+      type: typeof item.type === "string" ? stripControlChars(item.type) : "job",
+      status: typeof item.status === "string" ? stripControlChars(item.status) : "running",
       label: typeof item.label === "string" ? stripControlChars(item.label) : "",
       // 0, not now(): a host that omits startTime must not look like a job that
       // started this instant — the value is also the discriminator that tells a
@@ -714,7 +714,21 @@ function readLastLineFromContent(content: string, maxLen = 200): string | null {
 }
 
 function validateJobId(id: string, tool: string): void {
-  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
+  // The single gate in front of every id. It rejects:
+  //   * a path shape — an id can never address a file outside the jobs dir;
+  //   * control bytes — every consumer echoes the id into tool output and the
+  //     transcript, where ESC/BEL would inject terminal sequences;
+  //   * an implausible length.
+  // JSON.stringify in the error keeps the rejected value printable without
+  // letting it become an argument.
+  if (
+    !id ||
+    id.length > 200 ||
+    id.includes("/") ||
+    id.includes("\\") ||
+    id.includes("..") ||
+    /[\u0000-\u001F\u007F-\u009F]/.test(id)
+  ) {
     throw new Error(`${tool}: invalid job id ${JSON.stringify(id)}`);
   }
 }
@@ -737,30 +751,78 @@ function isInsideDir(dir: string, target: string): boolean {
 }
 
 /**
+ * The epoch second a bgrun id encodes (`<slug>-<epoch>-<pid>`), or undefined when
+ * the id does not carry a plausible one. Used to reason about a job's age when the
+ * only thing naming its process is a file name.
+ */
+function jobEpochFromId(id: string): number | undefined {
+  const parts = id.split("-");
+  if (parts.length < 3) return undefined;
+  const epoch = Number(parts[parts.length - 2]);
+  if (!Number.isInteger(epoch)) return undefined;
+  const now = Math.floor(Date.now() / 1000);
+  // A unix second, not a version or a counter: keeps `notes-1-12345` out.
+  return epoch > 1_600_000_000 && epoch < now + 86_400 ? epoch : undefined;
+}
+
+/**
+ * How long the process at `pid` has been alive, in seconds — or undefined when the
+ * OS will not say (no `ps`, an unparseable format, the process is gone). Undefined
+ * means "cannot check", never "mismatch": this guards against signalling a
+ * stranger, it is not a precondition for stopping a job.
+ */
+function processAgeSeconds(pid: number): number | undefined {
+  const out = spawnSync("ps", ["-o", "etime=", "-p", String(pid)], {
+    encoding: "utf8",
+  });
+  if (out.status !== 0 || !out.stdout) return undefined;
+  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(out.stdout.trim());
+  if (!m) return undefined;
+  const [, days, hours, minutes, seconds] = m;
+  return (
+    Number(days ?? 0) * 86_400 +
+    Number(hours ?? 0) * 3_600 +
+    Number(minutes ?? 0) * 60 +
+    Number(seconds ?? 0)
+  );
+}
+
+/** Outcome of a signal attempt: which scope was reached, or why nothing was. */
+type SignalOutcome =
+  | { ok: true; scope: "group" | "pid" }
+  | { ok: false; code: string };
+
+/**
  * Signal a whole process group by leader pid. bgrun spawns detached, so the job's
  * wrapper leads its own group and `-pid` is what reaches the command *and* the
  * children it started; a bare pid kill would leave a compiler or test binary
- * running. Process groups are POSIX-only, so a failing negative-pid kill falls
- * back to the single pid (the same two-step the digest runner's closure uses).
+ * running.
  *
- * Returns the failure code (`ESRCH` for "already gone") or undefined on success.
+ * Two deliberate limits, both learned from review:
+ *   * **ESRCH is never retried as a single pid.** "No process group with that id"
+ *     means the wrapper is gone — the pid may already belong to an unrelated
+ *     process, and signalling it would kill a stranger while reporting a group
+ *     signal that never happened.
+ *   * The single-pid fallback exists only for platforms that cannot signal groups
+ *     (process groups are POSIX-only), and it says so in its result, because the
+ *     job's children can survive it.
  */
-function signalProcessGroup(pid: number, signal: NodeJS.Signals): string | undefined {
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): SignalOutcome {
   try {
     process.kill(-pid, signal);
-    return undefined;
+    return { ok: true, scope: "group" };
   } catch (err) {
-    const groupCode = (err as NodeJS.ErrnoException).code;
-    try {
-      process.kill(pid, signal);
-      return undefined;
-    } catch (fallbackErr) {
-      const code = (fallbackErr as NodeJS.ErrnoException).code;
-      // ESRCH from either attempt means the process is gone, which is not an
-      // error for a kill: the job is already stopped.
-      if (code === "ESRCH" || groupCode === "ESRCH") return "ESRCH";
-      return code ?? (fallbackErr as Error).message;
+    const groupCode = (err as NodeJS.ErrnoException).code ?? "unknown";
+    if (groupCode === "ESRCH") return { ok: false, code: "ESRCH" };
+    if (groupCode === "EINVAL" || groupCode === "ENOSYS" || groupCode === "ENOTSUP") {
+      try {
+        process.kill(pid, signal);
+        return { ok: true, scope: "pid" };
+      } catch (fallbackErr) {
+        return { ok: false, code: (fallbackErr as NodeJS.ErrnoException).code ?? "unknown" };
+      }
     }
+    return { ok: false, code: groupCode };
   }
 }
 
@@ -1834,6 +1896,11 @@ export default function (pi: ExtensionAPI) {
   >();
   // Bounds on that map: at most one entry per delivered job, capped, and a batch
   // larger than this is treated as not-ours (see recordNativeOutputs).
+  // Slack for the pid-attribution check: a wrapper starts within a moment of the
+  // id being minted, and the two facts come from different clocks (the id carries
+  // whole seconds, `ps` reports whole seconds). Generous on purpose — this exists
+  // to catch a pid that cannot be this job's, not to argue about seconds.
+  const PID_AGE_TOLERANCE_S = 60;
   const NATIVE_OUTPUT_CAP = 64;
   const NATIVE_OUTPUT_BATCH_CAP = 64;
 
@@ -2066,7 +2133,7 @@ export default function (pi: ExtensionAPI) {
     });
     for (const job of native) {
       rows.push(
-        `  ${sanitizeHostText(job.id, 64)}  ${nativeJobLabel(job)}  (since ${formatSince(job.startTime)})`,
+        `  ${job.id}  ${nativeJobLabel(job)}  (since ${formatSince(job.startTime)})`,
       );
     }
     lines.push(...rows.slice(0, maxRows));
@@ -4084,7 +4151,7 @@ export default function (pi: ExtensionAPI) {
         // The caller's id, echoed back: stripped for display (it reached us from
         // the model or the host and may carry control bytes) while the lookup
         // above keeps using it raw.
-        const displayId = sanitizeHostText(id, 64);
+        const displayId = id;
         const native = findNativeJob(ctx, id);
         const state = native?.status ?? "completed";
         return {
@@ -4092,9 +4159,9 @@ export default function (pi: ExtensionAPI) {
             {
               type: "text",
               text:
-                `${displayId}: ${sanitizeHostText(state, 32)} — native background job (${sanitizeHostText(native?.type ?? "bash", 32)}), not a bgrun job.\n` +
+                `${displayId}: ${state} — native background job (${native?.type ?? "bash"}), not a bgrun job.\n` +
                 (native?.label ? `  cmd: ${native.label}\n` : "") +
-                `  output: ${nativeOutput.path} (artifact ${sanitizeHostText(nativeOutput.artifactId, 64)} — the host's spill of the full output; bgtail ${displayId} and bggrep ${displayId} read it)\n` +
+                `  output: ${nativeOutput.path} (artifact ${nativeOutput.artifactId} — the host's spill of the full output; bgtail ${displayId} and bggrep ${displayId} read it)\n` +
                 `  cancel: hub cancel ids:["${displayId}"]`,
             },
           ],
@@ -4114,13 +4181,13 @@ export default function (pi: ExtensionAPI) {
         // a bare "not found", which in practice sent a session chasing `bg_5`.
         const native = findNativeJob(ctx, id);
         if (native) {
-          const displayId = sanitizeHostText(id, 64);
+          const displayId = id;
           return {
             content: [
               {
                 type: "text",
                 text:
-                  `${displayId}: ${sanitizeHostText(native.status, 32)} — native background job (${sanitizeHostText(native.type, 32)}), not a bgrun job.\n` +
+                  `${displayId}: ${native.status} — native background job (${native.type}), not a bgrun job.\n` +
                   (native.label ? `  cmd: ${native.label}\n` : "") +
                   "  output: delivered automatically as an async result (no artifact: the host " +
                   "spills only output it truncated, and only deliveries this session saw resolve)\n" +
@@ -4232,7 +4299,7 @@ export default function (pi: ExtensionAPI) {
     if (native.length > 0) {
       const rows = native.map(
         (job) =>
-          `  ${sanitizeHostText(job.id, 64)}: ${sanitizeHostText(job.status, 32)} — ${nativeJobLabel(job)}`,
+          `  ${job.id}: ${job.status} — ${nativeJobLabel(job)}`,
       );
       sections.push(
         `native background jobs (host-managed; their output is delivered automatically, and bgtail/bggrep can read it once the host spills it — the host's own list is \`hub jobs\`, humans \`/jobs\`):\n${rows.join("\n")}`,
@@ -4290,8 +4357,10 @@ export default function (pi: ExtensionAPI) {
       "process group — the command and anything it started — because the job was spawned detached. Refuses " +
       "when the job already finished (its log stays readable) and when the id is not a bgrun job (a " +
       "host-managed `bg_N` job belongs to the host: cancel it with `hub cancel`). A job started by another " +
-      "session needs includeForeign: true. Reports whether the process is still alive after the signal; the " +
-      "authoritative outcome is the wake that follows (or the stale-check, for a foreign job).",
+      "session needs includeForeign: true. It refuses a pid that cannot be the job's — one that is already " +
+      "gone, unusable, or recycled onto an unrelated process — because signalling a stranger is worse than " +
+      "failing. It reports the signal it sent, not a guess at the outcome: the authoritative result is the " +
+      "wake that follows (or the stale-check, for a foreign job).",
     promptSnippet: "Stop a running bgrun job",
     parameters: Type.Object({
       id: Type.String({
@@ -4347,7 +4416,7 @@ export default function (pi: ExtensionAPI) {
       const native = ctx ? findNativeJob(ctx, id) : undefined;
       const text = native
         ? `"${id}" is a host-managed background job, not a bgrun job — bgrun never signals it. ` +
-          `Cancel it with \`hub cancel ids:["${sanitizeHostText(id, 64)}"]\` (the host's own tool).`
+          `Cancel it with \`hub cancel ids:["${id}"]\` (the host's own tool).`
         : `No running bgrun job with id ${id}. ${unknownJobHint(id, supportsNativeJobSnapshot(ctx))}`;
       return {
         content: [{ type: "text", text }],
@@ -4396,6 +4465,67 @@ export default function (pi: ExtensionAPI) {
         isError: true,
       };
     }
+    if (pid === 1) {
+      // `kill(-1, sig)` is POSIX for "every process I may signal" — the caller's
+      // shell, editor and the agent itself. A bgrun job's child is never pid 1.
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `${id} resolves to pid 1, which is the init process and never a bgrun job — nothing was ` +
+              "signalled. That id names no job of ours.",
+          },
+        ],
+        details: { id, state: "unknown", pid },
+        isError: true,
+      };
+    }
+
+    // A pid we did not record from our own spawn is only *claimed* by an id or a
+    // file name: pids are recycled, and the jobs dir is a plain directory that a
+    // job's own command can write to. Before anything is signalled, that claim is
+    // checked against the job it claims to be — the id must carry our shape, and
+    // the process must be about as old as the job (the wrapper starts with it), so
+    // a recycled pid *and* a name pointing at some unrelated process are refused.
+    if (!rec || rec.child === undefined) {
+      const epoch = jobEpochFromId(id);
+      const claimedStartMs = rec ? rec.started : (epoch ?? 0) * 1_000;
+      if (claimedStartMs <= 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${id} is not a bgrun job id (expected \`<name>-<epoch>-<pid>\`), so bgkill will not ` +
+                "signal whatever process its name happens to point at. " +
+                unknownJobHint(id, supportsNativeJobSnapshot(ctx)),
+            },
+          ],
+          details: { id, state: "unknown" },
+          isError: true,
+        };
+      }
+      const age = processAgeSeconds(pid);
+      if (age !== undefined) {
+        const jobAge = Math.max(0, Math.round((Date.now() - claimedStartMs) / 1_000));
+        if (Math.abs(age - jobAge) > PID_AGE_TOLERANCE_S) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `${id} names pid ${pid}, but that process is ${age}s old while the job is ${jobAge}s old — ` +
+                  "so the pid does not belong to this job (it was recycled, or the name points elsewhere). " +
+                  "Nothing was signalled. If the job really is still running, find its pid with `bgstatus` and stop it by hand.",
+              },
+            ],
+            details: { id, state: "stale-pid", pid, processAgeSeconds: age, jobAgeSeconds: jobAge },
+            isError: true,
+          };
+        }
+      }
+    }
     if (!isRunningPid(pid)) {
       return {
         content: [
@@ -4410,32 +4540,36 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
-    const failure = signalProcessGroup(pid, signal);
-    if (failure && failure !== "ESRCH") {
+    const outcome = signalProcessGroup(pid, signal);
+    if (!outcome.ok && outcome.code !== "ESRCH") {
       return {
         content: [
           {
             type: "text",
             text:
-              `Could not signal process group ${pid} (${failure}). ` +
+              `Could not signal the process group of ${pid} (${outcome.code}). ` +
               `Kill it directly if you need it gone: kill -${force ? "9" : "TERM"} -- -${pid}`,
           },
         ],
-        details: { id, state: "failed", pid, error: failure },
+        details: { id, state: "failed", pid, error: outcome.code },
         isError: true,
       };
     }
-    const signalled = failure === undefined;
+    const signalled = outcome.ok;
 
     // No liveness probe after the signal: a group that has just been signalled
     // still reads as alive for the few milliseconds the signal is pending (seen
     // on the real host), and a "retry with force" that fires on a job already
     // dying is worse than no hint at all. The deterministic answer is the wake
     // the wrapper's exit triggers — or, for a foreign job, the stale-check.
+    const reached = signalled ? (outcome as { ok: true; scope: "group" | "pid" }).scope : undefined;
     const lines = [
-      signalled
-        ? `${id}: ${signal} sent to process group ${pid}.`
-        : `${id}: process group ${pid} was already gone — nothing was signalled.`,
+      !signalled
+        ? `${id}: no process group with id ${pid} — the wrapper is gone, so nothing was signalled.`
+        : reached === "group"
+          ? `${id}: ${signal} sent to process group ${pid}.`
+          : `${id}: ${signal} sent to pid ${pid} only — this platform cannot signal process groups, so ` +
+            "children the command started may survive.",
       adopted
         ? "It belongs to another session: the stale-check settles its state here (no wake is sent to you)."
         : "You will be woken with its exit code.",
