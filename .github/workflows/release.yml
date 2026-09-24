@@ -74,20 +74,44 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           EVENT_NAME: ${{ github.event_name }}
+          IS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           pkg_version=$(node -p "require('./package.json').version")
           echo "pkg_version=${pkg_version}" >> "$GITHUB_OUTPUT"
 
+          # A dry run publishes nothing, so there is no version to protect.
+          if [ "$IS_DRY_RUN" = "true" ]; then
+            echo "::notice::DRY-RUN — package.json version that would be published: ${pkg_version}"
+            exit 0
+          fi
+
           if [ "$EVENT_NAME" = "release" ]; then
-            tag_version="${RELEASE_TAG#v}"
-            if [ "$tag_version" != "$pkg_version" ]; then
-              echo "::error title=Version mismatch::Release tag '${RELEASE_TAG}' (${tag_version}) does not match package.json version '${pkg_version}'."
+            tag="$RELEASE_TAG"
+            if [ -z "$tag" ]; then
+              echo "::error title=Missing release tag::The release event carried no tag to validate against."
               exit 1
             fi
-            echo "::notice::Version check passed — tag ${RELEASE_TAG} matches package.json ${pkg_version}"
+            tag_version="${tag#v}"
+            if [ "$tag_version" != "$pkg_version" ]; then
+              echo "::error title=Version mismatch::Release tag '${tag}' (${tag_version}) does not match package.json version '${pkg_version}'."
+              exit 1
+            fi
           else
-            echo "::notice::DRY-RUN — package.json version that would be published: ${pkg_version}"
+            # Manual dispatch, publishing for real. The event carries no tag, so derive
+            # the one that must exist. Without this check a stray dispatch publishes
+            # whatever package.json happens to say — a version with no tag behind it,
+            # no release to point at, and no way to undo it on npm.
+            tag="v${pkg_version}"
+            if ! gh api "repos/${REPO}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+              echo "::error title=No matching tag::Refusing to publish ${pkg_version}: tag '${tag}' does not exist. Create the GitHub Release first."
+              exit 1
+            fi
           fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Version check passed — tag ${tag} matches package.json ${pkg_version}"
 
       # ── Publish primary (unscoped: pi-background-run) ──────────────────────────────
       # package.json ships with "name": "pi-background-run" so the default publish
@@ -140,7 +164,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
           PKG_VERSION: ${{ steps.version_check.outputs.pkg_version }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ steps.version_check.outputs.tag }}
           PRIMARY_OUTCOME: ${{ steps.publish_primary.outcome }}
           ALIAS_OUTCOME: ${{ steps.publish_alias.outcome }}
           WORKFLOW_NAME: ${{ github.workflow }}

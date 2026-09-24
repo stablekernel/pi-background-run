@@ -132,6 +132,11 @@ The full flow, and the two places a human is involved:
    gh workflow run release.yml -f dry-run=false
    ```
 
+   The dispatch refuses to publish unless a tag matching `package.json` exists, so a
+   stray run can never push a version with no release behind it — which on npm is not
+   undoable. A dry run (`-f dry-run=true`, the default) skips that check, since it
+   publishes nothing.
+
 **Why step 4 is manual.** GitHub's exemption list covers `workflow_dispatch`,
 `repository_dispatch`, and those three `pull_request` activity types — `release` is
 **not** on it. So the Release that release-please creates with `GITHUB_TOKEN` does not
@@ -150,11 +155,27 @@ Read and write**. A fine-grained PAT needs org-owner approval (the org default i
 "Require administrator approval"); a classic PAT with `public_repo` does not, and a
 GitHub App needs neither approval nor rotation.
 
-One trap: `||` falls through only on *empty*, so a secret whose value is
-**unauthorised** — a fine-grained PAT still pending approval — short-circuits the
-fallback and makes release-please hard-fail with
-`403 Resource not accessible by personal access token`. Delete it rather than leaving
-it pending; a missing secret is strictly better than a broken one.
+#### An expired token does not block releases
+
+`||` falls through only on *empty*, so a secret that is present but **rejected** —
+expired, revoked, or never approved — would otherwise short-circuit the fallback and
+hard-fail with `403 Resource not accessible by personal access token`.
+
+`release-please.yml` handles that explicitly instead:
+
+1. The first attempt uses `RELEASE_PLEASE_TOKEN || GITHUB_TOKEN` with
+   `continue-on-error: true`, so a rejection cannot fail the job.
+2. On `failure`, a second attempt retries on `GITHUB_TOKEN`. release-please is
+   idempotent, so a retry after a partial first attempt reuses whatever it already
+   created rather than duplicating it.
+3. The run then **fails on purpose**, because a failed workflow run is the only signal
+   GitHub actually notifies on — a warning would reach nobody.
+
+Red here means *rotate the token*, not *releases are broken*: the fallback has already
+opened or updated the Release PR, and publishing never depended on this job. The
+practical effect of an expired token is that releases drop back to the two manual steps
+above, and you get told.
+
 
 ## See also
 
