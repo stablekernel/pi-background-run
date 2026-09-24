@@ -46,12 +46,49 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # First attempt uses the configured token when present, GITHUB_TOKEN otherwise.
+      # continue-on-error so a REJECTED token — expired, revoked, or created but never
+      # approved — degrades to the credential-free path instead of blocking releases
+      # outright. (Testing for the secret itself is not an option: `secrets` is not an
+      # available context in a step `if:`.)
       - name: Release Please
+        id: attempt
+        continue-on-error: true
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          # Defaults to GITHUB_TOKEN, which is a fully supported path — not a
-          # degraded one. It costs one "Approve workflows to run" click on the
-          # Release PR and a manual publish dispatch; see the header above.
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # Same run, on GITHUB_TOKEN. release-please is idempotent, so a retry after a
+      # partial first attempt reuses whatever it already created rather than
+      # duplicating it. Release PRs still open here — they just need the approve click,
+      # and publishing becomes the manual dispatch. See docs/releasing.md.
+      - name: Release Please (fallback to GITHUB_TOKEN)
+        if: ${{ steps.attempt.outcome == 'failure' }}
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # FAILS ON PURPOSE. A warning would notify nobody — a failed workflow run is the
+      # only signal GitHub pushes out — and this cannot block a release, because the
+      # fallback above already did the work and publishing does not depend on this job.
+      # Red here means "rotate the token", not "releases are broken".
+      - name: Report rejected token
+        if: ${{ steps.attempt.outcome == 'failure' }}
+        run: |
+          {
+            echo "## Release token rejected — fell back to GITHUB_TOKEN"
+            echo ""
+            echo "\`RELEASE_PLEASE_TOKEN\` was rejected, so release-please was retried on"
+            echo "\`GITHUB_TOKEN\`. **Releases still work**, but they now need the two manual"
+            echo "steps: approve the Release PR's workflow runs, then publish with"
+            echo "\`gh workflow run release.yml -f dry-run=false\`."
+            echo ""
+            echo "To fix: mint a replacement, run \`gh secret set RELEASE_PLEASE_TOKEN\`,"
+            echo "then revoke the old token. See \`docs/releasing.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Release token rejected::RELEASE_PLEASE_TOKEN was rejected; fell back to GITHUB_TOKEN, so releases still work via the manual approve + dispatch steps. Rotate the token — see docs/releasing.md."
+          exit 1
