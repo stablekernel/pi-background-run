@@ -14,5 +14,7 @@ dist/
 
 # Local pi-bgrun project config (jobsDir / showCompletedJobs / digest) — per
 # contributor, not repo policy: it changes what every bgrun job in this checkout
-# does, and a digest command is shell run at wake time. See docs/dogfooding.md.
+# does, and a digest command is shell run at wake time. One path per host:
+# $CONFIG_DIR is .pi on pi and .omp on oh-my-pi. See docs/dogfooding.md.
 .pi/pi-bgrun.json
+.omp/pi-bgrun.json
