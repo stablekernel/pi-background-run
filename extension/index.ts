@@ -52,6 +52,10 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
+// Type-only, so it is erased at compile time: the runtime import below stays
+// dynamic because this fallback exists for runtimes WITHOUT worker_threads, and a
+// static import would fail at load there.
+import type { Worker as NodeWorker } from "node:worker_threads";
 import { createHash, randomBytes } from "node:crypto";
 import {
   DIGEST_PRESET_IDS,
@@ -396,7 +400,7 @@ const BGGREP_DEFAULT_TIMEOUT_MS = 2_000;
 const BGGREP_WORKER_SOURCE = `
 const { parentPort, workerData } = require("node:worker_threads");
 try {
-  const re = new RegExp(workerData.source);
+  const re = new RegExp(workerData.source, workerData.flags || "");
   const lines = workerData.lines;
   const cap = workerData.cap;
   const out = [];
@@ -488,6 +492,47 @@ type GrepMatchOutcome =
   | { kind: "timeout" }
   | { kind: "invalid"; message: string };
 
+// Callers reach for PCRE habits, and the one that keeps costing tool calls is the
+// inline case-insensitive flag: `(?i)error` is valid PCRE and a syntax error in
+// JavaScript, whose RegExp takes flags as a second argument and has no inline
+// form at all. Accept the start-of-pattern group a PCRE user writes and translate
+// it into the equivalent JS flags, so `(?i)`, `(?im)` and `(?is)` read and behave
+// as expected.
+//
+// Only the LEADING position is translated: PCRE scopes a mid-pattern `(?i)` to
+// the REST of the pattern, so stripping one there would silently widen the match
+// instead of honoring it. Those get the explanation in inlineFlagHint() instead.
+const GREP_LEADING_FLAGS_RE = /^\(\?([ims]+)\)/;
+// Anything shaped like an inline flag group — used only to explain a failure the
+// engine already reported.
+const GREP_ANY_FLAGS_RE = /\(\?[a-zA-Z-]+[):]/;
+
+export function splitInlineFlags(raw: string): {
+  source: string;
+  flags: string;
+} {
+  const m = raw.match(GREP_LEADING_FLAGS_RE);
+  if (!m) return { source: raw, flags: "" };
+  // Dedupe and order them so the flags string is deterministic.
+  const flags = [...m[1]]
+    .filter((c, i, all) => all.indexOf(c) === i)
+    .sort()
+    .join("");
+  return { source: raw.slice(m[0].length), flags };
+}
+
+// Explain a compile failure in the caller's terms when the pattern used PCRE flag
+// syntax. A leading group we already translated is not the problem — there the
+// engine's own message is the honest answer — so the hint is reserved for the
+// forms this tool cannot honor.
+export function inlineFlagHint(raw: string): string {
+  if (!GREP_ANY_FLAGS_RE.test(raw)) return "";
+  if (GREP_LEADING_FLAGS_RE.test(raw)) return "";
+  return (
+    " — JavaScript regexes have no inline flags: a leading (?i), (?m) or (?s) group is accepted (e.g. `(?i)error` for a case-insensitive search), but a group anywhere else would scope differently than PCRE does; put the flags first, or write the alternatives out (`fail|FAIL`)"
+  );
+}
+
 // Bounded between lines only — a single pathological line can still stall.
 // Used solely when worker_threads is unavailable (never on Node or Bun).
 export function matchLinesSyncBounded(
@@ -495,10 +540,11 @@ export function matchLinesSyncBounded(
   lines: string[],
   cap: number,
   budgetMs: number,
+  flags: string = "",
 ): GrepMatchOutcome {
   let re: RegExp;
   try {
-    re = new RegExp(source);
+    re = new RegExp(source, flags);
   } catch (err) {
     return { kind: "invalid", message: (err as Error).message };
   }
@@ -514,32 +560,36 @@ export function matchLinesSyncBounded(
   return { kind: "ok", matchIdx: out };
 }
 
-// Exported, and workerSource-injectable, so a test can prove the ABORT path on
-// any engine: pass a worker body that never returns and the budget must still
-// yield `{kind: "timeout"}`. Input-driven catastrophic patterns cannot test it
-// — engines differ (V8 backtracks exponentially where JSC does not), so the
+// Exported, and workerSource-injectable via opts, so a test can prove the ABORT
+// path on any engine: pass a worker body that never returns and the budget must
+// still yield `{kind: "timeout"}`. Input-driven catastrophic patterns cannot test
+// it — engines differ (V8 backtracks exponentially where JSC does not), so the
 // only portable assertion is that termination works.
 export async function matchLinesWithBudget(
   source: string,
   lines: string[],
   cap: number,
   budgetMs: number,
-  workerSource: string = BGGREP_WORKER_SOURCE,
+  opts: { workerSource?: string; flags?: string } = {},
 ): Promise<GrepMatchOutcome> {
-  let WorkerCtor: typeof import("node:worker_threads").Worker;
+  const workerSource = opts.workerSource ?? BGGREP_WORKER_SOURCE;
+  const flags = opts.flags ?? "";
+  let WorkerCtor: typeof NodeWorker;
   try {
+    // Runtime-selected on purpose: absent on the platforms the fallback exists
+    // for, so a static import cannot work here.
     ({ Worker: WorkerCtor } = await import("node:worker_threads"));
   } catch {
-    return matchLinesSyncBounded(source, lines, cap, budgetMs);
+    return matchLinesSyncBounded(source, lines, cap, budgetMs, flags);
   }
-  let worker: import("node:worker_threads").Worker;
+  let worker: NodeWorker;
   try {
     worker = new WorkerCtor(workerSource, {
       eval: true,
-      workerData: { source, lines, cap },
+      workerData: { source, lines, cap, flags },
     });
   } catch {
-    return matchLinesSyncBounded(source, lines, cap, budgetMs);
+    return matchLinesSyncBounded(source, lines, cap, budgetMs, flags);
   }
   return new Promise<GrepMatchOutcome>((resolve) => {
     let settled = false;
@@ -3907,13 +3957,16 @@ export default function (pi: ExtensionAPI) {
     const context = Math.max(0, Math.floor(contextParam));
     if (!id) throw new Error("bggrep: id is required");
     // resolveLogForJob() below validates the id; no need to double-check.
-    const source = pattern ?? DEFAULT_GREP_PATTERN;
+    const raw = pattern ?? DEFAULT_GREP_PATTERN;
+    // A leading PCRE-style flag group is translated, not rejected: JS RegExp has
+    // no inline flag syntax, and failing on `(?i)` cost a real tool call.
+    const { source, flags } = splitInlineFlags(raw);
     try {
       // Validate up front so a bad pattern fails immediately, without a worker.
-      void new RegExp(source);
+      void new RegExp(source, flags);
     } catch (err) {
       throw new Error(
-        `bggrep: invalid pattern ${JSON.stringify(source)}: ${(err as Error).message}`,
+        `bggrep: invalid pattern ${JSON.stringify(raw)}: ${(err as Error).message}${inlineFlagHint(raw)}`,
       );
     }
     // Record-first, same as bgtail — correct across config changes.
@@ -3973,10 +4026,11 @@ export default function (pi: ExtensionAPI) {
       rawLines,
       BGGREP_LINE_CAP,
       budgetMs,
+      { flags },
     );
     if (outcome.kind === "invalid") {
       throw new Error(
-        `bggrep: invalid pattern ${JSON.stringify(source)}: ${outcome.message}`,
+        `bggrep: invalid pattern ${JSON.stringify(raw)}: ${outcome.message}${inlineFlagHint(raw)}`,
       );
     }
     if (outcome.kind === "timeout") {
@@ -3985,7 +4039,7 @@ export default function (pi: ExtensionAPI) {
           {
             type: "text",
             text:
-              `bggrep: /${source}/ exceeded the ${budgetMs}ms match budget across ` +
+              `bggrep: /${raw}/ exceeded the ${budgetMs}ms match budget across ` +
               `${rawLines.length} line${rawLines.length === 1 ? "" : "s"} — likely ` +
               `catastrophic backtracking; no results computed.`,
           },
@@ -3996,7 +4050,7 @@ export default function (pi: ExtensionAPI) {
           linesSearched: rawLines.length,
           logPath,
           notFound: false,
-          pattern: source,
+          pattern: raw,
           timedOut: true,
           windowBytes: readWindow,
           ...truncDetails,
@@ -4006,7 +4060,7 @@ export default function (pi: ExtensionAPI) {
     }
     const matchIdx = outcome.matchIdx;
     const header =
-      `${matchIdx.length} match${matchIdx.length === 1 ? "" : "es"} for /${source}/ ` +
+      `${matchIdx.length} match${matchIdx.length === 1 ? "" : "es"} for /${raw}/ ` +
       `in ${rawLines.length} line${rawLines.length === 1 ? "" : "s"}`;
     if (matchIdx.length === 0) {
       return {
@@ -4062,7 +4116,7 @@ export default function (pi: ExtensionAPI) {
         linesSearched: rawLines.length,
         logPath,
         notFound: false,
-        pattern: source,
+        pattern: raw,
         capped,
         windowBytes: readWindow,
         ...truncDetails,
@@ -4081,7 +4135,7 @@ export default function (pi: ExtensionAPI) {
     name: "bggrep",
     label: "Grep Background Log",
     description: toolDescription(
-      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; reading that path directly is the whole-log escape hatch. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. JavaScript regex syntax: a LEADING `(?i)`, `(?m)` or `(?s)` group is accepted and translated to the equivalent flags — `(?i)error` searches case-insensitively — and no other inline-flag form is supported (JS RegExp has none), so a mid-pattern group fails with an explanation rather than scoping differently than PCRE would. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; reading that path directly is the whole-log escape hatch. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
       BGGREP_GUIDELINES,
     ),
     promptSnippet: "Search a bgrun job's log for a pattern",
@@ -4093,7 +4147,7 @@ export default function (pi: ExtensionAPI) {
       pattern: Type.Optional(
         Type.String({
           description:
-            "Regex to search for. Default: generic failure signatures — override when you know the format.",
+            "Regex to search for (JavaScript syntax; a LEADING (?i), (?m) or (?s) group is accepted, e.g. (?i)error for case-insensitive). Default: generic failure signatures — override when you know the format.",
         }),
       ),
       context: Type.Optional(
