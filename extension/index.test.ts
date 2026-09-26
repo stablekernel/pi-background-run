@@ -3287,11 +3287,13 @@ test("bggrep: a leading (?i) group searches case-insensitively", async () => {
       flagged.content[0].text as string,
       /DIAGNOSTIC_MARKER_UPSTREAM/,
     );
-    // The header quotes the pattern as the caller wrote it, flags included.
+    // The header AND details quote the pattern as the caller wrote it, flags
+    // included — the caller must be able to see what was searched for.
     assert.match(
       flagged.content[0].text as string,
       /1 match for \/\(\?i\)diagnostic_marker\//,
     );
+    assert.equal(flagged.details.pattern, "(?i)diagnostic_marker");
 
     // Without the flag the same pattern matches nothing — so it is the
     // translation doing the work, not something else.
@@ -3331,7 +3333,7 @@ test("bggrep: an inline flag group that is not leading is explained, not swallow
         undefined,
         ctx,
       ),
-      /no inline flags/,
+      /unscoped inline flags/,
     );
   });
 });
@@ -3356,10 +3358,15 @@ test("splitInlineFlags: only a leading group translates; the hint covers the res
     flags: "",
   });
   assert.equal(mod.inlineFlagHint("plain"), "");
-  assert.match(mod.inlineFlagHint("a(?i)b"), /no inline flags/);
-  assert.match(mod.inlineFlagHint("x(?s:y)"), /no inline flags/);
+  assert.match(mod.inlineFlagHint("a(?i)b"), /unscoped inline flags/);
+  assert.match(mod.inlineFlagHint("x(?s:y)"), /unscoped inline flags/);
   // A leading group we honored is not the reason for a later compile failure.
   assert.equal(mod.inlineFlagHint("(?i)[unclosed"), "");
+  // A SECOND group further inside IS the reason, even when the pattern starts with
+  // one. Keying this check on the raw pattern suppressed the hint here — which is
+  // the only case the hint exists for.
+  assert.match(mod.inlineFlagHint("(?is)a(?m)b"), /unscoped inline flags/);
+  assert.match(mod.inlineFlagHint("(?i)(?i)b"), /unscoped inline flags/);
 });
 
 test("bggrep: caps at 50 matches with a not-shown note", async () => {
@@ -7172,6 +7179,30 @@ test("bggrep sync fallback: same results as the worker path, including the line 
   assert.equal(
     (await mod.matchLinesWithBudget("(", lines, 10, 2_000)).kind,
     "invalid",
+  );
+
+  // The flags argument must reach BOTH paths. Only the worker is reachable from the
+  // tool in this suite (worker_threads exists on Node and Bun), so a regression that
+  // dropped the argument at either fallback call site — the exact bug class this
+  // feature fixed — would otherwise ship silently.
+  const upper = ["DIAGNOSTIC_MARKER"];
+  assert.deepEqual(
+    mod.matchLinesSyncBounded("diagnostic_marker", upper, 100, 1_000, "i"),
+    { kind: "ok", matchIdx: [0] },
+    "the sync fallback honours flags",
+  );
+  assert.deepEqual(
+    await mod.matchLinesWithBudget("diagnostic_marker", upper, 100, 2_000, {
+      flags: "i",
+    }),
+    { kind: "ok", matchIdx: [0] },
+    "the worker honours flags",
+  );
+  // Without the flag the same pattern misses on both paths, so the assertions above
+  // are testing the flag rather than a pattern that would hit anyway.
+  assert.deepEqual(
+    mod.matchLinesSyncBounded("diagnostic_marker", upper, 100, 1_000),
+    { kind: "ok", matchIdx: [] },
   );
 });
 

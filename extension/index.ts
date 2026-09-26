@@ -526,10 +526,13 @@ export function splitInlineFlags(raw: string): {
 // engine's own message is the honest answer — so the hint is reserved for the
 // forms this tool cannot honor.
 export function inlineFlagHint(raw: string): string {
-  if (!GREP_ANY_FLAGS_RE.test(raw)) return "";
-  if (GREP_LEADING_FLAGS_RE.test(raw)) return "";
+  // Keyed on the pattern AFTER a leading group is stripped. A leading group that
+  // was honoured is not the reason for the failure — but a SECOND group further
+  // into the pattern is exactly the case this hint exists for, and suppressing it
+  // there (the raw pattern does start with a group) told the caller nothing.
+  if (!GREP_ANY_FLAGS_RE.test(splitInlineFlags(raw).source)) return "";
   return (
-    " — JavaScript regexes have no inline flags: a leading (?i), (?m) or (?s) group is accepted (e.g. `(?i)error` for a case-insensitive search), but a group anywhere else would scope differently than PCRE does; put the flags first, or write the alternatives out (`fail|FAIL`)"
+    " — JavaScript regexes have no unscoped inline flags: a bare (?i)/(?m)/(?s) group is only accepted at the very start of the pattern, and this one is not first. Put the flags first, write the alternatives out (`fail|FAIL`), or scope it — `(?i:error)` is understood natively"
   );
 }
 
@@ -4135,7 +4138,7 @@ export default function (pi: ExtensionAPI) {
     name: "bggrep",
     label: "Grep Background Log",
     description: toolDescription(
-      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. JavaScript regex syntax: a LEADING `(?i)`, `(?m)` or `(?s)` group is accepted and translated to the equivalent flags — `(?i)error` searches case-insensitively — and no other inline-flag form is supported (JS RegExp has none), so a mid-pattern group fails with an explanation rather than scoping differently than PCRE would. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; reading that path directly is the whole-log escape hatch. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. JavaScript regex syntax: a LEADING `(?i)`, `(?m)` or `(?s)` group is accepted and translated to the equivalent flags — `(?i)error` searches case-insensitively. A *scoped* group (`(?i:error)`) is understood natively, anywhere. A bare flag group anywhere else is rejected with an explanation, since JS has no unscoped inline flags. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; reading that path directly is the whole-log escape hatch. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
       BGGREP_GUIDELINES,
     ),
     promptSnippet: "Search a bgrun job's log for a pattern",
