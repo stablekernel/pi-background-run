@@ -162,6 +162,24 @@ generated run would silently invalidate the measurement it was made for.
   ones are evidence about the agent's use of it, and the reports below say which
   is which.
 
+### Running a cell by hand
+
+The vanilla cells are scripted (`pi -ne -ns -e <provider> -p --session-dir <dir> -n <label> "<prompt>"`).
+The bgrun cells cannot be: the wake needs a live session, so each is a real
+session with a human in it. Per run:
+
+1. Fresh session in a clean checkout, the bgrun extension loaded, nothing else in
+   the transcript — a resumed or reused session contaminates the context count.
+2. Send the cell's prompt verbatim (the mechanism clause is the only difference
+   from its pair), then **do nothing**: no follow-up nudges, no "is it done", no
+   hints. The wake is the mechanism under test; prodding it changes the run.
+3. Let the agent finish on its own, then note the session directory.
+4. `bun scripts/measure-sessions.ts <session-dir>` for the row.
+
+Two things worth resisting: re-running a cell whose number looks wrong (that is
+sampling on the outcome), and comparing a bgrun cell measured in a live session
+against a vanilla cell measured one-shot without saying so in the table.
+
 ## Measured effect on context
 
 Three ways the same suite run (`bun test extension/index.test.ts`, 224 tests,
