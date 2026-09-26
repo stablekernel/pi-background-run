@@ -3478,6 +3478,68 @@ test("bgtail: a wider `lines` hands back the earlier lines not yet shown, never 
   });
 });
 
+test("bgtail: a widening after a shrinking read still returns the missed lines", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const res = await bgrun.execute(
+      "s1",
+      { command: "seq 1 10 | sed 's/^/line-/'", name: "shrinking" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    assert.ok(id, "got a job id");
+    await waitForWakes(wakes, 1);
+    const logPath = join(dir, `${id}.log`);
+
+    // Coverage is the last 5 lines (6-10 of 10).
+    const first = await bgtail.execute(
+      "s2",
+      { id, lines: 5 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(first.content[0].text as string, /line-10/);
+
+    // Three lines arrive, then a NARROWER read shows only the last two: line-11 has
+    // never been seen, and `served` shrinks to 2 — forgetting the earlier run. That
+    // shrink is the case the widening invariant has to survive.
+    appendFileSync(logPath, "line-11\nline-12\nline-13\n");
+    const narrow = await bgtail.execute(
+      "s3",
+      { id, lines: 2 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const narrowText = narrow.content[0].text as string;
+    assert.match(narrowText, /line-13/);
+    assert.doesNotMatch(narrowText, /line-11/, "line-11 has never been shown");
+
+    // So widening to 4 must hand back line-11 — the line nothing has shown yet.
+    // It may ALSO repeat a line seen before the gap (coverage is a single trailing
+    // run, so a repeat is the documented behaviour), which is why only the no-loss
+    // half is asserted here: a future dedup fix should keep this test passing.
+    const widened = await bgtail.execute(
+      "s4",
+      { id, lines: 4 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      widened.content[0].text as string,
+      /line-11/,
+      "a widening must not lose the line the narrowing read skipped",
+    );
+  });
+});
+
 test("bgtail: raw:true keeps the verbatim window but still advances the bookmark", async () => {
   await withJobsDir(async (dir, h) => {
     const { wakes, tools, ctx } = h;
