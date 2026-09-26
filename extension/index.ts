@@ -2795,6 +2795,7 @@ export default function (pi: ExtensionAPI) {
     "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
     "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard — bgrun's `started:` line names them when you omit it.",
     "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
+    "Do not poll a job you just started — no bgstatus/bgtail round after bgrun. The wake is the signal: it carries the exit code, duration, log line count, the log's last line and the project's digest. Read the log after the wake only for detail the wake does not carry (e.g. which assertions failed).",
     "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search, or read the log's path directly for whole-log analysis.",
   ];
 
@@ -3197,7 +3198,7 @@ export default function (pi: ExtensionAPI) {
         }
         startedLines.push(
           `  log: ${logPath}`,
-          `  You'll be woken automatically when it finishes.`,
+          `  You'll be woken automatically when it finishes — no need to poll; the wake carries the exit code, counters and digest.`,
         );
         return {
           content: [{ type: "text", text: startedLines.join("\n") }],

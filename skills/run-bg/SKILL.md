@@ -98,10 +98,15 @@ Which to use:
    vocabulary: when a digest is configured and you omit `type`, the `started:`
    result names the configured types. Note the returned job-id. Continue other
    work; you will be woken automatically when the job finishes.
-2. **On wake:** check the exit status in the wake message first.
-   - `exit: 0` → success. `bgtail` to confirm.
+2. **On wake:** the wake *is* the result — exit code, duration, log line count, the
+   log's last line, and the digest scorecard when the project configures one.
+   - `exit: 0` → success. Report it. Do not open the log to confirm: the wake's own
+     counters are the confirmation, and a read spends context you do not need to spend.
    - `exit: <non-zero>` → failure. Analyze the log (see below).
-3. **If you need to check before the wake (non-blocking):** call `bgstatus` with the job id.
+3. **Checking before the wake is rarely worth it.** A job you just started will be
+   `running`, and the wake arrives on its own — polling early buys nothing and costs
+   a call. Reach for `bgstatus` when the job is *not* one you just started: another
+   session's, one from before a restart, or one whose wake never came.
    - `running` → keep doing other work. Do NOT spin a wait loop.
    - `done exit=0` → success.
    - `done exit=<non-zero>` → failure; analyze the log.
