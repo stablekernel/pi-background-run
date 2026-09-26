@@ -16,8 +16,8 @@ prompt, one session directory per run. Cell definition and fixture recipe:
 | working dir | `/Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc` |
 | sessions | each run gets its **own** `--session-dir`: a shared one profiles only its first `*.jsonl` |
 
-**Verified shape of the run** (the exact command above, agent environment): 97 lines,
-exit 1. The planted block sits at lines 34–35 and names two files —
+**Verified shape of the run** (the exact command above, run from this worktree's shell):
+97 lines, exit 1. The planted block sits at lines 34–35 and names two files —
 `harness.ts:28` (the assertion) then `part-02.test.ts:41` (the call site) — and the
 runner's own trace at line 73 names the same two, with `(fail)` at 77. So the symptom and
 the cause are in **different files**, and the cause's file is one the session has no other

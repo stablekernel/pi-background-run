@@ -67,6 +67,15 @@
  *     prints. A cell measuring how an agent FINDS or DIAGNOSES a failure must run
  *     with 0, or the number it produces is partly the fixture's doing. Kept at 1 by
  *     default so the measurements already taken against this fixture stay comparable.
+ *   - DUMMY_CAUSE_MODULE [0] — the SHAPE of the failure's cause. 0 keeps the assertion
+ *     inline in the failing test, where the trace's only *file* frame IS that test and
+ *     the second frame is the runner's own call site — there is nothing to follow. 1
+ *     emits a helper module and calls it, so the deepest frame names harness.ts: a file
+ *     a session has no other reason to open. This is what a cell measuring how far a
+ *     session FOLLOWS a trace needs (`trace-root` in docs/benchmark); kept at 0 by
+ *     default so already recorded fixture shapes stay comparable. With it on, the
+ *     planted block names both real lines — the module's assertion and the call site —
+ *     and the script exits 3 rather than emit a trace pointing at the wrong place.
  *   - DUMMY_OUT_DIR [<system tmpdir>/pi-bgrun-dummy-suite] — where the suite is
  *     written; outside the repo by default and guarded against the repo.
  *

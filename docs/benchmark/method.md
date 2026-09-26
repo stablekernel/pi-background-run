@@ -63,7 +63,7 @@ only between runs that share a manifest.
 |---|---|---|
 | `green-short` | the repo's own suite | the everyday case: no waiting, modest output |
 | `red-tail-short` | the repo's suite plus a fixture that fails near the end of the output | failure position, short run |
-| `long-buried` | generated, default knobs | duration and volume together |
+| `long-buried` | generated, default knobs (5 files x 30 tests x 600ms ≈ 180s) but with `DUMMY_ANNOUNCE_FAILURE=0` — a cell about finding a buried failure must not be handed the line that names it | duration and volume together |
 | `fast-verbose` | generated with `DUMMY_SLEEP_MS=20`, `DUMMY_LINES_PER_TEST=8` | volume without duration |
 | `fail-fast` | generated with `DUMMY_FAIL_FAST=1` | a failure that ends the work early |
 | `trace-root` | generated with `DUMMY_ANNOUNCE_FAILURE=0 DUMMY_CAUSE_MODULE=1`; the failing test calls a helper **module**, so the deepest trace frame names a file that is neither the failing test nor runner plumbing | **diagnosis depth**: the symptom is cheap to find and the cause is a frame away (`H11 <trace-depth>`). It needs that helper module — the generated trace's only *file* frame is the failing test itself, and its second frame is the runner's own call site — under Node `at …part-NN.test.ts:39:25`, directly above `at fn (node:test:210:18)`; under Bun `at TestContext.<anonymous> (…part-NN.test.ts:NN:9)`. Corrected 2026-09-26: an earlier version of this row read that second frame as a cause frame. Run it with the announcement off — the fixture naming its own failure is help no real suite gives |

@@ -268,6 +268,36 @@ haiku→sonnet→opus, which is the axis `H7`/`H11` need.
   with it off. The default stays `1` so the measurements already taken against this
   fixture remain comparable.
 
+## Instrument work, 2026-09-26 (no cell run)
+
+Done while the cells wait on attended sessions. None of it is a measurement, and nothing
+here is cited as evidence — it is the machinery the remaining cells need, built and verified.
+
+- **`cause_reached` / `frames_opened`** in `scripts/measure-sessions.ts`, plus a `cause`
+  column and three CSV columns. Frames are read from **tool results** — what a session could
+  follow — not from its final answer; the cause is the deepest frame's file, and "reached"
+  means some call addressed that file or the final text named it. A `trace-root` cell had no
+  metric before this: `locating` measures how a session looked, and `H11` is about what it
+  did with what it found.
+- **`DUMMY_CAUSE_MODULE=1`** in `scripts/make-dummy-suite.ts`. The inline fixture could not
+  answer the question at all: its trace's only *file* frame is the failing test itself and
+  its second frame is the runner's own call site, so "open the file the trace names" was the
+  same as reading the failing test. The knob moves the assertion into a helper module, so the
+  deepest frame names `harness.ts` — a file with no other reason to be opened. Off by
+  default, so the shapes already measured stay comparable.
+- **A correction.** `method.md`'s `trace-root` row claimed the generated trace already named
+  a cause frame; it did not. The row now names the knob the cell needs and both runners'
+  second-frame shapes (Node `at …:39:25` above `at fn (node:test:210:18)`; Bun
+  `TestContext.<anonymous>`).
+- **Fixtures generated and shape-verified.** `trace-root`: 97 lines, exit 1, planted block and
+  the runner's real trace both naming `harness.ts:28` and `part-02.test.ts:41`. `long-buried`:
+  see [runs/long-buried/RUNSHEET.md](runs/long-buried/RUNSHEET.md).
+- **Contracts covered:** the generator's shape (`scripts/make-dummy-suite.test.ts` — module
+  present, both line numbers real, the run fails, the knob is opt-in, a bad value is
+  rejected) and the metric's cases (`scripts/measure-sessions.test.ts` — reached by reading,
+  missed by reading the failing test alone, reached by naming it, no trace at all, and the
+  CSV header and row staying in step).
+
 ## What was discarded
 
 An earlier round of measurements was withdrawn from these docs: cells were run while
