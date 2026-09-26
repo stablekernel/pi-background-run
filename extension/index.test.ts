@@ -518,6 +518,10 @@ test("bgrun: failing command wakes with ❌ and the non-zero exit code", async (
     const wake = wakes[0].text;
     assert.match(wake, /❌/);
     assert.match(wake, /exit 7/);
+    // A failure is the case that needs the log, so the wake asks for it — and
+    // the success path must not (pinned by the wake-shape test).
+    assert.match(wake, /Analyze the failure/);
+    assert.doesNotMatch(wake, /report it, and continue/);
   });
 });
 
@@ -4858,8 +4862,18 @@ function trustCtx(ctx: any, proj: string, trusted: boolean): any {
 }
 
 function digestBlockOf(wake: string): string | null {
-  const m = wake.match(/digest \([^)]*\): ([\s\S]*?)\nReview the result/);
-  return m ? m[1] : null;
+  // The wake always ENDS with one outcome-instruction line, so the digest block
+  // runs from its own line to the last line. Deliberately not keyed to that
+  // instruction's wording: it differs by exit code (report vs analyze), and keying
+  // to it is what silently broke these tests when the wording changed.
+  const lines = wake.split("\n");
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  const idx = lines.findIndex((l) => /^digest \([^)]*\): /.test(l));
+  if (idx === -1) return null;
+  return [
+    lines[idx].replace(/^digest \([^)]*\): /, ""),
+    ...lines.slice(idx + 1, -1),
+  ].join("\n");
 }
 
 test("wake digest: preset scorecard appears on a green log", async () => {
@@ -5110,7 +5124,7 @@ test("wake digest: no digest configured → wake shape unchanged (regression gua
     const id = wake.match(/`([^`]+)`/)![1];
     const lines = wake.split("\n");
     // Pre-digest shape: exit line, Command, Stats (Phase 1), Last output,
-    // Review instruction — exactly five lines, nothing appended.
+    // outcome instruction — exactly five lines, nothing appended.
     assert.equal(lines.length, 5);
     assert.equal(lines[0], `✅ Background job \`${id}\` finished (exit 0).`);
     assert.equal(lines[1], "Command: echo hello world");
@@ -5118,7 +5132,7 @@ test("wake digest: no digest configured → wake shape unchanged (regression gua
     assert.equal(lines[3], "Last output: hello world");
     assert.equal(
       lines[4],
-      "Review the result now: call `bgtail` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.",
+      "The exit code, stats and last output above are the result — report it, and continue the task that depended on this. Read the log only for detail they do not carry.",
     );
     assert.ok(!wake.includes("digest ("));
   } finally {
