@@ -56,10 +56,22 @@ battery, recorded with the command that produced them.
 | `AGENT=1 CLAUDECODE=1 CI=true NO_COLOR=1 TERM=dumb` — a pi session's own | 82 | 82 | **0**: byte-identical |
 | agent vars unset, `TERM=xterm-256color` | 87 | 87 | 12 — the per-test lines, format only: `✓ name` on the pty, `(pass) name [dur]` on the pipe |
 
-Neither shape is ever larger. What changes the output is whether `AGENT` or
-`CLAUDECODE` is set (either alone suffices) and whether `TERM` supports colour — not
-whether stdout is a terminal. This is also the explanation for the earlier round's
-unexplained line counts for one command: it was the environment, not the terminal.
+Neither shape is ever larger. What changes the output is whether `AGENT` is set, and
+whether `TERM` supports colour — not whether stdout is a terminal, and **not
+`CLAUDECODE`**: measured on one 300-test fixture, `AGENT=1` alone gives 694 lines with no
+per-test lines, `CLAUDECODE=1` alone gives 996 with all 301 of them, and both together
+give 694 — the same as a session's own environment (`+ CI=true NO_COLOR=1 TERM=dumb`).
+*Corrected 2026-09-26: this entry previously said "either alone suffices". The pty/pipe
+probe that established the falsification only ever set both variables together, so it
+never isolated them; the matrix above does.* Line counts are the signal here — the
+per-test lines carry per-test durations, so byte-level hashes differ between runs even
+in one environment.
+
+This is also the explanation for the earlier round's unexplained line counts for one
+command: it was the environment, not the terminal. And it makes the stream split matter
+more in a session than outside one: with per-test lines suppressed, the failing test's
+*name* is on stderr too, so a session that captures stdout only has no record of which
+test failed and no trace — the fixture's own stage lines are all that is left.
 
 At **full scale** (10 files, 300 tests) the same difference is 302 lines, and none of
 them are the fixture's own:
