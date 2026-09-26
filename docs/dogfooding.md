@@ -99,7 +99,7 @@ explain away.
 |---|---|---|---|
 | R1 | the repo's own suite: green, 224 tests, ~22s, ~340 lines | **vanilla** | nothing blocks and the output is small; bgrun adds a job, a wake and a read. Falsified if the digest makes the bgrun session cheaper overall |
 | R2 | red, failure **78–90 lines from the end** | **vanilla** | a `tail -40` window hits it, one call, no wait — the pytest/jest shape |
-| R3 | generated suite: ~180s, ~2,760 lines, failure 65% through | **bgrun** | no window reaches the failure, so vanilla buys a second full run. Already measured below |
+| R3 | generated suite at the **standard density**: ~180s, **694** lines, failure 65% through | **bgrun** | the failure sits ~250 lines from the end, so no `head`/`tail` window reaches it and vanilla buys a second full run. The long-suite row measured below used the *verbose* density and is being re-run under this one |
 | R4 | **same volume, no time**: generated with `DUMMY_SLEEP_MS=20`, `DUMMY_LINES_PER_TEST=8` | **bgrun** on completeness, **vanilla** on cost | isolates volume from duration. If one or two greps find the failure, vanilla is cheaper and bgrun's advantage is time, not size |
 | R5 | **fail-fast**: `DUMMY_FAIL_FAST=1`, the run collapses at the failure | **vanilla** | when a failure ends the work early the blocking cost is small, and the wake is pure overhead |
 | C1 | start the long suite, then do an unrelated ~60s task in the same session | **bgrun** | overlap is the actual niche: wall ≈ max(180, 60) against 240. **Falsified if the agent waits anyway** — a plausible outcome worth measuring |
@@ -131,17 +131,25 @@ What it builds, and why each property is the thing under test:
 - **Noisy**: each test logs a tunable number of lines. The default is **realistic**
   (2, against bun's own ~1.5 lines per test); `DUMMY_LINES_PER_TEST=8` reproduces
   the verbose density the earliest measurements here used, which matters when
-  comparing against them.
+  comparing against them. Measured: **694** output lines at the default density,
+  **2,494** at `=8`.
 - **Failing in the middle**: one planted test asserts a marker pair at 65% of the
   run, so no `head`/`tail` window reaches it and the failure's *position* is under
-  test rather than its existence.
+  test rather than its existence. The 65% is measured, and now explained: bun 1.3.6
+  discovers these files in a **non-lexical** order (`2,3,1,8,9,10,5,4,6,7`,
+  measured twice), so `part-05` runs seventh of ten while `DUMMY_FAIL_FILE=5`
+  reads as 45%.
 - **Honest failure shape**: the failure block looks like a real assertion failure
-  (assertion, expected vs received, stack) rather than a two-line stub, so the
-  output volume a red run really produces is not understated.
+  (assertion, expected vs received, stack naming the generated file and line, and a
+  footer — ~19 lines) rather than a two-line stub, so the output volume a red run
+  really produces is not understated.
 - **Knobs for the negative cells**: `DUMMY_FAIL_FAST=1` ends the run at the
   failure, which is the regime where a background job should have nothing to
   offer; `DUMMY_FILES`/`DUMMY_TESTS_PER_FILE`/`DUMMY_FAIL_FILE`/`DUMMY_FAIL_STEP`
-  move the size and the failure's position.
+  move the size and the failure's position. Measured at smoke scale: fail-fast
+  finished in **4.09s** against **6.29s**, i.e. it stops at the fraction of the run
+  that had already completed before the failure in bun's order — 65%, not the 45%
+  a lexical order would give.
 
 The script validates its own fixture: the planted failure must exist, or the
 generated run would silently invalidate the measurement it was made for.
@@ -296,7 +304,9 @@ which is what the next section measures.
 
 The repo's own suite is 340 lines in 22s — neither. This section uses a generated
 one (`bun run bench:make-suite`, see `scripts/make-dummy-suite.ts`): 300 tests over
-10 files, ~180s, ~2,760 lines, failing 65% of the way through so no `head`/`tail`
+10 files, ~180s, ~2,760 lines as generated at the time (2,494 with the current
+generator at that same density, 694 at the realistic default), failing 65% of the
+way through so no `head`/`tail`
 window reaches it. Nothing about the command telegraphs its volume. Note the
 density, though: this run used the fixture's then-default of 8 log lines per test,
 which is *verbose* — bun's own reporter prints ~1.5 lines per test, which is what
@@ -322,6 +332,14 @@ Worth noting on the bgrun side: two of its five calls came *before* the wake —
 `bgstatus` (200 chars) and a 40-line `bgtail` (2,031 chars), together **28% of its
 context**, spent learning what the wake then delivered for free. That is the
 behaviour the guidance now discourages: do not poll a job you just started.
+
+This row is the **verbose-density** variant of the long-suite cell, measured
+before the fixture gained a realistic default. Under the standard protocol it is
+R3 with 694 lines of output instead of ~2,760, and it needs re-measuring before its
+numbers can sit next to R1/R2's — the failure's distance from the end changes with
+the density, and that distance is the whole mechanism. The vanilla half is
+scriptable and cheap; the bgrun half needs a live session, like every other bgrun
+cell.
 
 ## Where bgrun helps, and where it does not
 
