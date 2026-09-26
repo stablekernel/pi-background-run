@@ -2795,7 +2795,7 @@ export default function (pi: ExtensionAPI) {
     "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
     "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard — bgrun's `started:` line names them when you omit it.",
     "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
-    "Do not poll a job you just started — no bgstatus/bgtail round after bgrun. The wake is the signal: it carries the exit code, duration, log line count, the log's last line and the project's digest. Read the log after the wake only for detail the wake does not carry (e.g. which assertions failed).",
+    "Do not poll a job you just started — no bgstatus/bgtail round after bgrun: the wake is the signal and carries the outcome (exit code, stats, the log's last line, and the digest when the project configures one). Read the log only when the wake is not enough — typically the detail behind a failure.",
     "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search, or read the log's path directly for whole-log analysis.",
   ];
 
@@ -3145,7 +3145,13 @@ export default function (pi: ExtensionAPI) {
           } else if (digestNoMatchNote) {
             wake += `${digestNoMatchNote}\n`;
           }
-          wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
+          // A failure is what needs the log; on success the wake already IS the
+          // result. An unconditional "call bgtail" here would undo the point of the
+          // wake, because it is the last instruction the agent reads.
+          wake +=
+            exitCode === 0
+              ? "The exit code, stats and last output above are the result — report it, and continue the task that depended on this. Read the log only for detail they do not carry."
+              : "Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it — then continue the task that depended on this.";
           try {
             if (rec.ctx.isIdle()) {
               pi.sendUserMessage(wake);
@@ -3198,7 +3204,7 @@ export default function (pi: ExtensionAPI) {
         }
         startedLines.push(
           `  log: ${logPath}`,
-          `  You'll be woken automatically when it finishes — no need to poll; the wake carries the exit code, counters and digest.`,
+          `  You'll be woken automatically when it finishes — no need to poll; the wake carries the exit code, the stats and the log's last line.`,
         );
         return {
           content: [{ type: "text", text: startedLines.join("\n") }],

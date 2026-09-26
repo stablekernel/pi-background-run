@@ -619,7 +619,7 @@ Command: go test ./...
 Stats: 42.3s, 1204 lines
 Last output: FAIL example.com/api/handlers
 digest (go-test): 7 ok / 1 FAIL: TestResolveNotFound
-Review the result now: call `bgtail` ...
+Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it — then continue the task that depended on this.
 ```
 
 Shell safety: the command comes from trust-gated config and runs with your
