@@ -44,4 +44,14 @@ One row per session. The profile then goes beside the transcripts under `.bench-
 cell's outcome is recorded in `results.md` against its prediction, and that is also when the
 write-up item can move.
 
-Committed: `a60cd7b` (metric, fixture knob, tests, the `trace-root` sheet).
+Committed: `a60cd7b` (metric, fixture knob, tests, the `trace-root` sheet) and `6f7d6d1` (the
+three sheets, the corrected rows, the dated instrument entry).
+
+## One decision waiting for you
+
+The raw session transcripts should be **kept, not left in `/tmp`**. An earlier round of
+measurements was withdrawn from these docs for a reason that still bites — figures that could
+not be traced back to transcripts. The profiles (`--csv`) and the per-run manifests get
+committed beside each cell's run sheet; the transcripts are the evidence those numbers refer
+to, and they are text, so keeping them is cheap. `.bench-runs/` stays the scratch for working
+output, which is what it is for.
