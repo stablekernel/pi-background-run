@@ -3261,6 +3261,118 @@ test("bggrep: invalid pattern errors clearly", async () => {
   });
 });
 
+test("bggrep: a leading (?i) group searches case-insensitively", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bggrep = tools.get("bggrep")!;
+    const res = await bgrun.execute(
+      "c1",
+      { command: "printf 'DIAGNOSTIC_MARKER_UPSTREAM\\nplain line\\n'" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    assert.ok(id, "got a job id");
+    await waitForWakes(wakes, 1);
+
+    // Lowercase pattern against an uppercase line: only the flag can match it.
+    const flagged = await bggrep.execute(
+      "c2",
+      { id, pattern: "(?i)diagnostic_marker" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(flagged.details.matches, 1);
+    assert.match(
+      flagged.content[0].text as string,
+      /DIAGNOSTIC_MARKER_UPSTREAM/,
+    );
+    // The header AND details quote the pattern as the caller wrote it, flags
+    // included — the caller must be able to see what was searched for.
+    assert.match(
+      flagged.content[0].text as string,
+      /1 match for \/\(\?i\)diagnostic_marker\//,
+    );
+    assert.equal(flagged.details.pattern, "(?i)diagnostic_marker");
+
+    // Without the flag the same pattern matches nothing — so it is the
+    // translation doing the work, not something else.
+    const plain = await bggrep.execute(
+      "c3",
+      { id, pattern: "diagnostic_marker" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(plain.details.matches, 0);
+  });
+});
+
+test("bggrep: an inline flag group that is not leading is explained, not swallowed", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bggrep = tools.get("bggrep")!;
+    const res = await bgrun.execute(
+      "c1",
+      { command: "echo hit" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    await waitForWakes(wakes, 1);
+    // PCRE scopes this to the rest of the pattern, so stripping it would silently
+    // widen the match — it must fail, and say why.
+    await assert.rejects(
+      bggrep.execute(
+        "c2",
+        { id, pattern: "hit(?i)more" },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      /unscoped inline flags/,
+    );
+  });
+});
+
+test("splitInlineFlags: only a leading group translates; the hint covers the rest", async () => {
+  // loadModule() is typed by the helper; the exports under test are declared in
+  // the extension module, so no cast is needed here.
+  const mod = await loadModule();
+  assert.deepEqual(mod.splitInlineFlags("(?i)error"), {
+    source: "error",
+    flags: "i",
+  });
+  assert.deepEqual(mod.splitInlineFlags("(?mi)x"), { source: "x", flags: "im" });
+  assert.deepEqual(mod.splitInlineFlags("(?is)a(?m)b"), {
+    source: "a(?m)b",
+    flags: "is",
+  });
+  assert.deepEqual(mod.splitInlineFlags("plain"), { source: "plain", flags: "" });
+  // Not leading → left untouched for the engine to reject, with the reason.
+  assert.deepEqual(mod.splitInlineFlags("a(?i)b"), {
+    source: "a(?i)b",
+    flags: "",
+  });
+  assert.equal(mod.inlineFlagHint("plain"), "");
+  assert.match(mod.inlineFlagHint("a(?i)b"), /unscoped inline flags/);
+  assert.match(mod.inlineFlagHint("x(?s:y)"), /unscoped inline flags/);
+  // A leading group we honored is not the reason for a later compile failure.
+  assert.equal(mod.inlineFlagHint("(?i)[unclosed"), "");
+  // A SECOND group further inside IS the reason, even when the pattern starts with
+  // one. Keying this check on the raw pattern suppressed the hint here — which is
+  // the only case the hint exists for.
+  assert.match(mod.inlineFlagHint("(?is)a(?m)b"), /unscoped inline flags/);
+  assert.match(mod.inlineFlagHint("(?i)(?i)b"), /unscoped inline flags/);
+});
+
 test("bggrep: caps at 50 matches with a not-shown note", async () => {
   await withJobsDir(async (_dir, h) => {
     const { wakes, tools, ctx } = h;
@@ -7203,7 +7315,7 @@ test("bggrep: the budget terminates a worker that is stuck mid-match (abort path
     ["a".repeat(50)],
     10,
     300,
-    stall,
+    { workerSource: stall },
   );
   const elapsed = Date.now() - t0;
   assert.equal(outcome.kind, "timeout", "a stuck worker is reported as a timeout");
@@ -7242,6 +7354,30 @@ test("bggrep sync fallback: same results as the worker path, including the line 
   assert.equal(
     (await mod.matchLinesWithBudget("(", lines, 10, 2_000)).kind,
     "invalid",
+  );
+
+  // The flags argument must reach BOTH paths. Only the worker is reachable from the
+  // tool in this suite (worker_threads exists on Node and Bun), so a regression that
+  // dropped the argument at either fallback call site — the exact bug class this
+  // feature fixed — would otherwise ship silently.
+  const upper = ["DIAGNOSTIC_MARKER"];
+  assert.deepEqual(
+    mod.matchLinesSyncBounded("diagnostic_marker", upper, 100, 1_000, "i"),
+    { kind: "ok", matchIdx: [0] },
+    "the sync fallback honours flags",
+  );
+  assert.deepEqual(
+    await mod.matchLinesWithBudget("diagnostic_marker", upper, 100, 2_000, {
+      flags: "i",
+    }),
+    { kind: "ok", matchIdx: [0] },
+    "the worker honours flags",
+  );
+  // Without the flag the same pattern misses on both paths, so the assertions above
+  // are testing the flag rather than a pattern that would hit anyway.
+  assert.deepEqual(
+    mod.matchLinesSyncBounded("diagnostic_marker", upper, 100, 1_000),
+    { kind: "ok", matchIdx: [] },
   );
 });
 
