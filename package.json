@@ -28,7 +28,7 @@
     ]
   },
   "scripts": {
-    "test": "bun test extension/index.test.ts",
+    "test": "bun test extension/index.test.ts scripts/measure-sessions.test.ts",
     "lint": "tsc --noEmit",
     "lint:pr-title": "bun scripts/check-conventional-commit.ts",
     "bench:make-suite": "bun scripts/make-dummy-suite.ts"
