@@ -74,7 +74,19 @@ more in a session than outside one: with per-test lines suppressed, the failing 
 test failed and no trace — the fixture's own stage lines are all that is left.
 
 At **full scale** (10 files, 300 tests) the same difference is 302 lines, and none of
-them are the fixture's own:
+them are the fixture's own — the breakdown, measured by diffing the two logs:
+
+| contribution | lines |
+|---|---|
+| per-test lines (`(pass) name [dur]`) | 300 |
+| the `1 tests failed:` block header | 1 |
+| the blank line before that block | 1 |
+
+Everything else matches exactly: fixture stage lines 600/600, file banners 10/10, frame
+lines 9/9, `N pass` / `N fail` totals 2/2, `Ran N tests` 1/1. Note that the failing
+test's `(fail) name [dur]` line stays in *both* — it is the failure block's own repeat of
+the failing test, not a per-test line, which is why a "lines matching `(pass|fail)`" count
+reads 301 vs 1 rather than 300 vs 0:
 
 | environment | total lines | per-test lines | failure marker at |
 |---|---|---|---|
