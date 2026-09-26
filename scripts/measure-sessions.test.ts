@@ -23,6 +23,7 @@ import {
   UPSTREAM_MARKER,
   expandTarget,
   formatReport,
+  locateStrategy,
   measureSession,
   resolveTargets,
   summarize,
@@ -265,4 +266,65 @@ test("target resolution expands globs and reports misses", () => {
   const { paths, missing } = resolveTargets([join(root, "glob-*"), "no-such-dir"]);
   assert.equal(paths.length, 2);
   assert.deepEqual(missing, ["no-such-dir"]);
+});
+
+test("locating strategy: a search beats a window, a bare run is a full read", () => {
+  const bash = (command: string) => locateStrategy("bash", command);
+
+  // pattern — found by what it says, so position is irrelevant
+  assert.equal(bash("grep -n 'fail' out.log"), "pattern");
+  assert.equal(bash("sed -n '/FAIL/,+40p' out.log"), "pattern");
+  assert.equal(bash("rg -i fail"), "pattern");
+  // a search that also bounds its output is still a search: the window only
+  // decides what it paid, not whether it had to know where to look
+  assert.equal(bash("grep -n x out.log | head -40"), "pattern");
+
+  // position — a guessed window, which is a bet
+  assert.equal(bash("bun test x 2>&1 | tail -50"), "position");
+  assert.equal(bash("sed -n '250,262p' out.log"), "position");
+  assert.equal(bash("head -200 out.log"), "position");
+
+  // full-read — no window at all, so the whole output lands in context
+  assert.equal(bash("bun test x"), "full-read");
+  assert.equal(bash("cat out.log"), "full-read");
+
+  // located nothing
+  assert.equal(bash("cd repo && ls -la"), null);
+  assert.equal(locateStrategy("bgstatus", "job-1"), null);
+  // a handoff starts the run; it does not look at anything
+  assert.equal(locateStrategy("bgrun", "bun test x"), null);
+
+  // the bgrun arms' own readers are the other half of the comparison
+  assert.equal(locateStrategy("bggrep", "job-1"), "pattern");
+  assert.equal(locateStrategy("bgtail", "job-1"), "position");
+
+  // `read`: a bare one takes the file, offset/limit make it a window
+  assert.equal(locateStrategy("read", "/tmp/out.log", { path: "/tmp/out.log" }), "full-read");
+  assert.equal(
+    locateStrategy("read", "/tmp/out.log", { path: "/tmp/out.log", offset: 250 }),
+    "position",
+  );
+  assert.equal(
+    locateStrategy("read", "/tmp/out.log", { limit: 40, path: "/tmp/out.log" }),
+    "position",
+  );
+});
+
+test("a session's locate mix records the first move and the whole session", () => {
+  // Flood, then search by name: the first move is what H7 is about.
+  const dir = session("locate-mix", [
+    assistant(0, [toolCall("c1", "bash", "bun test extension/index.test.ts")]),
+    toolResult(20, "c1", "lots of output"),
+    assistant(21, [toolCall("c2", "bash", "grep -n fail out.log")]),
+    toolResult(22, "c2", UPSTREAM_MARKER),
+  ]);
+  const measured = measureSession("locate-mix", dir);
+  assert.equal(measured.locateFirst, "full-read");
+  assert.deepEqual(measured.locateCounts, { pattern: 1, position: 0, "full-read": 1 });
+
+  // Both surfaces must carry it, or the mix is unreadable downstream.
+  assert.ok(formatReport([measured], [], []).includes("full-read"));
+  const csv = toCsv([measured], []).split("\n");
+  assert.ok(csv[0].includes("locate_first,locate_pattern"));
+  assert.ok(csv[1].includes("full-read,1,0,1"));
 });

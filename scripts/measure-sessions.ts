@@ -74,6 +74,61 @@ export const SUITE_PATTERN =
 /** A call the agent chose to spend time in rather than use. */
 export const IDLE_PATTERN = /^\s*(sleep|wait)\b/;
 
+/** How an agent went looking for something in a run's output. */
+export type LocateStrategy = "pattern" | "position" | "full-read";
+
+/** Every strategy, in report order. */
+export const LOCATE_STRATEGIES: readonly LocateStrategy[] = [
+  "pattern",
+  "position",
+  "full-read",
+];
+
+export function emptyLocateCounts(): Record<LocateStrategy, number> {
+  return { pattern: 0, position: 0, "full-read": 0 };
+}
+
+/**
+ * Classify how one call went looking, or null when it located nothing.
+ *
+ * `H7 <capability>` in docs/benchmark/predictions.md turns on the mix: `pattern`
+ * finds a failure wherever it sits, `position` guesses a window and is therefore
+ * a bet, and `full-read` takes everything and pays for it. Precedence is
+ * pattern → position → full-read, because a command usually does both
+ * (`grep -n x log | head -40`): the *search* decides whether the agent had to
+ * know where to look, and the window only bounds what it paid for.
+ *
+ * Calls that merely run things (`cd`, a build, `bgstatus`) classify as null. The
+ * `read` tool counts: a bare read takes the whole file, while `offset`/`limit`
+ * make it a window — so a session that writes output to a file and reads a slice
+ * of it is *position*, not nothing.
+ */
+export function locateStrategy(
+  tool: string,
+  command: string,
+  args: Record<string, unknown> = {},
+): LocateStrategy | null {
+  // The bgrun arms' own readers: bggrep searches by match, bgtail is a window.
+  if (tool === "bggrep") return "pattern";
+  if (tool === "bgtail") return "position";
+  if (tool === "read") {
+    return args.offset !== undefined || args.limit !== undefined
+      ? "position"
+      : "full-read";
+  }
+  if (tool !== "bash") return null;
+
+  if (/\b(grep|egrep|fgrep|rg|ripgrep|awk)\b/.test(command)) return "pattern";
+  // A sed addressed by a match searches; one addressed by line numbers guesses.
+  if (/sed\s+-n\s+['"]?\//.test(command)) return "pattern";
+  if (/\b(head|tail)\b/.test(command)) return "position";
+  if (/sed\s+-n\s+['"]?\d/.test(command)) return "position";
+  // No window at all: a suite run whose entire output lands in context, or a
+  // bare `cat`.
+  if (SUITE_PATTERN.test(command) || /\bcat\b/.test(command)) return "full-read";
+  return null;
+}
+
 export const UPSTREAM_MARKER = "DIAGNOSTIC_MARKER_UPSTREAM";
 export const DOWNSTREAM_MARKER = "DIAGNOSTIC_MARKER_DOWNSTREAM";
 
@@ -96,6 +151,8 @@ export interface CallMeasurement {
   batched: boolean;
   /** True when this call actually started the suite (foreground or handoff). */
   suiteExecution: boolean;
+  /** How this call went looking, or null when it located nothing. */
+  locate: LocateStrategy | null;
 }
 
 export interface SessionMeasurement {
@@ -118,6 +175,10 @@ export interface SessionMeasurement {
   calls: CallMeasurement[];
   /** Every command/id/path seen, in call order. */
   commands: string[];
+  /** The first call that went looking, and how. Null when none did. */
+  locateFirst: LocateStrategy | null;
+  /** Calls per strategy — the mix `H7 <capability>` turns on. */
+  locateCounts: Record<LocateStrategy, number>;
   diagnosticUpstream: boolean;
   diagnosticDownstream: boolean;
 }
@@ -176,7 +237,12 @@ function readTranscript(transcript: string): {
   const rows: Omit<CallMeasurement, "suiteExecution">[] = [];
   const pending = new Map<
     string,
-    { tool: string; command: string; at: number | null }
+    {
+      tool: string;
+      command: string;
+      at: number | null;
+      locate: LocateStrategy | null;
+    }
   >();
   const batched = new Set<string>();
   let first: number | null = null;
@@ -230,7 +296,12 @@ function readTranscript(transcript: string): {
         if (tool === "bgrun") sawBgrun = true;
         const id = typeof call.id === "string" ? call.id : `${rows.length}:${ids.length}`;
         ids.push(id);
-        pending.set(id, { tool, command, at });
+        pending.set(id, {
+          tool,
+          command,
+          at,
+          locate: locateStrategy(tool, command, args),
+        });
       }
       // Everything after the first call in one assistant message resolves at the
       // batch's summary timestamp, not its own — flagged so the wait is read right.
@@ -265,6 +336,7 @@ function readTranscript(transcript: string): {
         resultChars,
         cumulativeContextChars: cumulative,
         batched: batched.has(matchedId),
+        locate: matched?.locate ?? null,
       });
       continue;
     }
@@ -302,6 +374,8 @@ export function measureSession(label: string, target: string): SessionMeasuremen
       toolCalls: 0,
       calls: [],
       commands: [],
+      locateFirst: null,
+      locateCounts: emptyLocateCounts(),
       diagnosticUpstream: false,
       diagnosticDownstream: false,
     };
@@ -317,6 +391,12 @@ export function measureSession(label: string, target: string): SessionMeasuremen
   const handoffs = calls.filter((c) => c.tool === "bgrun");
   const blockedSeconds = foreground.reduce((sum, c) => sum + c.waitSeconds, 0);
   const sleeps = calls.filter((c) => IDLE_PATTERN.test(c.command));
+  // The first call that went looking, and the mix across the whole session: H7
+  // asks which one the agent reached for, H8 asks whether that changes with the
+  // model. Neither is a property of the tool, so both sit on the agent side.
+  const locateCounts = emptyLocateCounts();
+  for (const call of calls) if (call.locate) locateCounts[call.locate] += 1;
+  const locateFirst = calls.find((c) => c.locate)?.locate ?? null;
   return {
     label,
     transcript,
@@ -334,6 +414,8 @@ export function measureSession(label: string, target: string): SessionMeasuremen
     toolCalls: calls.length,
     calls,
     commands: calls.map((c) => c.command),
+    locateFirst,
+    locateCounts,
     diagnosticUpstream: raw.lastAssistantText.includes(UPSTREAM_MARKER),
     diagnosticDownstream: raw.lastAssistantText.includes(DOWNSTREAM_MARKER),
   };
@@ -527,6 +609,7 @@ const TABLE_COLUMNS: Array<[string, (s: SessionMeasurement) => string, number]> 
   ["sleep_s", (s) => seconds(s.agentSleepSeconds), 7],
   ["ctx_chars", (s) => chars(s.contextChars), 9],
   ["diag", (s) => diagnosticLabel(s), 8],
+  ["locate", (s) => s.locateFirst ?? "-", 10],
   ["calls", (s) => String(s.toolCalls), 5],
 ];
 
@@ -563,7 +646,7 @@ export function formatReport(
       `  ${pad("#", 3)}${pad("tool", 10)}${pad("wait_s", 8)}${pad("result", 8)}${pad(
         "cum_ctx",
         10,
-      )}command`,
+      )}${pad("locate", 10)}command`,
     );
     session.calls.forEach((call, index) => {
       const command = call.command.replace(/\s+/g, " ").trim();
@@ -574,7 +657,7 @@ export function formatReport(
         )}${pad(String(call.resultChars), 8)}${pad(
           chars(call.cumulativeContextChars),
           10,
-        )}${command}${call.batched ? " [batched]" : ""}`,
+        )}${pad(call.locate ?? "-", 10)}${command}${call.batched ? " [batched]" : ""}`,
       );
     });
   }
@@ -629,6 +712,10 @@ const CSV_COLUMNS = [
   "ctx_chars",
   "tool_calls",
   "diag",
+  "locate_first",
+  "locate_pattern",
+  "locate_position",
+  "locate_full_read",
   "commands",
   "calls",
 ] as const;
@@ -656,6 +743,10 @@ export function toCsv(
         String(Math.round(session.contextChars)),
         String(session.toolCalls),
         diagnosticLabel(session),
+        session.locateFirst ?? "",
+        String(session.locateCounts.pattern),
+        String(session.locateCounts.position),
+        String(session.locateCounts["full-read"]),
         session.commands.join(" ; "),
         session.calls
           .map((c) => `${c.tool}@${seconds(c.waitSeconds)}s/${c.resultChars}`)
@@ -687,6 +778,9 @@ export function toCsv(
         range("ctx_chars"),
         "",
         `${summary.diagnosticReach}/${summary.sessions}`,
+        "",
+        "",
+        "",
         "",
         "",
       ]
