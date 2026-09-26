@@ -66,7 +66,7 @@ only between runs that share a manifest.
 | `long-buried` | generated, default knobs | duration and volume together |
 | `fast-verbose` | generated with `DUMMY_SLEEP_MS=20`, `DUMMY_LINES_PER_TEST=8` | volume without duration |
 | `fail-fast` | generated with `DUMMY_FAIL_FAST=1` | a failure that ends the work early |
-| `trace-root` | generated; the failing test raises the error from a helper frame, so the trace names a location that is not the assertion site | **diagnosis depth**: the symptom is cheap to find and the cause is a frame away (`H11 <trace-depth>`). The generator's current trace already names a second location in the same file, so the cell is affordable as it stands; a dedicated helper *file* is a small addition that would sharpen it |
+| `trace-root` | generated with `DUMMY_ANNOUNCE_FAILURE=0`; the failing test raises the error from a helper frame, so the trace names a location that is not the assertion site | **diagnosis depth**: the symptom is cheap to find and the cause is a frame away (`H11 <trace-depth>`). The generator's trace already names a second location in the same file, so the cell needs no new generator code; a dedicated helper *file* would sharpen it. Run it with the announcement off — the fixture naming its own failure is help no real suite gives |
 
 **Dialogues** — `overlap-task` (start a long job, then do an unrelated task),
 `parallel-jobs` (several long jobs at once), `resume-midrun` (the session ends and

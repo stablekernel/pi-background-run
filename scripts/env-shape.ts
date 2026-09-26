@@ -139,7 +139,7 @@ console.log(`  redirecting stdout only (\`bun test … > log\`), plain environme
 console.log(`    stdout: ${count(outText, /^.*$/gm)} lines, ${count(outText, /^\s*\(fail\)/gm)} failing-test lines, ${count(outText, /^\s+at /gm)} frames, marker: ${outText.includes("DIAGNOSTIC_MARKER_UPSTREAM")}`);
 console.log(`    stderr: ${count(errText, /^.*$/gm)} lines, ${count(errText, /^\s*\(fail\)/gm)} failing-test lines, ${count(errText, /^\s+at /gm)} frames, marker: ${errText.includes("DIAGNOSTIC_MARKER_UPSTREAM")}`);
 const echoesPlant = outText.includes("the planted failure is");
-console.log(`    the fixture echoes the planted failure's location to stdout: ${echoesPlant}  (a crutch a real project would not print)`);
+console.log(`    the fixture echoes the planted failure's location to stdout: ${echoesPlant}${echoesPlant ? "  (a crutch no real project prints — generate with DUMMY_ANNOUNCE_FAILURE=0 for any diagnosis cell)" : ""}`);
 
 // --- what reaches a session at wake ------------------------------------------
 const widest = plain[0].total >= agent[0].total ? plain[0] : agent[0];

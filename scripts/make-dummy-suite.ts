@@ -61,6 +61,12 @@
  *     near the failure instead of at the end. That is the regime where the very
  *     property a background job exploits — the run is long — disappears, so it is
  *     where bgrun should NOT be expected to win.
+ *   - DUMMY_ANNOUNCE_FAILURE [1] — the fixture's HELP, and the only knob that is not
+ *     about the run itself. 1 makes the generated summary name where the planted
+ *     failure is ("the planted failure is part 05 step 15…"), which no real project
+ *     prints. A cell measuring how an agent FINDS or DIAGNOSES a failure must run
+ *     with 0, or the number it produces is partly the fixture's doing. Kept at 1 by
+ *     default so the measurements already taken against this fixture stay comparable.
  *   - DUMMY_OUT_DIR [<system tmpdir>/pi-bgrun-dummy-suite] — where the suite is
  *     written; outside the repo by default and guarded against the repo.
  *
@@ -122,6 +128,7 @@ const failFile = Number(process.env.DUMMY_FAIL_FILE ?? 5);
 const failStep = Number(process.env.DUMMY_FAIL_STEP ?? 15);
 const linesPerTest = Number(process.env.DUMMY_LINES_PER_TEST ?? 2);
 const failFast = Number(process.env.DUMMY_FAIL_FAST ?? 0);
+const announceFailure = Number(process.env.DUMMY_ANNOUNCE_FAILURE ?? 1);
 
 for (const [name, value] of Object.entries({
   sleepMs,
@@ -140,6 +147,14 @@ for (const [name, value] of Object.entries({
 // typo silently ignored by the generated `=== 1` test.
 if (failFast !== 0 && failFast !== 1) {
   console.error(`error: DUMMY_FAIL_FAST must be 0 or 1 (got ${failFast})`);
+  process.exit(2);
+}
+// Same boolean treatment: any other value would be a typo that silently leaves the
+// fixture's help switched on, which is the state a diagnosis cell must not run in.
+if (announceFailure !== 0 && announceFailure !== 1) {
+  console.error(
+    `error: DUMMY_ANNOUNCE_FAILURE must be 0 or 1 (got ${announceFailure})`,
+  );
   process.exit(2);
 }
 // The planted failure IS the fixture: a run that passes while this script's report
@@ -224,7 +239,14 @@ for (let i = 1; i <= files; i++) {
     "  pass  ${g.__passed ?? 0}",
     "  fail  ${g.__failed === true ? 1 : 0}",
     "  skip  ${g.__skipped ?? 0}",
-    `the planted failure is part ${String(failFile).padStart(2, "0")} step ${failStepLabel}; its markers are the comparison pair`,
+    // The announcement is a CRUTCH: a real project does not print where its planted
+    // failure is. A cell measuring discovery or diagnosis runs with
+    // DUMMY_ANNOUNCE_FAILURE=0, or it measures the fixture's help.
+    ...(announceFailure === 1
+      ? [
+          `the planted failure is part ${String(failFile).padStart(2, "0")} step ${failStepLabel}; its markers are the comparison pair`,
+        ]
+      : []),
     "──────────────────────────────────────────────",
   ].join("\n");
 
@@ -322,5 +344,6 @@ console.log(
     `  output:   ~${total * linesPerTest} log lines, plus per-file banners and the summary\n` +
     `  failing:  part ${String(failFile).padStart(2, "0")} step ${failStep}, exit 1` +
     `${failFast === 1 ? " (fail-fast: the run stops there)" : ""}\n` +
+    `  announces itself: ${announceFailure === 1 ? "yes (the summary names the planted failure)" : "NO — the fixture does not name its own failure"}\n` +
     `  run it:   bun test ${outDir}`,
 );

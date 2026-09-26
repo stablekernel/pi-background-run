@@ -151,9 +151,13 @@ reproducible from inside a single script.
 
 ## Capability ladder
 
-Crossed with `red-tail-short`, `long-buried` and `trace-root`. Rungs named; **probed for
-availability only in part** — `anthropic/claude-haiku-4-5` by the unattended-session
-smoke, the other two still to probe before a battery depends on them.
+Crossed with `red-tail-short`, `long-buried` and `trace-root`. All three rungs are
+probed and usable: the gateway catalogue probe (`rung-probe3`, 32 non-bedrock ids) reads
+`OK` for `anthropic/claude-haiku-4-5-20251001`, `anthropic/claude-sonnet-4-6` and
+`anthropic/claude-opus-5`, and the unattended-session smoke additionally drove haiku
+end-to-end in a session. The `anthropic/claude-opus-4-5…4-8` series is also served, which
+would make a purer same-line ladder — at a much smaller capability gap than
+haiku→sonnet→opus, which is the axis `H7`/`H11` need.
 
 | rung | model | `red-tail-short` | `long-buried` | `trace-root` |
 |---|---|---|---|---|
@@ -167,10 +171,10 @@ smoke, the other two still to probe before a battery depends on them.
 - Phase 1 instrument work: `locating` and the shape/evidence-path instruments are done;
   the unattended-session smoke is running, and the unattended-versus-manual equivalence
   check needs two short manual sessions.
-- Rung probes: two of three outstanding (see above). The unattended-session smoke probes
-  the first as a side effect.
-- The fixture's crutch (`the planted failure is part 05 step 15`) must become an axis or
-  be removed before `trace-root` or `long-buried` numbers mean anything.
+- The fixture's crutch is now a knob, not a blocker: `DUMMY_ANNOUNCE_FAILURE=0` removes
+  the line that names the planted failure, and every diagnosis or discovery cell must run
+  with it off. The default stays `1` so the measurements already taken against this
+  fixture remain comparable.
 
 ## What was discarded
 
