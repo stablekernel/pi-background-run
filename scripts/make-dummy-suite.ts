@@ -17,8 +17,9 @@
  * -----------------
  * A suite that is long, noisy, and fails somewhere easy to miss:
  *   - LONG: every test awaits one chain shared through globalThis, so the total
- *     wall-clock is sleeps x tests however the runner schedules them. (bun runs
- *     node:test tests concurrently, which would otherwise collapse the runtime.)
+ *     wall-clock is sleeps x tests however the runner schedules them. (bun 1.3.6
+ *     happens to run these sequentially, but the chain makes the duration
+ *     independent of that: a concurrent scheduler would otherwise collapse it.)
  *   - NOISY: each test logs 8 lines, so a run produces thousands of lines.
  *   - FAILING: one test in the middle asserts a planted marker pair, so the
  *     failure sits far from both ends of the output.
@@ -33,12 +34,41 @@
  * [<system tmpdir>/pi-bgrun-dummy-suite], DUMMY_SLEEP_MS [600], DUMMY_FILES [10],
  * DUMMY_TESTS_PER_FILE [30], DUMMY_FAIL_FILE [5], DUMMY_FAIL_STEP [15].
  */
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+// Canonicalise through symlinks and case, because BOTH sides of the in-repo check
+// must agree: `import.meta.url` arrives symlink-resolved from Bun (/tmp becomes
+// /private/tmp on macOS), while a user-supplied DUMMY_OUT_DIR does not. Comparing a
+// canonical path against an unresolved one let a symlinked or case-variant spelling
+// slip past the guard — and the rmSync below would then empty that directory.
+function canonical(path: string): string {
+  let head = resolve(path);
+  const tail: string[] = [];
+  while (!existsSync(head)) {
+    const parent = dirname(head);
+    if (parent === head) break;
+    tail.unshift(basename(head));
+    head = parent;
+  }
+  let real = head;
+  try {
+    real = realpathSync(head);
+  } catch {
+    // Fall back to the resolved form if the filesystem refuses (permissions, race).
+  }
+  return tail.length > 0 ? join(real, ...tail) : real;
+}
+
+const repoRoot = canonical(resolve(dirname(fileURLToPath(import.meta.url)), ".."));
 const outDir = resolve(
   process.env.DUMMY_OUT_DIR ?? join(tmpdir(), "pi-bgrun-dummy-suite"),
 );
@@ -55,19 +85,43 @@ for (const [name, value] of Object.entries({
   failFile,
   failStep,
 })) {
-  if (!Number.isFinite(value) || value < 1) {
-    console.error(`error: ${name} must be a positive number (got ${value})`);
+  if (!Number.isInteger(value) || value < 1) {
+    console.error(`error: ${name} must be a positive integer (got ${value})`);
     process.exit(2);
   }
 }
-
-if (outDir === repoRoot || outDir.startsWith(repoRoot + sep)) {
-  console.warn(
-    `warning: ${outDir} is inside the repo (${repoRoot}).\n` +
-      "         `bun test` discovers *.test.ts anywhere in the tree and does not\n" +
-      "         respect .gitignore, so a bare `bun test` will now run this suite too.\n" +
-      "         Unset DUMMY_OUT_DIR to write outside the repo instead.",
+// The planted failure IS the fixture: a run that passes while this script's report
+// claims it fails would quietly invalidate whatever used it.
+if (failFile > files || failStep > perFile) {
+  console.error(
+    `error: the planted failure must land inside the suite — DUMMY_FAIL_FILE is ${failFile} of ${files} files and DUMMY_FAIL_STEP is ${failStep} of ${perFile} tests.\n` +
+      "       Outside that range the generated suite passes, and anything measuring\n" +
+      "       it would be measuring the wrong run.",
   );
+  process.exit(2);
+}
+
+// Fatal by default, not a warning: this script CLEARS its output directory before
+// writing, so pointing it at the repo can delete tracked files — and the failure is
+// silent, because everything after it works.
+if (
+  canonical(outDir) === repoRoot ||
+  canonical(outDir).startsWith(repoRoot + sep)
+) {
+  const detail =
+    `${outDir} resolves inside the repo (${repoRoot}).\n` +
+    "  `bun test` discovers *.test.ts anywhere in the tree and does not respect\n" +
+    "  .gitignore, so a bare `bun test` would then run this suite too — and this\n" +
+    "  script clears its output directory before writing, so pointing it at the\n" +
+    "  repo can delete tracked files.\n" +
+    "  Unset DUMMY_OUT_DIR to write outside the repo (the default), or set\n" +
+    "  DUMMY_ALLOW_IN_REPO=1 if you really mean to generate inside it.";
+  if (process.env.DUMMY_ALLOW_IN_REPO === "1") {
+    console.warn(`warning: ${detail}`);
+  } else {
+    console.error(`error: ${detail}`);
+    process.exit(2);
+  }
 }
 
 rmSync(outDir, { recursive: true, force: true });
@@ -123,7 +177,7 @@ console.log(
   `generated ${files} files in ${outDir}\n` +
     `  tests:    ${total} (${files} files x ${perFile})\n` +
     `  runtime:  ~${((sleepMs * total) / 1000).toFixed(0)}s (${sleepMs}ms x ${total})\n` +
-    `  output:   ~${total * 9} lines\n` +
+    `  output:   ~${total * 9} log lines, plus the summary\n` +
     `  failing:  part ${String(failFile).padStart(2, "0")} step ${failStep}, exit 1\n` +
     `  run it:   bun test ${outDir}`,
 );
