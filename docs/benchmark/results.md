@@ -61,6 +61,36 @@ Neither shape is ever larger. What changes the output is whether `AGENT` or
 whether stdout is a terminal. This is also the explanation for the earlier round's
 unexplained line counts for one command: it was the environment, not the terminal.
 
+At **full scale** (10 files, 300 tests) the same difference is 302 lines, and none of
+them are the fixture's own:
+
+| environment | total lines | per-test lines | failure marker at |
+|---|---|---|---|
+| `AGENT=1 CLAUDECODE=1` | 694 | 0 | line 417 — 60% |
+| agent vars empty, `TERM=xterm-256color` | 996 | 300 | line 611 — 61% |
+
+The fixture's own stage lines (`[part 05 step 15] stage 1/2 — building…`) survive in both
+environments. They are what remains of the failure's neighbourhood once the runner's
+chatter is gone, which is why the cells can run in either.
+
+**Stability**: four consecutive full-scale runs at `DUMMY_SLEEP_MS=600` returned
+identical line counts and an identical failure position (996 / 301 per-test / line 611),
+and 180s of wall every time. The fixture is deterministic; the environment is the only
+thing that moves its shape.
+
+**Execution order is not numeric.** `readdir` yields `02, 03, 01, 08, 09, 10, 05, 04, 06,
+07`, so the planted failure in part 05 runs **7th of 10** and its marker sits at ~60% of
+the output — **not** in the tail. Any cell that assumes the failure is at the end of the
+output is wrong for this fixture.
+
+**Provenance, including one failed check.** The environment leg was first run under
+`bgrun`, whose shell does not inherit `AGENT`/`CLAUDECODE`: both labelled "environments"
+were the same environment and all four runs returned the non-agent shape. The header
+printed the environment, which is why the mistake was visible instead of being recorded
+as a result — the numbers above are from a re-run with the variables set explicitly, and
+the earlier four runs remain valid as run-to-run stability evidence within one
+environment.
+
 **Provenance**: `bun scripts/pty-shape.ts`, run in
 `/Users/lloyd.engebretsen/sk/pi-bgrun.ptyshape` at `8e63fc8`, then re-run in both
 environments to confirm; `bun test scripts/pty-shape.test.ts` — 4 tests pass;
@@ -70,26 +100,77 @@ environments to confirm; `bun test scripts/pty-shape.test.ts` — 4 tests pass;
 no line count is quoted without one; the fixture's own line counts are re-measured per
 environment before any cell depends on them.
 
+### `trace-root` — the path a failure's evidence travels
+
+**Prediction**: `H9 <digest-starves>`, `H10 <condenser-eats-traces>`.
+
+**Result: the digest carries counts and nothing else.** For a run whose failing test is
+`load part 05 > step 15`:
+
+| the door the evidence comes through | content |
+|---|---|
+| the digest (configured `grep -E '[0-9]+ (pass\|fail)$' \| tail -5`) | `299 pass`, `1 fail` |
+| the log's last line | `Ran 300 tests across 10 files. [179.81s]` |
+| the failing test's name, its 9 frames, the marker pair | **only by opening the log** |
+
+The failing test is never named, so a session that trusts the wake cannot reach the
+symptom, let alone the cause. `H9` is therefore a *behavioural* question — do sessions
+open the log unprompted — and `trace-root` leans vanilla until it is measured.
+
+**The diagnosis is entirely on stderr.** Capturing stdout only, which is the obvious
+`bun test … > log`:
+
+| capture | lines | failing-test lines | frames | marker |
+|---|---|---|---|---|
+| stdout only | 619 | 0 | 0 | absent |
+| stderr | 379 | 2 | 9 | present |
+
+In an agent environment stdout-only loses the per-test lines as well, leaving the
+fixture's own `the planted failure is part 05 step 15` line as the only clue — **and that
+line is a crutch**, because a real project does not print where its planted failure is.
+It has to become an axis (with and without) or go, or the cell measures the fixture's
+help rather than the agent's work.
+
+**Result: the condenser preserves the trace** — `H10 <condenser-eats-traces>`
+**falsified, in the form it was stated**. A condensed read of the failure block kept the
+assertion text, all 9 frames, both fixture locations and the markers; nothing was merged
+or dropped. The narrow form it did not exercise: this trace has no *repeated* frames, so
+the collapse rule had nothing to collapse.
+
+**One tool defect recorded on the way, because it decides reachability**: a *wide*
+condensed read truncates the newest lines rather than the oldest and advances coverage
+past them, so a follow-up read reports "no new lines" and the log's end becomes
+unreachable that way; `raw: true` returns the true tail. A session reading a log narrowly
+gets the end but no frames; reading it widely gets frames but not the end.
+
+**Provenance**: `bun scripts/env-shape.ts` — shape per environment, the stream split, the
+digest and last-line content, and the crutch; it exits non-zero if both labelled
+environments produce the same shape. The condenser half needs a job and `bgtail` on its
+log (`h8b-trace-log`, 998 lines, marker at 611, frames at 617/655/656) and is not
+reproducible from inside a single script.
+
 ## Capability ladder
 
-Crossed with `red-tail-short` and `long-buried` only. Rungs to be named and probed for
-availability before the battery starts.
+Crossed with `red-tail-short`, `long-buried` and `trace-root`. Rungs named; **probed for
+availability only in part** — `anthropic/claude-haiku-4-5` by the unattended-session
+smoke, the other two still to probe before a battery depends on them.
 
-| rung | model | `red-tail-short` | `long-buried` |
-|---|---|---|---|
-| weak | `anthropic/claude-haiku-4-5` | not run | not run |
-| mid | `anthropic/claude-sonnet-4-6` | not run | not run |
-| strong | `anthropic/claude-opus-5` | not run | not run |
-| floor probe (not a rung) | `fireworks/gpt-oss-120b` | not run | not run |
+| rung | model | `red-tail-short` | `long-buried` | `trace-root` |
+|---|---|---|---|---|
+| weak | `anthropic/claude-haiku-4-5` | not run | not run | not run |
+| mid | `anthropic/claude-sonnet-4-6` | not run | not run | not run |
+| strong | `anthropic/claude-opus-5` | not run | not run | not run |
+| floor probe (not a rung) | `fireworks/gpt-oss-120b` | not run | not run | not run |
 
 ## Blocked on
 
-- Phase 1 instrument work: the `locating` classification in the profiler, `pty-shape.ts`
-  and its CI test, fixture reproducibility, the unattended-session smoke, and the
-  unattended-versus-manual equivalence check (which needs two short manual sessions).
-- ~~Rung selection~~ **chosen**: the Claude family ladder above, every rung probed for
-  availability. Remaining: the unattended-session smoke, and the equivalence check,
-  which needs two short manual sessions.
+- Phase 1 instrument work: `locating` and the shape/evidence-path instruments are done;
+  the unattended-session smoke is running, and the unattended-versus-manual equivalence
+  check needs two short manual sessions.
+- Rung probes: two of three outstanding (see above). The unattended-session smoke probes
+  the first as a side effect.
+- The fixture's crutch (`the planted failure is part 05 step 15`) must become an axis or
+  be removed before `trace-root` or `long-buried` numbers mean anything.
 
 ## What was discarded
 

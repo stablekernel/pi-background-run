@@ -66,6 +66,7 @@ only between runs that share a manifest.
 | `long-buried` | generated, default knobs | duration and volume together |
 | `fast-verbose` | generated with `DUMMY_SLEEP_MS=20`, `DUMMY_LINES_PER_TEST=8` | volume without duration |
 | `fail-fast` | generated with `DUMMY_FAIL_FAST=1` | a failure that ends the work early |
+| `trace-root` | generated; the failing test raises the error from a helper frame, so the trace names a location that is not the assertion site | **diagnosis depth**: the symptom is cheap to find and the cause is a frame away (`H11 <trace-depth>`). The generator's current trace already names a second location in the same file, so the cell is affordable as it stands; a dedicated helper *file* is a small addition that would sharpen it |
 
 **Dialogues** — `overlap-task` (start a long job, then do an unrelated task),
 `parallel-jobs` (several long jobs at once), `resume-midrun` (the session ends and
@@ -77,6 +78,15 @@ what survives afterwards.
 agent involved. It is an *instrument check*, run before a battery to pin the output
 shape every other cell depends on, and its first run falsified the reason it was built
 (`H1 <pty-shape>`). `pty-agent` is dropped (`H2`).
+
+Two more standing instrument checks joined it in Phase 1. The **environment
+comparison** runs the same fixture in an agent and a non-agent environment — the check
+which established that the *environment* is the variable, and whose first run was
+invalid because `bgrun` does not inherit `AGENT`/`CLAUDECODE`, so both halves were the
+same environment. That is why its header prints the environment and why no shape may be
+quoted without one. The **trace path** check asks what the wake digest and `bgtail`
+actually show of a failing test's stack trace, since a batched job's evidence reaches a
+session through those two doors and through nothing else.
 
 ### The capability axis
 
@@ -152,6 +162,7 @@ only instrument. Its columns:
 | `calls` | tool calls made |
 | `diag` | whether the failure markers reached the final assistant text |
 | `locating` | **the classification H7 needs**: the agent's first locating command, as `pattern` (`grep`, `sed -n '/…/…'`), `position` (`head`, `tail`, line-addressed `sed`), `full-read`, or `none` |
+| `cause_reached` | **planned, not yet implemented** — what `trace-root` needs: whether the session opened or named the location the trace points at, and whether its answer carried the cause rather than the symptom. A presence-only metric cannot express this: a session can grep its way to a symptom perfectly, report it, and stop, and every existing column would look healthy |
 
 `locating` is a small addition to the profiler, made in Phase 1 from the commands the
 tool already records. Without it H7 could only be judged by reading transcripts, which
@@ -245,7 +256,7 @@ number here can be re-checked from the transcripts it came from.
 
 ## Limits, stated up front
 
-- One machine, one checkout; mostly n=3, and three rungs only on the two H7-critical
+- One machine, one checkout; mostly n=3, and three rungs only on the three ladder
   cells.
 - Context is characters of transcript text, not billed tokens.
 - The long fixture is synthetic. Real suites bring flaky tests, retries, parallel

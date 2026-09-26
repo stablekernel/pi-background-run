@@ -35,6 +35,9 @@ hurt.
 | `H6 <unattended>` | a bgrun cell can be run unattended if pi is held open interactively in a pty, with the wake landing in the live session | the wake never arrives, or arrives as a fetched tool result, or the session dies before the job ends | medium |
 | `H7 <capability>` | **the load-bearing one**: capable agents *grep for the failure* (`grep -i fail`, `sed -n '/FAIL/,+40p'`) rather than guessing positional windows — so bgrun's central claim shrinks to the cases where no pattern finds it | agents guess positional windows more often than they grep, as measured by the `locating` column | unknown — this is the hypothesis most likely to hurt, and the reason `long-buried` is in the battery |
 | `H8 <ladder-gradient>` | the locating-strategy mix is a **function of capability**: weak rungs guess positions, strong rungs grep, so bgrun's advantage shrinks as capability rises | the mix is flat across rungs — in which case locating strategy is a property of the *prompt*, not the agent, and capability is the wrong axis | low-medium |
+| `H9 <digest-starves>` | a session that trusts the wake and does not open the log stops at the digest. The digest is **counts only** (`299 pass`, `1 fail`) and never names the failing test, so such a session cannot reach even the *symptom*. The tool's guidance says to read the log when the wake is not enough; this asks whether sessions do | sessions reach the failing test without opening the log and without being told to, or they open it unprompted in nearly every run | high on mechanism — **half of it measured already**, see [results.md](./results.md) — and unknown on behaviour |
+| `H10 <condenser-eats-traces>` — **FALSIFIED (narrow form live)** | the claim was: `bgtail`'s condenser (repeats collapsed, long lines capped) mutilates a stack trace — merging or dropping the frame that matters — so the bgrun arm's own reader is a footgun on exactly the cells where *following* the evidence, not finding it, is the cost. **Measured**: a condensed read of a real failure block preserved the assertion text, all 9 frames, both fixture locations and the markers, nothing merged or dropped. It stays live only in the narrow form the check could not exercise — a trace with *repeated identical frames*, which the collapse rule would merge | — (falsified as stated, before any battery run, by a job plus `bgtail` on its log; see [results.md](./results.md)) | was medium |
+| `H11 <trace-depth>` | reaching a root cause is a **capability boundary, not a reading-strategy one**: capable rungs open the frame the trace names, weak rungs report the assertion text and stop. Unlike `H8 <ladder-gradient>` this predicts a difference in what the agent *does with what it found*, not in how it looked | `cause_reached` is flat across rungs | medium |
 
 ## Cell register
 
@@ -46,6 +49,7 @@ cheaper for the same information, not merely different.
 | **`green-short`** repo suite, green | vanilla cheaper by median; **bimodal** — it either tails the output or floods context with all of it. bgrun's spread is small. Blocked: the suite's runtime vs **0.0s** | no waiting exists; the only variable is how the agent reads | vanilla's spread is as tight as bgrun's, or bgrun exceeds vanilla's *worst* case | high on mechanism, medium on context |
 | **`red-tail-short`** red, failure near the end | vanilla wins the median (one window reaches it, one call); its range is one to several executions. bgrun: one execution, 0.0s blocked. **Also a ladder cell** | the diagnostic is reachable positionally, so nothing forces a re-run | vanilla never re-runs, or bgrun's context falls below vanilla's best | medium-high |
 | **`long-buried`** generated, failure buried mid-run | bgrun wins executions (1 vs ≥2) and blocked time (0.0s vs the runtime, once or twice). **Context may go either way.** **Also a ladder cell** | no positional window reaches a failure buried in the middle, so vanilla pays a second full run | **the agent greps by pattern instead of windowing**, pinning the failure in one cheap call — see `H7 <capability>` | medium |
+| **`trace-root`** generated, symptom near the end, cause three frames down | **expected struggle for bgrun**, and it leans vanilla: the symptom is one grep away, so locating is cheap, while the *cause* is a frame the session has to open and read. Every layer that summarises between the session and the log is a way to lose that frame — and the wake digest is one (`H9`), as is `bgtail`'s condenser (`H10`). **Also a ladder cell**, and the one where a rung difference shows up in what the agent does with the trace rather than in how it searched (`H11`) | locating cost is low and following cost is high; the failure's *reason* is not in the failure's text | bgrun reaches `cause_reached` at least as often and no more expensively than vanilla, **or** the condenser proves to preserve traces intact | medium — direction honestly unknown |
 | **`fast-verbose`** volume without duration | **expected struggle**: near-tie on time; vanilla cheaper if it windows, worse if it floods. bgrun's gain is a greppable, delta-readable log | volume without duration creates no blocking cost | bgrun wins on context at equal information | low-medium |
 | **`fail-fast`** failure ends the run early | **expected struggle**: vanilla wins wall and context; the wake is overhead | the run ends at the failure, so the property bgrun exploits is gone | bgrun wins | high on direction, unknown on size |
 | **`pty-fixture`** runner output, pty vs pipe | was: pty = pipe + a per-test line | — | **falsified by `H1`**: identical in an agent environment, format-only difference outside it. Kept as a standing instrument check, because it pins the output shape every other cell's numbers depend on | done, falsified |
@@ -55,16 +59,35 @@ cheaper for the same information, not merely different.
 | **`resume-midrun`** session ends mid-run | bgrun wins categorically: the log and `bgstatus` outlive the session; the foreground result died with it | the log is on disk | vanilla simply re-runs and the gap is small — direction holds, magnitude shrinks | high on direction, medium on size |
 | **`peek-midrun`** ask where a run is | bgrun wins the cell; **low real-world frequency** | only a detached job can be asked mid-flight | a vanilla agent self-redirects and backgrounds, and answers the same way | high on direction, low on value |
 
+## Amendments
+
+Dated notes for measurements that land *before* a battery run, so the register shows the
+prediction as it was written next to the evidence that arrived later.
+
+- **2026-09-26.** The `trace-root` row predicted two mechanisms that could lose the frame
+  on the bgrun side: the wake digest (`H9 <digest-starves>`) and `bgtail`'s condenser
+  (`H10 <condenser-eats-traces>`). Both have now been measured as instrument checks. The
+  digest is **counts only** and never names the failing test, so on this cell the bgrun
+  arm's wake is strictly poorer than a terminal's, and the question becomes whether the
+  session opens the log at all. The condenser **kept every frame** of a real trace,
+  falsifying `H10` as stated. The row's prediction — that `trace-root` leans vanilla — is
+  **unchanged and still untested**: the mechanism is now known, the behaviour is not.
+
 ## The capability ladder
 
-Applied only to `red-tail-short` and `long-buried`, crossed with three rungs. Predicted
-per-rung behaviour, and the reason the ladder exists at all:
+Applied to `red-tail-short`, `long-buried` and `trace-root`, crossed with three rungs.
+The first two ask how the agent *looked*; `trace-root` asks what it did with what it
+found. Predicted per-rung behaviour, and the reason the ladder exists at all:
 
 | rung | predicted `locating` mix | predicted effect on bgrun's edge |
 |---|---|---|
 | weak | mostly `position`, some `full-read`; more re-runs and more context | edge at its largest |
 | mid | mixed: `pattern` on failures that name themselves, `position` otherwise | edge moderate |
 | strong | `pattern` first, one call, small context | edge at its smallest — possibly gone |
+
+On `trace-root` the same rungs are read through `cause_reached` rather than `locating`:
+weak stops at the symptom text, mid opens the frame the trace names, strong opens it and
+names the reason. That is `H11 <trace-depth>`, and it can fail in the same flat way.
 
 Falsified by a flat mix across rungs, which would mean the locating strategy is driven
 by the prompt or the failure's shape rather than by the agent's capability, and that
@@ -80,7 +103,10 @@ and when nobody wants to read the log at all (the digest carries the answer).
 
 **Should struggle** — short runs; failures a window reaches; **failures a pattern
 finds**; fail-fast; a fast-but-noisy command; and the audience that already has a
-terminal: `&`, `tmux`, a split pane. In CI, none of it applies.
+terminal: `&`, `tmux`, a split pane; and **failures whose cause is a frame away**
+(`trace-root`), where the diagnostic is cheap to find and expensive to follow, and every
+summarising layer between the session and the log is a place the frame can be lost. In
+CI, none of it applies.
 
 **What falsification would mean.** If `H7 <capability>` holds — if capable agents grep
 for the failure rather than guess at windows — then bgrun's positional advantage is
