@@ -206,6 +206,25 @@ the agent's own choice, so a session that reads more of the log narrows the cont
 gap by design — that is the escape hatch working, not a measurement flaw. The
 failure pair below is n=3 per arm.
 
+### The baseline is not stable
+
+That table is one run per arm, and the arm that matters — the neutral ask — is the
+least stable one. Three runs of it under the standard protocol (`R1`: one-shot
+`pi -p`, same command, same wording, same model) spent:
+
+| run | context chars | what it read |
+|---|---|---|
+| 1 | **4,894** | a bounded tail |
+| 2 | **5,018** | a bounded tail |
+| 3 | **21,787** | the whole 241-line run |
+
+Same prompt, same command, **4.4×** the context, because the window is the agent's
+guess and the guess varies. The bgrun column has no equivalent mode: the log's size
+is fixed on disk and the digest is what the wake carries (368 chars), so the cheap
+outcome does not depend on the model choosing well that day. That is a claim about
+**variance, not about the median** — and it is the more useful claim, because the
+median vanilla run is cheaper than bgrun and always will be.
+
 ### When the suite fails
 
 Same setup and the same ask ("report the failure details"), but every run in a
@@ -243,6 +262,17 @@ buys is the absence of the bad case — 4 executions, 82s, 23.6 KB — not a bet
 median. And the position of the failure is what makes it a guess: a runner that
 summarises failures at the very end (pytest, jest) would be hit by `tail -40` every
 time.
+
+Three further vanilla runs of the same command and ask under the standard protocol
+(`R2`: one-shot `pi -p`) came out better than the three above — executions **1, 3,
+1**; blocked **21.8s, 66.2s, 21.9s**; context **3,641 / 23,034 / 4,719** chars. Six
+vanilla runs of the same command therefore read: median one execution and ~4.7 KB,
+worst four executions, 66.2s blocked and 23 KB. Rounding that to "the agent runs it
+three times" would overstate the typical case, so both samples stay here. The
+spread is the finding, and in all six runs the tail *did* eventually reach the
+diagnostic — this fixture punishes a bad window with another run, not with a missed
+failure. At 22s a run that is a tolerable tax; at 180s it is the whole afternoon,
+which is what the next section measures.
 
 ### When the suite is long and noisy
 
