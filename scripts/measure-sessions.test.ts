@@ -28,6 +28,7 @@ import {
   resolveTargets,
   summarize,
   toCsv,
+  traceFiles,
 } from "./measure-sessions.ts";
 
 const root = mkdtempSync(join(tmpdir(), "measure-sessions-test-"));
@@ -327,4 +328,136 @@ test("a session's locate mix records the first move and the whole session", () =
   const csv = toCsv([measured], []).split("\n");
   assert.ok(csv[0].includes("locate_first,locate_pattern"));
   assert.ok(csv[1].includes("full-read,1,0,1"));
+});
+
+test("traceFiles: names the source files deepest first, ignores runner plumbing", () => {
+  // The shape a cause-module fixture emits: the throw site in a file of its own,
+  // then the call site, then frames belonging to the runner itself.
+  const trace = [
+    "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:",
+    "    at loadStep (/w/harness.ts:28:9)",
+    "    at load part 02 (/w/part-02.test.ts:41:25)",
+    "    at Test.runInAsyncScope (node:async_hooks:206:9)",
+    "    at fn (node:test:210:18)",
+  ].join("\n");
+
+  assert.deepEqual(traceFiles(trace), [
+    { file: "/w/harness.ts", line: 28 },
+    { file: "/w/part-02.test.ts", line: 41 },
+  ]);
+});
+
+test("traceFiles: the inline shape names one file only — the failing test", () => {
+  // This is the fact that makes DUMMY_CAUSE_MODULE necessary: the assertion and the
+  // runner's call site are the SAME file, so there is no cause to follow.
+  const trace = [
+    "      at /w/part-02.test.ts:58:18",
+    "      at /w/part-02.test.ts:39:25",
+    "      at fn (node:test:210:18)",
+  ].join("\n");
+
+  assert.deepEqual(traceFiles(trace), [{ file: "/w/part-02.test.ts", line: 58 }]);
+});
+
+test("cause: following the trace into the cause's file counts as reached", () => {
+  const dir = session("cause-reached", [
+    assistant(0, [toolCall("c1", "bash", "bun test /w")]),
+    toolResult(
+      20,
+      "c1",
+      [
+        "AssertionError: Expected values to be strictly deep-equal:",
+        "    at loadStep (/w/harness.ts:28:9)",
+        "    at load part 02 (/w/part-02.test.ts:41:25)",
+        "    at fn (node:test:210:18)",
+      ].join("\n"),
+    ),
+    assistant(30, [toolCall("c2", "read", "/w/harness.ts")]),
+    toolResult(31, "c2", "export function loadStep(): void {"),
+    assistant(40, [{ type: "text", text: "harness.ts compares the wrong pair" }]),
+  ]);
+
+  const measured = measureSession("cause-reached", dir);
+  assert.deepEqual(
+    measured.traceFrames.map((frame) => frame.file),
+    ["/w/harness.ts", "/w/part-02.test.ts"],
+  );
+  assert.equal(measured.causeFile, "/w/harness.ts");
+  assert.equal(measured.causeReached, true);
+  // Only the cause's file was addressed; the call site's was not.
+  assert.equal(measured.framesOpened, 1);
+});
+
+test("cause: reading the failing test alone is not reaching the cause", () => {
+  const dir = session("cause-missed", [
+    assistant(0, [toolCall("c1", "bash", "bun test /w")]),
+    toolResult(
+      20,
+      "c1",
+      [
+        "    at loadStep (/w/harness.ts:28:9)",
+        "    at load part 02 (/w/part-02.test.ts:41:25)",
+        "    at fn (node:test:210:18)",
+      ].join("\n"),
+    ),
+    assistant(30, [toolCall("c2", "read", "/w/part-02.test.ts")]),
+    toolResult(31, "c2", "assert.deepEqual("),
+    assistant(40, [{ type: "text", text: "part-02.test.ts fails at step 02" }]),
+  ]);
+
+  const measured = measureSession("cause-missed", dir);
+  assert.equal(measured.causeFile, "/w/harness.ts");
+  assert.equal(measured.causeReached, false);
+  // The failing test WAS opened — that is what framesOpened counts, and it is not
+  // the cause. Collapsing the two would report diagnosis depth that did not happen.
+  assert.equal(measured.framesOpened, 1);
+});
+
+test("cause: naming the cause's file in the final text counts as reached", () => {
+  const dir = session("cause-named", [
+    assistant(0, [toolCall("c1", "bash", "bun test /w")]),
+    toolResult(
+      20,
+      "c1",
+      [
+        "    at loadStep (/w/harness.ts:28:9)",
+        "    at fn (node:test:210:18)",
+      ].join("\n"),
+    ),
+    assistant(30, [
+      { type: "text", text: "the failure comes from harness.ts, line 28" },
+    ]),
+  ]);
+
+  const measured = measureSession("cause-named", dir);
+  assert.equal(measured.causeFile, "/w/harness.ts");
+  assert.equal(measured.causeReached, true);
+  assert.equal(measured.framesOpened, 0);
+});
+
+test("cause: no trace in view means nothing to reach", () => {
+  const dir = session("cause-absent", [
+    assistant(0, [toolCall("c1", "bash", "bun test /w")]),
+    toolResult(5, "c1", "all green"),
+  ]);
+
+  const measured = measureSession("cause-absent", dir);
+  assert.deepEqual(measured.traceFrames, []);
+  assert.equal(measured.causeFile, null);
+  assert.equal(measured.causeReached, false);
+  assert.equal(measured.framesOpened, 0);
+});
+
+test("csv: the cause columns are in the header AND every row, in step", () => {
+  const dir = session("cause-csv", [
+    assistant(0, [toolCall("c1", "bash", "bun test /w")]),
+    toolResult(20, "c1", "    at loadStep (/w/harness.ts:28:9)"),
+    assistant(30, [{ type: "text", text: "harness.ts line 28" }]),
+  ]);
+  const [header, row] = toCsv([measureSession("cause-csv", dir)], []).split("\n");
+
+  // A column added to one side and not the other shifts every value after it, and
+  // the row still parses — so only a count catches it.
+  assert.equal(header.split(",").length, row.split(",").length);
+  assert.ok(header.includes("cause_reached,cause_file,frames_opened"));
 });

@@ -43,6 +43,14 @@
  *                    For the failing fixtures that is the only measure of whether
  *                    the failure detail reached the model at all — a run can be
  *                    fast because the agent never saw what broke.
+ *   causeReached     whether the session reached the CAUSE a trace named: the
+ *                    deepest frame's file — the throw site's own file — was either
+ *                    addressed by some call or named in the final assistant text.
+ *                    Reading the failing test is not reaching it, which is the
+ *                    whole distinction a `trace-root` cell exists to measure.
+ *   framesOpened     how many of the trace's files the session addressed, against
+ *                    traceFrames.length. `0/2` says it read the failing test and
+ *                    stopped; `2/2` says it walked the trace out to the cause.
  *
  * TOLERANCE
  * ---------
@@ -73,6 +81,43 @@ export const SUITE_PATTERN =
 
 /** A call the agent chose to spend time in rather than use. */
 export const IDLE_PATTERN = /^\s*(sleep|wait)\b/;
+
+/**
+ * A stack-trace frame that names a source file, in either shape a runner emits:
+ * `at fn (path:line:col)` — Node, Bun, and the fixture's own planted block — or a
+ * bare `at path:line:col`. The function name is `.*` rather than a word: the
+ * fixture labels its call site `at load part 02 (…)`, and a name-scoped pattern
+ * silently dropped those frames. Runner plumbing (`at fn (node:test:210:18)`)
+ * carries no file extension and is therefore not a frame; see traceFiles.
+ */
+const TRACE_FRAME =
+  /^\s*at\s+(?:.*\()?((?:[A-Za-z]:)?[^\s():]+\.(?:ts|tsx|js|mjs|cjs)):(\d+):(\d+)\)?\s*$/;
+
+/** One trace frame, reduced to the file it names and the line inside it. */
+export interface TraceFrame {
+  file: string;
+  line: number;
+}
+
+/**
+ * The source files a trace names, deduplicated in first-seen order.
+ *
+ * Order IS depth: a runner prints the throw site first and its callers below it, so
+ * `frames[0]` is the deepest frame — the cause a session has to follow. This is the
+ * distinction a `trace-root` cell measures, and it only exists when the fixture
+ * puts the cause in a file of its own (`DUMMY_CAUSE_MODULE=1`); with the assertion
+ * inline, its first frame is the failing test everyone reads anyway.
+ */
+export function traceFiles(text: string): TraceFrame[] {
+  const seen = new Map<string, TraceFrame>();
+  for (const line of text.split("\n")) {
+    const match = TRACE_FRAME.exec(line);
+    if (!match) continue;
+    const file = match[1];
+    if (!seen.has(file)) seen.set(file, { file, line: Number(match[2]) });
+  }
+  return [...seen.values()];
+}
 
 /** How an agent went looking for something in a run's output. */
 export type LocateStrategy = "pattern" | "position" | "full-read";
@@ -181,6 +226,14 @@ export interface SessionMeasurement {
   locateCounts: Record<LocateStrategy, number>;
   diagnosticUpstream: boolean;
   diagnosticDownstream: boolean;
+  /** Files a trace named, deepest first. Empty when no trace came into view. */
+  traceFrames: TraceFrame[];
+  /** The deepest frame's file — the cause a session has to follow. Null without a trace. */
+  causeFile: string | null;
+  /** Whether a call addressed the cause's file, or the final text named it. */
+  causeReached: boolean;
+  /** How many of the trace's files the session addressed. */
+  framesOpened: number;
 }
 
 /** Text/thinking characters a `message` entry contributes to context. */
@@ -233,6 +286,7 @@ function readTranscript(transcript: string): {
   contextChars: number;
   lastAssistantText: string;
   sawBgrun: boolean;
+  frames: TraceFrame[];
 } {
   const rows: Omit<CallMeasurement, "suiteExecution">[] = [];
   const pending = new Map<
@@ -250,12 +304,16 @@ function readTranscript(transcript: string): {
   let cumulative = 0;
   let lastAssistantText = "";
   let sawBgrun = false;
+  // Frames are collected as they come into VIEW — from tool results — not scraped
+  // from the final answer: what a session can follow is what its results showed it.
+  const frames: TraceFrame[] = [];
+  const seenFrames = new Set<string>();
 
   let text: string;
   try {
     text = readFileSync(transcript, "utf8");
   } catch {
-    return { rows, wallSeconds: 0, contextChars: 0, lastAssistantText, sawBgrun };
+    return { rows, wallSeconds: 0, contextChars: 0, lastAssistantText, sawBgrun, frames };
   }
 
   for (const line of text.split("\n")) {
@@ -315,6 +373,13 @@ function readTranscript(transcript: string): {
     if (role === "toolResult") {
       const resultChars = textLength(entry);
       cumulative += resultChars;
+      // A runner's failure trace arrives as a tool result, and that is the only
+      // place a cause is ever named — so this is where the frames get picked up.
+      for (const frame of traceFiles(messageText(entry))) {
+        if (seenFrames.has(frame.file)) continue;
+        seenFrames.add(frame.file);
+        frames.push(frame);
+      }
       const toolCallId = message?.toolCallId;
       let matched = typeof toolCallId === "string" ? pending.get(toolCallId) : undefined;
       let matchedId = typeof toolCallId === "string" ? toolCallId : "";
@@ -350,6 +415,7 @@ function readTranscript(transcript: string): {
     contextChars: cumulative,
     lastAssistantText,
     sawBgrun,
+    frames,
   };
 }
 
@@ -378,6 +444,10 @@ export function measureSession(label: string, target: string): SessionMeasuremen
       locateCounts: emptyLocateCounts(),
       diagnosticUpstream: false,
       diagnosticDownstream: false,
+      traceFrames: [],
+      causeFile: null,
+      causeReached: false,
+      framesOpened: 0,
     };
   }
   const raw = readTranscript(transcript);
@@ -397,6 +467,18 @@ export function measureSession(label: string, target: string): SessionMeasuremen
   const locateCounts = emptyLocateCounts();
   for (const call of calls) if (call.locate) locateCounts[call.locate] += 1;
   const locateFirst = calls.find((c) => c.locate)?.locate ?? null;
+  // The cause is the deepest frame — the throw site's own file. "Reached" means a
+  // call addressed that file, or the final answer named it. Reading the failing
+  // test does not count, which is exactly the distinction a trace-root cell reads.
+  const causeFile = raw.frames[0]?.file ?? null;
+  const causeName = causeFile === null ? null : basename(causeFile);
+  const openedFrames = raw.frames.filter((frame) =>
+    calls.some((call) => call.command.includes(basename(frame.file))),
+  );
+  const causeReached =
+    causeName !== null &&
+    (openedFrames.some((frame) => frame.file === causeFile) ||
+      raw.lastAssistantText.includes(causeName));
   return {
     label,
     transcript,
@@ -418,6 +500,10 @@ export function measureSession(label: string, target: string): SessionMeasuremen
     locateCounts,
     diagnosticUpstream: raw.lastAssistantText.includes(UPSTREAM_MARKER),
     diagnosticDownstream: raw.lastAssistantText.includes(DOWNSTREAM_MARKER),
+    traceFrames: raw.frames,
+    causeFile,
+    causeReached,
+    framesOpened: openedFrames.length,
   };
 }
 
@@ -610,6 +696,11 @@ const TABLE_COLUMNS: Array<[string, (s: SessionMeasurement) => string, number]> 
   ["ctx_chars", (s) => chars(s.contextChars), 9],
   ["diag", (s) => diagnosticLabel(s), 8],
   ["locate", (s) => s.locateFirst ?? "-", 10],
+  [
+    "cause",
+    (s) => (s.traceFrames.length === 0 ? "-" : s.causeReached ? "reached" : "missed"),
+    7,
+  ],
   ["calls", (s) => String(s.toolCalls), 5],
 ];
 
@@ -716,6 +807,9 @@ const CSV_COLUMNS = [
   "locate_pattern",
   "locate_position",
   "locate_full_read",
+  "cause_reached",
+  "cause_file",
+  "frames_opened",
   "commands",
   "calls",
 ] as const;
@@ -747,6 +841,9 @@ export function toCsv(
         String(session.locateCounts.pattern),
         String(session.locateCounts.position),
         String(session.locateCounts["full-read"]),
+        session.causeReached ? "1" : "0",
+        session.causeFile ?? "",
+        String(session.framesOpened),
         session.commands.join(" ; "),
         session.calls
           .map((c) => `${c.tool}@${seconds(c.waitSeconds)}s/${c.resultChars}`)
