@@ -173,6 +173,35 @@ environments produce the same shape. The condenser half needs a job and `bgtail`
 log (`h8b-trace-log`, 998 lines, marker at 611, frames at 617/655/656) and is not
 reproducible from inside a single script.
 
+### `H6` — the unattended method fails on stdin, not on the model
+
+**Prediction**: an interactive session, held open in a pty, with the wake landing in it.
+
+**Result so far: it cannot be held open that way.** Two smoke runs died identically — TUI
+frozen one frame past the prompt at 2.4% context, no wake, no marker, no session file,
+and a **byte-identical** log (4911 bytes) both times. Deterministic, not slow.
+
+Cause, measured in three steps:
+
+| step | observation |
+|---|---|
+| `script -q /dev/null sh -c 'read x'` with stdin `/dev/null` | the child reads immediate **EOF** — the pty's first byte is `^D` |
+| the same with a pipe writer held open | still immediate EOF, so re-plumbing the *parent's* stdin is not the fix |
+| `pi` in that pty | gone by the next sample (`pgrep -f`), **not** stopped; an earlier `ps` filter matched nothing and said nothing |
+
+`pi`'s own TUI banner lists ctrl+d as exit, and a `bgrun` job runs with stdin
+`/dev/null`, so the session quits mid-turn before its own job can finish. Without a pty
+`pi` answers the turn, writes the session and exits — the same dead end, reached a
+different way.
+
+**Consequence if no pty-input hold works**: `H6` is falsified for this setup and the
+method's fallback applies — cells a human drives are measured from a run-sheet, and this
+file states which ones they were. That is a *method* difference between cells, not a
+footnote, because it changes what may be claimed for them.
+
+**Still open**: whether a pty whose input is held open by a FIFO writer (rather than
+`/dev/null`) keeps `pi` alive past its turn.
+
 ## Capability ladder
 
 Crossed with `red-tail-short`, `long-buried` and `trace-root`. All three rungs are
