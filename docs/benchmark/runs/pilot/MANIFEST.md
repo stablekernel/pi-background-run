@@ -17,6 +17,7 @@ detached job's stdin is `/dev/null`, so the session exits before its own job fin
 | capture | the agent's own terminal; transcripts written to `--session-dir` |
 | prompt | `Run 'bun test /private/tmp/equiv-fixture' in this repo as a background job with bgrun, and report the failure details once it finishes.` |
 | profiler | `bun scripts/measure-sessions.ts <each transcript file>` — **pass the files**: a directory target profiles only its first `*.jsonl` |
+| transcripts | `.bench-runs/pilot/` (scratch, git-ignored — raw session JSONL is evidence, not documentation; whether it belongs in the repo is a later decision). The table below names them relative to that directory |
 
 The prompt above names bgrun, which is fine for a *method* check and wrong for a *cell*:
 cells use the neutral ask, so that whether a session reaches for the tool is a finding

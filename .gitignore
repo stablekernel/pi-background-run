@@ -18,3 +18,4 @@ dist/
 # $CONFIG_DIR is .pi on pi and .omp on oh-my-pi. See docs/dogfooding.md.
 .pi/pi-bgrun.json
 .omp/pi-bgrun.json
+.bench-runs/
