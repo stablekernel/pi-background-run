@@ -518,6 +518,10 @@ test("bgrun: failing command wakes with ❌ and the non-zero exit code", async (
     const wake = wakes[0].text;
     assert.match(wake, /❌/);
     assert.match(wake, /exit 7/);
+    // A failure is the case that needs the log, so the wake asks for it — and
+    // the success path must not (pinned by the wake-shape test).
+    assert.match(wake, /Analyze the failure/);
+    assert.doesNotMatch(wake, /report it, and continue/);
   });
 });
 
@@ -3491,6 +3495,167 @@ test("bgtail: delta tailing — first read full tail, then only new lines, then 
   });
 });
 
+test("bgtail: a wider `lines` hands back the earlier lines not yet shown, never the seen ones", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const res = await bgrun.execute(
+      "w1",
+      { command: "seq 1 12 | sed 's/^/line-/'", name: "widening" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    assert.ok(id, "got a job id");
+    await waitForWakes(wakes, 1);
+
+    // First read: the last 3 lines.
+    const t1 = await bgtail.execute(
+      "w2",
+      { id, lines: 3 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text1 = t1.content[0].text as string;
+    assert.match(text1, /line-12/);
+    assert.doesNotMatch(text1, /line-9/);
+
+    // Widening to 6: the three earlier lines it has not seen — and NOT a re-send
+    // of the three it already has, which is what delta tailing exists to avoid.
+    const t2 = await bgtail.execute(
+      "w3",
+      { id, lines: 6 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text2 = t2.content[0].text as string;
+    assert.match(
+      text2,
+      /no new lines since last read — showing the 3 earlier lines/,
+    );
+    assert.match(text2, /line-9/);
+    assert.match(text2, /line-7/);
+    assert.doesNotMatch(text2, /line-12/, "already-seen lines are not re-sent");
+    assert.doesNotMatch(text2, /line-6/, "the window stops at the width asked for");
+    assert.equal(t2.details.widened, true);
+    assert.equal(t2.details.linesShown, 3);
+
+    // Narrowing is still the cheap poll, not a widening.
+    const t3 = await bgtail.execute(
+      "w4",
+      { id, lines: 2 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(t3.content[0].text as string, /^\(no new lines since last read/);
+    assert.equal(t3.details.linesShown, 0);
+
+    // Wide enough to cover the log: the remaining earlier lines, once.
+    const t4 = await bgtail.execute(
+      "w5",
+      { id, lines: 99 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text4 = t4.content[0].text as string;
+    assert.match(text4, /line-1\b/);
+    assert.match(text4, /line-6/);
+    assert.doesNotMatch(text4, /line-9/, "line-9 came back last read");
+
+    // Everything is now covered, so a still-wider request has nothing older to
+    // give and must fall back to the cheap poll instead of inventing output.
+    const t5 = await bgtail.execute(
+      "w6",
+      { id, lines: 99 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(t5.content[0].text as string, /^\(no new lines since last read/);
+
+    // Appended lines win over a widening request: the delta is what a caller
+    // most needs, and `served` advances with it.
+    appendFileSync(join(dir, `${id}.log`), "line-13\n");
+    const t6 = await bgtail.execute(
+      "w7",
+      { id, lines: 40 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(t6.content[0].text as string, /\+1 new line since last read/);
+  });
+});
+
+test("bgtail: a widening after a shrinking read still returns the missed lines", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const res = await bgrun.execute(
+      "s1",
+      { command: "seq 1 10 | sed 's/^/line-/'", name: "shrinking" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    assert.ok(id, "got a job id");
+    await waitForWakes(wakes, 1);
+    const logPath = join(dir, `${id}.log`);
+
+    // Coverage is the last 5 lines (6-10 of 10).
+    const first = await bgtail.execute(
+      "s2",
+      { id, lines: 5 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(first.content[0].text as string, /line-10/);
+
+    // Three lines arrive, then a NARROWER read shows only the last two: line-11 has
+    // never been seen, and `served` shrinks to 2 — forgetting the earlier run. That
+    // shrink is the case the widening invariant has to survive.
+    appendFileSync(logPath, "line-11\nline-12\nline-13\n");
+    const narrow = await bgtail.execute(
+      "s3",
+      { id, lines: 2 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const narrowText = narrow.content[0].text as string;
+    assert.match(narrowText, /line-13/);
+    assert.doesNotMatch(narrowText, /line-11/, "line-11 has never been shown");
+
+    // So widening to 4 must hand back line-11 — the line nothing has shown yet.
+    // It may ALSO repeat a line seen before the gap (coverage is a single trailing
+    // run, so a repeat is the documented behaviour), which is why only the no-loss
+    // half is asserted here: a future dedup fix should keep this test passing.
+    const widened = await bgtail.execute(
+      "s4",
+      { id, lines: 4 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      widened.content[0].text as string,
+      /line-11/,
+      "a widening must not lose the line the narrowing read skipped",
+    );
+  });
+});
+
 test("bgtail: raw:true keeps the verbatim window but still advances the bookmark", async () => {
   await withJobsDir(async (dir, h) => {
     const { wakes, tools, ctx } = h;
@@ -4809,8 +4974,18 @@ function trustCtx(ctx: any, proj: string, trusted: boolean): any {
 }
 
 function digestBlockOf(wake: string): string | null {
-  const m = wake.match(/digest \([^)]*\): ([\s\S]*?)\nReview the result/);
-  return m ? m[1] : null;
+  // The wake always ENDS with one outcome-instruction line, so the digest block
+  // runs from its own line to the last line. Deliberately not keyed to that
+  // instruction's wording: it differs by exit code (report vs analyze), and keying
+  // to it is what silently broke these tests when the wording changed.
+  const lines = wake.split("\n");
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  const idx = lines.findIndex((l) => /^digest \([^)]*\): /.test(l));
+  if (idx === -1) return null;
+  return [
+    lines[idx].replace(/^digest \([^)]*\): /, ""),
+    ...lines.slice(idx + 1, -1),
+  ].join("\n");
 }
 
 test("wake digest: preset scorecard appears on a green log", async () => {
@@ -5061,7 +5236,7 @@ test("wake digest: no digest configured → wake shape unchanged (regression gua
     const id = wake.match(/`([^`]+)`/)![1];
     const lines = wake.split("\n");
     // Pre-digest shape: exit line, Command, Stats (Phase 1), Last output,
-    // Review instruction — exactly five lines, nothing appended.
+    // outcome instruction — exactly five lines, nothing appended.
     assert.equal(lines.length, 5);
     assert.equal(lines[0], `✅ Background job \`${id}\` finished (exit 0).`);
     assert.equal(lines[1], "Command: echo hello world");
@@ -5069,7 +5244,7 @@ test("wake digest: no digest configured → wake shape unchanged (regression gua
     assert.equal(lines[3], "Last output: hello world");
     assert.equal(
       lines[4],
-      "Review the result now: call `bgtail` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.",
+      "The exit code, stats and last output above are the result — report it, and continue the task that depended on this. Read the log only for detail they do not carry.",
     );
     assert.ok(!wake.includes("digest ("));
   } finally {

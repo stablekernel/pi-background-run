@@ -1973,6 +1973,13 @@ export default function (pi: ExtensionAPI) {
     first: string;
     window: number;
     /**
+     * Trailing content lines the caller has been shown. A later read asking for
+     * MORE lines than this is a widening request — the caller wants the older
+     * tail, not appended output — and is served as the slice between the two
+     * windows instead of the misleading "(no new lines since last read)".
+     */
+    served: number;
+    /**
      * The resolved path this bookmark was taken against. An id can outlive its
      * file: a `bg_N` id reused by the host after a session transition, or a
      * native delivery that remaps it to a different artifact. Without the path, a
@@ -2848,6 +2855,7 @@ export default function (pi: ExtensionAPI) {
     "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
     "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard — bgrun's `started:` line names them when you omit it.",
     "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
+    "Do not poll a job you just started — no bgstatus/bgtail round after bgrun: the wake is the signal and carries the outcome (exit code, stats, the log's last line, and the digest when the project configures one). Read the log only when the wake is not enough — typically the detail behind a failure.",
     "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search, or read the log's path directly for whole-log analysis.",
   ];
 
@@ -3197,7 +3205,13 @@ export default function (pi: ExtensionAPI) {
           } else if (digestNoMatchNote) {
             wake += `${digestNoMatchNote}\n`;
           }
-          wake += `Review the result now: call \`bgtail\` with this job id to see the output, summarize pass/fail, and continue the task that depended on it.`;
+          // A failure is what needs the log; on success the wake already IS the
+          // result. An unconditional "call bgtail" here would undo the point of the
+          // wake, because it is the last instruction the agent reads.
+          wake +=
+            exitCode === 0
+              ? "The exit code, stats and last output above are the result — report it, and continue the task that depended on this. Read the log only for detail they do not carry."
+              : "Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it — then continue the task that depended on this.";
           try {
             if (rec.ctx.isIdle()) {
               pi.sendUserMessage(wake);
@@ -3250,7 +3264,7 @@ export default function (pi: ExtensionAPI) {
         }
         startedLines.push(
           `  log: ${logPath}`,
-          `  You'll be woken automatically when it finishes.`,
+          `  You'll be woken automatically when it finishes — no need to poll; the wake carries the exit code, the stats and the log's last line.`,
         );
         return {
           content: [{ type: "text", text: startedLines.join("\n") }],
@@ -3812,10 +3826,15 @@ export default function (pi: ExtensionAPI) {
     let window: string[];
     let header: string | undefined;
     let newLines: number | undefined;
+    // Trailing content lines the caller will have been shown by this read.
+    // Bookmarked so a later read can tell "asked for a wider window" (wants
+    // older lines it has not seen) apart from "polling" (wants appended lines).
+    let served: number;
     if (raw || prev === undefined || shrank || replaced || windowChanged || pathChanged) {
       // Full tail: first read, raw mode, a shrunken/replaced log, or a changed
       // search window (all resets).
       window = rawLines.slice(-lines);
+      served = window.length;
       if (!raw) {
         header = pathChanged
           ? "log path changed since last read (the id now resolves elsewhere) — showing full tail"
@@ -3831,12 +3850,62 @@ export default function (pi: ExtensionAPI) {
       const fresh = rawLines.slice(prev.lines);
       newLines = fresh.length;
       if (fresh.length === 0) {
+        // No appended lines — but a `lines` larger than what the caller has
+        // already been shown is not a poll, it is a request for the OLDER tail
+        // (`tail -40`, then `tail -80`). Answering that with "no new lines"
+        // replies to the wrong question and reads as "nothing more to see", so
+        // hand back the slice between the two windows instead. When everything
+        // is already covered (served === total) there is nothing older to give,
+        // and the cheap poll response stands.
+        const widenedTo = Math.min(lines, total);
+        if (lines > prev.served && total > prev.served) {
+          const older = rawLines.slice(
+            Math.max(0, total - lines),
+            total - prev.served,
+          );
+          rememberTail(id, {
+            lines: total,
+            bytes: size,
+            first,
+            window: readWindow,
+            path: logPath,
+            served: widenedTo,
+          });
+          const condensed = condenseLogLines(older, { raw });
+          const olderNotes =
+            condensed.truncated.length > 0
+              ? `\n\n(${condensed.truncated.join("; ")})`
+              : "";
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `no new lines since last read — showing the ${older.length} earlier line${older.length === 1 ? "" : "s"} of the widened window ` +
+                  `(now the last ${widenedTo} of ${total})\n${condensed.text}${olderNotes}${capNote}${windowNote}${lineNote}`,
+              },
+            ],
+            details: {
+              id,
+              linesShown: older.length,
+              logPath,
+              notFound: false,
+              condensed: true,
+              newLines: 0,
+              totalLines: total,
+              widened: true,
+              windowBytes: readWindow,
+              ...truncDetails,
+            },
+          };
+        }
         rememberTail(id, {
           lines: total,
           bytes: size,
           first,
           window: readWindow,
           path: logPath,
+          served: prev.served,
         });
         return {
           content: [
@@ -3859,6 +3928,13 @@ export default function (pi: ExtensionAPI) {
         };
       }
       window = fresh.length > lines ? fresh.slice(-lines) : fresh;
+      // Coverage is contiguous from the end: every fresh line when they all fit
+      // the request, otherwise just the requested window (the unseen gap above
+      // it is why `served` falls back to `lines`).
+      served =
+        fresh.length > lines
+          ? lines
+          : Math.min(prev.served + fresh.length, total);
       header =
         `+${fresh.length} new line${fresh.length === 1 ? "" : "s"} since last read — ` +
         `log at ${total} lines${fresh.length > lines ? ` (showing last ${lines})` : ""}`;
@@ -3869,6 +3945,7 @@ export default function (pi: ExtensionAPI) {
       first,
       window: readWindow,
       path: logPath,
+      served,
     });
     const shown = window;
     const { text, truncated } = condenseLogLines(shown, { raw });
@@ -3903,7 +3980,7 @@ export default function (pi: ExtensionAPI) {
     name: "bgtail",
     label: "Tail Background Log",
     description:
-      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. raw: true returns the unprocessed last-N window. A shrunken, replaced, or differently-windowed log resets to a full tail. Reads only the log's last 2 MiB by default (`bytes` widens it, max 64 MiB) and says so when the log is bigger. For pattern search use bggrep; for whole-log analysis, read the log path directly (it is printed by bgstatus and in these notes).",
+      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. A larger `lines` than you have already been shown is a widening request: it returns the lines above your current coverage rather than the whole window again (coverage is a trailing run, so a line seen before an intervening gap can repeat). raw: true returns the unprocessed last-N window. A shrunken, replaced, or differently-windowed log resets to a full tail. Reads only the log's last 2 MiB by default (`bytes` widens it, max 64 MiB) and says so when the log is bigger. For pattern search use bggrep; for whole-log analysis, read the log path directly (it is printed by bgstatus and in these notes).",
     promptSnippet: "Read the last N lines of a bgrun job's log",
     parameters: Type.Object({
       id: Type.String({
