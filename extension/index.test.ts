@@ -3379,6 +3379,167 @@ test("bgtail: delta tailing — first read full tail, then only new lines, then 
   });
 });
 
+test("bgtail: a wider `lines` hands back the earlier lines not yet shown, never the seen ones", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const res = await bgrun.execute(
+      "w1",
+      { command: "seq 1 12 | sed 's/^/line-/'", name: "widening" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    assert.ok(id, "got a job id");
+    await waitForWakes(wakes, 1);
+
+    // First read: the last 3 lines.
+    const t1 = await bgtail.execute(
+      "w2",
+      { id, lines: 3 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text1 = t1.content[0].text as string;
+    assert.match(text1, /line-12/);
+    assert.doesNotMatch(text1, /line-9/);
+
+    // Widening to 6: the three earlier lines it has not seen — and NOT a re-send
+    // of the three it already has, which is what delta tailing exists to avoid.
+    const t2 = await bgtail.execute(
+      "w3",
+      { id, lines: 6 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text2 = t2.content[0].text as string;
+    assert.match(
+      text2,
+      /no new lines since last read — showing the 3 earlier lines/,
+    );
+    assert.match(text2, /line-9/);
+    assert.match(text2, /line-7/);
+    assert.doesNotMatch(text2, /line-12/, "already-seen lines are not re-sent");
+    assert.doesNotMatch(text2, /line-6/, "the window stops at the width asked for");
+    assert.equal(t2.details.widened, true);
+    assert.equal(t2.details.linesShown, 3);
+
+    // Narrowing is still the cheap poll, not a widening.
+    const t3 = await bgtail.execute(
+      "w4",
+      { id, lines: 2 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(t3.content[0].text as string, /^\(no new lines since last read/);
+    assert.equal(t3.details.linesShown, 0);
+
+    // Wide enough to cover the log: the remaining earlier lines, once.
+    const t4 = await bgtail.execute(
+      "w5",
+      { id, lines: 99 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const text4 = t4.content[0].text as string;
+    assert.match(text4, /line-1\b/);
+    assert.match(text4, /line-6/);
+    assert.doesNotMatch(text4, /line-9/, "line-9 came back last read");
+
+    // Everything is now covered, so a still-wider request has nothing older to
+    // give and must fall back to the cheap poll instead of inventing output.
+    const t5 = await bgtail.execute(
+      "w6",
+      { id, lines: 99 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(t5.content[0].text as string, /^\(no new lines since last read/);
+
+    // Appended lines win over a widening request: the delta is what a caller
+    // most needs, and `served` advances with it.
+    appendFileSync(join(dir, `${id}.log`), "line-13\n");
+    const t6 = await bgtail.execute(
+      "w7",
+      { id, lines: 40 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(t6.content[0].text as string, /\+1 new line since last read/);
+  });
+});
+
+test("bgtail: a widening after a shrinking read still returns the missed lines", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const res = await bgrun.execute(
+      "s1",
+      { command: "seq 1 10 | sed 's/^/line-/'", name: "shrinking" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = ((res.content[0].text as string).match(/^started: ([^\n]+)/) ||
+      [])[1];
+    assert.ok(id, "got a job id");
+    await waitForWakes(wakes, 1);
+    const logPath = join(dir, `${id}.log`);
+
+    // Coverage is the last 5 lines (6-10 of 10).
+    const first = await bgtail.execute(
+      "s2",
+      { id, lines: 5 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(first.content[0].text as string, /line-10/);
+
+    // Three lines arrive, then a NARROWER read shows only the last two: line-11 has
+    // never been seen, and `served` shrinks to 2 — forgetting the earlier run. That
+    // shrink is the case the widening invariant has to survive.
+    appendFileSync(logPath, "line-11\nline-12\nline-13\n");
+    const narrow = await bgtail.execute(
+      "s3",
+      { id, lines: 2 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const narrowText = narrow.content[0].text as string;
+    assert.match(narrowText, /line-13/);
+    assert.doesNotMatch(narrowText, /line-11/, "line-11 has never been shown");
+
+    // So widening to 4 must hand back line-11 — the line nothing has shown yet.
+    // It may ALSO repeat a line seen before the gap (coverage is a single trailing
+    // run, so a repeat is the documented behaviour), which is why only the no-loss
+    // half is asserted here: a future dedup fix should keep this test passing.
+    const widened = await bgtail.execute(
+      "s4",
+      { id, lines: 4 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match(
+      widened.content[0].text as string,
+      /line-11/,
+      "a widening must not lose the line the narrowing read skipped",
+    );
+  });
+});
+
 test("bgtail: raw:true keeps the verbatim window but still advances the bookmark", async () => {
   await withJobsDir(async (dir, h) => {
     const { wakes, tools, ctx } = h;
