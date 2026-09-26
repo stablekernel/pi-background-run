@@ -229,6 +229,16 @@ exits before its own job finishes; without a pty it exits when its turn ends; an
 the pty's input open hangs instead. See [results.md](./results.md). What follows is
 therefore the method rather than the exception.
 
+Two practical rules the pilot established, which a run-sheet has to carry:
+
+- **One directory per run.** The profiler takes the first `*.jsonl` of a directory target,
+  so a shared session directory silently profiles one run and drops the rest. Each session
+  gets its own `--session-dir`, or its transcript is passed by name.
+- **The prompt is neutral.** Both arms get the same ask — run this and report the failure
+  details — with no mention of how. Whether a session reaches for bgrun or runs the suite
+  in the foreground is a *finding about the tool's adoption*; a prompt that names bgrun
+  measures obedience instead.
+
 A bgrun cell is normally a real session with a human in it, which is why the battery
 would otherwise be limited by someone's patience. The unlock under test (`H6 <unattended>`):
 run `pi` **interactive in a pty** with the prompt as an argument — no `-p` — launched

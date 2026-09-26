@@ -210,6 +210,37 @@ done; holding the input open hangs instead. Cells a human drives are therefore m
 from a run-sheet, and this file states which ones those were — a *method* difference
 between cells, because it bounds what may be claimed for them.
 
+### The attended method — verified (pilot, 2026-09-26)
+
+`H6` being negative does not leave the method untested; it leaves the *unattended* claim
+untested. Two human-driven sessions on one fixture checked the rest of the loop — that a
+bgrun job's wake lands in a live session, and that the session acts on it. Raw transcripts
+and the per-run table: [runs/pilot](./runs/pilot/MANIFEST.md).
+
+| run | execs | handoff | fg | blocked_s | wall_s | ctx_chars | diag | locate | calls |
+|---|---|---|---|---|---|---|---|---|---|
+| manual-1 | 1 | 1 | 0 | 0.0 | 8.3 | 3,903 | up+down | `position` | 2 |
+| manual-2 | 1 | 1 | 0 | 0.0 | 8.3 | 4,427 | up+down | `position` | 2 |
+
+**Result: the loop works, twice, identically.** Both wakes landed and were acted on; both
+sessions read the job's log with `bgtail` rather than grepping it — `position`, the first
+real values that column has ever held; neither ran the suite in the foreground; blocked
+time is 0.0s in both. Wall is identical to the tenth of a second and context varies 13%
+between runs, which is the repeatability a battery needs before any cell means anything.
+
+**A trap the pilot found, worth more than the result**: the profiler treats a *directory*
+target as **one** session (its first `*.jsonl`, sorted), so pointing it at a flat session
+dir silently profiles one run and drops the others — the exact "the tool has it, nothing
+says what was skipped" failure this method exists to prevent. One directory per run, or
+pass the transcript files by name.
+
+**Where the battery starts, after the trim** (agreed 2026-09-26): the three `H7`-critical
+cells — `long-buried`, `red-tail-short`, `trace-root` — at **one rung** first
+(`anthropic/claude-sonnet-4-6`), both arms, n=3. Cheapest first: `red-tail-short`, whose
+suite runs in about 25s. With one rung the *cells* are tested and the ladder hypotheses
+(`H7`, `H8`, `H11`) are not — that is the trade the trim makes explicitly rather than by
+omission, and it is reversible: the ladder widens only if the arm effect shows up at all.
+
 ## Capability ladder
 
 Crossed with `red-tail-short`, `long-buried` and `trace-root`. All three rungs are
