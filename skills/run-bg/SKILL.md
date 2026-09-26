@@ -84,7 +84,7 @@ Which to use:
 |---|---|
 | Start  | `bgrun(command: "make test-short", name: "unit-tests", type: "test")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the live panel, and wake messages) |
 | Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
-| Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing) |
+| Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing); a *bigger* `lines` than you have been shown is a widening and returns the lines above your coverage (a line seen before a gap can repeat) |
 | Grep   | `bggrep(<job-id>, "pattern", context?)` — line-numbered matches, capped and condensed; default pattern = generic failure signatures (override when you know the format) |
 | Clean  | `bgclean()` for this session's old logs; `bgclean all` to sweep every session's (default 7-day retention) |
 | Kill   | `bgkill(<job-id>)` — SIGTERM to the job's process group; `force: true` for SIGKILL. Refuses finished ids, non-bgrun ids, and another session's job unless `includeForeign: true` |
@@ -126,7 +126,7 @@ first — it is a short pass/fail scorecard configured for this project and
 usually answers "what failed" without any follow-up read. `bgtail` stays the
 positional-peek tool for everything else.
 
-- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing) — polling a running job is nearly free.
+- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing) — polling a running job is nearly free. Asking for a **larger `lines`** than you have been shown widens the window instead: it returns the lines above your coverage, so widening costs the difference rather than re-sending the window (a line seen before a gap can repeat).
 - **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Resolves the job id to the configured jobs dir itself — no path to reconstruct. (A sandboxed whole-log reader, context-mode's `ctx_execute_file`, can read the same file given its absolute path — see below.) Searches the last 2 MiB by default; `bytes: 67112960` (the 64 MiB ceiling plus the wrapper's 4 KiB of notices and exit marker) widens it to the whole kept log — the exact ceiling alone stops a few bytes short of the marker, dropping the head you asked for — more scanning costs latency and memory, **not context**, since the returned matches stay capped. Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
 - **Whole-log failure analysis:** read the log's **absolute path** directly
   (with a sandboxed whole-log reader if your environment has one — context-mode's
