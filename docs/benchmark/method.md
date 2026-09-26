@@ -224,6 +224,11 @@ argument for probing instruments instead of trusting them.
 
 ## Case: unattended bgrun sessions
 
+**Result: negative on this setup.** A detached job's stdin is `/dev/null`, so the session
+exits before its own job finishes; without a pty it exits when its turn ends; and holding
+the pty's input open hangs instead. See [results.md](./results.md). What follows is
+therefore the method rather than the exception.
+
 A bgrun cell is normally a real session with a human in it, which is why the battery
 would otherwise be limited by someone's patience. The unlock under test (`H6 <unattended>`):
 run `pi` **interactive in a pty** with the prompt as an argument — no `-p` — launched

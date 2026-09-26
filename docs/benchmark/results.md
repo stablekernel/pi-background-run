@@ -199,8 +199,16 @@ method's fallback applies — cells a human drives are measured from a run-sheet
 file states which ones they were. That is a *method* difference between cells, not a
 footnote, because it changes what may be claimed for them.
 
-**Still open**: whether a pty whose input is held open by a FIFO writer (rather than
-`/dev/null`) keeps `pi` alive past its turn.
+**The last variant failed too.** A pty whose input is held open by a FIFO writer (rather
+than `/dev/null`) does not rescue it: the reader blocks on the named pipe and the probe had
+to be killed by its own five-minute timeout. That route is not merely unproven but
+unusable as a job — a hung probe is worse than a failed one.
+
+**Verdict: `H6 <unattended>` is negative on this setup.** With stdin `/dev/null` the
+session exits before its own job can finish; without a pty it exits as soon as its turn is
+done; holding the input open hangs instead. Cells a human drives are therefore measured
+from a run-sheet, and this file states which ones those were — a *method* difference
+between cells, because it bounds what may be claimed for them.
 
 ## Capability ladder
 
@@ -221,9 +229,9 @@ haiku→sonnet→opus, which is the axis `H7`/`H11` need.
 
 ## Blocked on
 
-- Phase 1 instrument work: `locating` and the shape/evidence-path instruments are done;
-  the unattended-session smoke is running, and the unattended-versus-manual equivalence
-  check needs two short manual sessions.
+- Phase 1 instrument work is closed: `locating`, the shape and evidence-path instruments,
+  and the unattended question (`H6`, negative — see above) are all answered. What remains
+  is the first cell, which needs the manual sessions.
 - The fixture's crutch is now a knob, not a blocker: `DUMMY_ANNOUNCE_FAILURE=0` removes
   the line that names the planted failure, and every diagnosis or discovery cell must run
   with it off. The default stays `1` so the measurements already taken against this
