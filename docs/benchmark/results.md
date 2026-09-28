@@ -1,9 +1,9 @@
 # Results
 
-Empty by design. This file holds what the battery measures, in the form the method
-requires, and it stays empty until a cell actually runs. Predictions are in
-[predictions.md](./predictions.md); the procedure that produces these rows is in
-[method.md](./method.md).
+The record of what the battery has measured: the cell status table, the executed cells
+with their numbers and verdicts, and the instrument checks that decided whether those
+numbers mean anything. Predictions are in [predictions.md](./predictions.md); the
+procedure that produces these rows is in [method.md](./method.md).
 
 ## How a result is recorded
 

@@ -77,7 +77,7 @@ fixture whose cause is a separate file, the informative question is whether that
 all, and here it did so 0/3 against 3/3.
 
 `H11`'s actual claim — capability, not reading strategy — needs the rungs
-([../../predictions.md](../../predictions.md), the ladder table), which this cell has not run. What
+([../../predictions.md](../../predictions.md), the untested register), which this cell has not run. What
 this cell shows is that on the bgrun side an *instrument* difference can produce the appearance of a
 depth difference, which is a confound the ladder will have to control for: a weak rung on the vanilla
 arm would still see `harness.ts`, because the whole log arrives in one result.

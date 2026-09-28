@@ -191,10 +191,12 @@ agent driving bgrun, and a single run of one is an anecdote. Report n≥3 with m
 7. Record the outcome against the cell's prediction: confirmed, falsified, or
    inconclusive.
 
-**Run manifest** (beside each transcript): cell id · arm · context (including
-pty/pipe) · **model, rung and reasoning effort** · the exact prompt · fixture id and
-file hash as a digest · fixture knobs · session directory · start/end timestamps · machine load ·
-anything else that ran concurrently.
+**Run manifest** — required of every cell from here on, and **not** present beside the
+existing cells' transcripts: for those, the recorded `CELL.md` / `RUNSHEET.md` sheets
+*are* the manifest. A per-session manifest sits beside each transcript and carries:
+cell id · arm · context (including pty/pipe) · **model, rung and reasoning effort** ·
+the exact prompt · fixture id and file hash as a digest · fixture knobs · session
+directory · start/end timestamps · machine load · anything else that ran concurrently.
 
 ## Case: the pty/pipe question — answered
 
