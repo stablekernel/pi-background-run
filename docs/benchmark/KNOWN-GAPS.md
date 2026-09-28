@@ -42,13 +42,28 @@ recorded there: prompt/tool shaping, richer pointers, or documenting the feature
 possibly deprecating it. The related *defect* work — the evidence rule across all three presets — is
 issue #34.
 
-## The history rewrite, deliberately not done
+## The history rewrite — done 2026-09-28
 
-Two pilot transcripts were deleted from the tree in `57e4218` but remain fetchable as blobs
-`8dc540974b3e11cdb0bb91d7675b88681219763e` and `a94b186b8f8f099d35cb656bb292b65d0917723e`, carrying
-the same personal context that was just redacted everywhere else. Removed files stay in history, so a
-clone still contains them. Purging needs a rewrite of this branch (unpushed, so cheap), then reflog
-expiry and `gc` — a deliberate step, not a side effect of a redaction commit.
+Two pilot transcripts were committed in `965a39d` and deleted in `57e4218`, but a deleted file stays
+fetchable from history, so a clone still carried the personal context that was redacted everywhere
+else. Both blobs (`8dc540974b3e11cdb0bb91d7675b88681219763e`, `a94b186b8f8f099d35cb656bb292b65d0917723e`)
+are now unreachable, and `git rev-list --objects bench/dogfooding | grep pilot/manual` returns nothing.
 
-The verbatim pre-redaction transcripts are kept outside any repository at
-`~/.pi-bgrun-bench-transcripts/`, so nothing was lost by redacting.
+Scope was checked first: the commit that added them is local-only, so the remote never held these
+blobs. Two consequences, stated because a later push depends on them:
+
+- **A push now needs `--force`.** The rewrite changed every SHA, and after rebasing onto `main` the
+  branch is no longer a descendant of `origin/bench/dogfooding`. Acceptable for a solo bench branch
+  whose remote holds the same content — but a decision, not an incidental detail.
+- The rebase onto `main` was needed because `filter-branch` rewrites a branch's whole ancestry,
+  including the commits shared with the published branch. Without it the branch showed 92 commits over
+  `main` instead of 50, which would have made a later PR unreadable.
+
+Safety: the tip's tree hash is unchanged before and after (`9b5407b1943d68c46d20726062edf2fb07fd40ec`),
+the profiler still reproduces the committed profiles, the profiler's tests pass, and the working tree
+is clean. An index-filter cannot alter a tree it removes no file from, which is what makes the rewrite
+provably content-neutral here.
+
+`MANIFEST.md` in the pilot directory now states plainly that those transcripts are not in the
+repository and why, so the dangling references the usability audit found are no longer silent. The
+verbatim pre-redaction transcripts remain outside any repository at `~/.pi-bgrun-bench-transcripts/`.
