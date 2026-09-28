@@ -39,8 +39,12 @@ session names it outright: *"Assertion error in `harness.ts:28`"*. The bgrun arm
 a **pattern search** over the log after the wake, does not contain it: the sessions searched for
 failure words (`(?i)(fail|✗|×|error|expect)`), which matches the assertion and the runner's `(fail)`
 line but **not** the frame lines themselves — `at loadStep (.../harness.ts:28:9)` contains no failure
-word. So the frame was filtered out by the search, and the wake's digest is counts-only, so nothing
-pointed at it. The bgrun answers cite `part-02.test.ts` with line numbers that actually belong to the
+word. So the frame was filtered out by the search, and the wake's digest pointed at nothing better: in
+this project it is configured as counts only (`grep -E '[0-9]+ (pass|fail)$' | tail -5` — see
+[../../method.md](../../method.md)), so it names no test and no file. The extension ships presets that
+*do* name failures (`go-test`, `jest`, `pytest`, `junit-xml`), so what starved this session was the
+configuration, not a missing capability — which is itself testable, by re-running this cell with a
+naming digest. The bgrun answers cite `part-02.test.ts` with line numbers that actually belong to the
 harness file (28 is the assertion inside `harness.ts`, 41 the call site): numbers without their file
 attribution. How those numbers reached a context with no `harness.ts` in it is not established from
 these transcripts and is left as an open question rather than a story.

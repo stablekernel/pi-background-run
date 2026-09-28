@@ -64,6 +64,32 @@ read — and the two mechanisms that could lose that frame on the bgrun side hav
 measured away as instrument checks: the wake digest (counts only, `H9`) and `bgtail`'s
 condenser (kept every frame, `H10` falsified as stated). Falsified by a flat mix across rungs.
 
+## Variant: a digest that names the failure (proposed experiment)
+
+Cell 3's bgrun sessions never saw the cause file: the wake's digest is counts-only, so they had no
+pointer and searched for failure words, which a frame line does not contain. Whether that pointer is
+the whole story is testable without any product change — re-run this cell with a digest that names
+the failure and see whether `harness.ts` appears:
+
+1. In `.pi/pi-bgrun.json` (the bench worktree's project config), replace the `test` digest's
+   `command` with something that keeps the failure and its neighbourhood:
+
+   ```json
+   "command": "grep -E '(fail|✗|AssertionError)' -A3 \"$1\" | tail -12"
+   ```
+
+2. Run the cell into fresh dirs, so it cannot shadow the runs above:
+
+   ```sh
+   ./run-cell.sh trace-root --variant namingdigest
+   ```
+
+3. Compare `harness.ts` occurrences in context and `cause_file` between `trace-root` and
+   `trace-root-namingdigest`. If the cause file appears, the missing pointer was the whole defect and
+   the fix belongs in the wake itself (name the deepest frame), not in each project's config.
+
+Restore the config afterwards: a changed digest silently changes every later cell.
+
 ## While the cell runs
 
 - Nothing else heavy on the machine; I stay off it.
