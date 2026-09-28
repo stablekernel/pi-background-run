@@ -328,14 +328,17 @@ record: [runs/trace-root/CELL.md](runs/trace-root/CELL.md).
 **The bgrun arm never saw the cause.** The fixture puts it in a file of its own; vanilla's single
 synchronous read carries the whole log and names it (*"Assertion error in `harness.ts:28`"*), while
 the bgrun arm's pattern search — for failure words, which the frame line
-`at loadStep (.../harness.ts:28:9)` does not contain — filtered it out, and the counts-only wake
-digest pointed at nothing better. That is the cell's prediction confirmed by its intended mechanism,
-with the loss coming from the session's own grep rather than from condensation (`H10` stays
-falsified).
+`at loadStep (.../harness.ts:28:9)` does not contain — filtered it out, because the wake presented
+its summary as the result ("the exit code, stats and last output above **are the result**"), leaving
+no reason to open the window around the failure. That is the cell's prediction confirmed by its
+intended mechanism, with the loss coming from the session's own grep rather than from condensation
+(`H10` stays falsified).
 
 **The efficiency result is real and it was bought with the diagnosis:** 65% less context and 3s more
-wall, on a cell whose whole point is following the symptom to the root. `H9 <digest-starves>` gets
-its first behavioural entry in the narrow form. `H11` is **not** tested here: `cause_reached` reads 1
+wall, on a cell whose whole point is following the symptom to the root. `H9 <digest-starves>` gains
+nothing from this cell: no digest was configured for this project, so it cannot speak to it. H9's one
+behavioural entry remains the pilot cell's, where a configured digest carried counts and nothing
+else. `H11` is **not** tested here: `cause_reached` reads 1
 in both arms for definitional reasons (it is session-relative — the deepest frame *that session saw*),
 so it must be read with `cause_file`; on a fixture with a separate cause file, the informative
 question is whether that file appears at all, and it appeared 0/3 against 3/3. The ladder is what
@@ -369,6 +372,45 @@ This also retroactively justifies deleting the built-in locator: the JS-tuned re
 The presets and the `on: "failure"` gate are precision layers — they put a pointer in the wake — not
 the thing that made a session follow the trace. Variant B (`--variant tracepreset`) now measures an
 increment on top of this rather than a fix.
+
+## Cell 4 — `long-buried`, and its pointer variant (2026-09-28)
+
+The expensive-workload cell: the failure is buried in `part-05` of ten, so a tail read has nothing to
+find. Workload from the job's own command line: **570 tests, 1,281 lines, ~204s per run**. Full
+record: [runs/long-buried/CELL.md](runs/long-buried/CELL.md).
+
+| metric (median) | bgrun (framing only) | vanilla | bgrun (with pointer) |
+|---|---|---|---|
+| wall_s | **225.9** [223.1–228.4] | 696.2 [283.8–732.4] | 233.1 [231.2–233.1] |
+| blocked_s | **0.0** | 660.2 | 0.0 |
+| ctx_chars | **18,760** | 79,901 | 28,633 |
+| calls | 3, 4, 4 | 12, 2, 6 | 5, 5, 6 |
+| deepest frame seen | `part-05.test.ts` | `part-05.test.ts` | `part-05.test.ts` |
+| polls / wake claims | 0 / 0 | — | 0 / 0 |
+
+**The first cell where bgrun wins on both axes — 3.1× faster, 4.3× lighter — and the mechanism is the
+job's cost.** bgrun pays it once (225.9s ≈ 204s job + ~22s agent work, `blocked_s` 0.0); vanilla pays
+it repeatedly (4 foreground runs median, `blocked_s` 660.2, spread 283.8–732.4 depending on how many
+times the session chose to re-run). This is the regime the async handoff is for, and it is the
+counterweight to Cells 1/1b/3, where a 23–34s job made the wake's round trip the dominant cost.
+Diagnosis is a *tie* — both arms reached `part-05.test.ts` — which is the best form of the result:
+the same answer at a quarter of the context, because vanilla bought it by reading everything.
+
+**The pointer variant is a negative result, and a product defect.** Its first behavioural exercise:
+the `js-trace` preset fired on the failing job and named
+`Failure: (pass) preset js-trace corpus (captured): …` — a **passing** test's name, not the failing
+one. The cause is self-reference: the suite under test contains the preset's own corpus tests, which
+print captured failure text, so the log holds failure-shaped strings from passing tests. Sessions did
+not trust it — calls rose from 3–4 to 5–6, context ~50% — and still reached `part-05.test.ts`. The
+scan cost is irrelevant (~20ms against 204s); the price is that a claim which may be wrong must be
+verified.
+
+**Design rule, now measured: a pointer that can be wrong must be conservative — a wrong pointer costs
+more than no pointer** (4 calls / 18.8k with none, against 5.3 calls / 28.6k with this one). The
+preset defect is being fixed from the kept log,
+`<bench>/.pi/pi-bgrun/jobs/bun-tests-1790622377-55299.log`. Attribution caveat: the workload is the
+extension's own suite, which is a pathological digest input, so the *rule* generalises further than
+the *number* does.
 
 ## Blocked on
 
