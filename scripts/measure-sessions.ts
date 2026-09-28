@@ -87,11 +87,14 @@ export const IDLE_PATTERN = /^\s*(sleep|wait)\b/;
  * `at fn (path:line:col)` — Node, Bun, and the fixture's own planted block — or a
  * bare `at path:line:col`. The function name is `.*` rather than a word: the
  * fixture labels its call site `at load part 02 (…)`, and a name-scoped pattern
- * silently dropped those frames. Runner plumbing (`at fn (node:test:210:18)`)
+ * silently dropped those frames. The optional `L331:`/`331:` prefix is a
+ * line-numbered view — `bgtail` and `bggrep` hand those back, and one session in
+ * the first cell read its trace entirely that way, where an anchored pattern scored
+ * a five-frame trace as "no trace at all". Runner plumbing (`at fn (node:test:210:18)`)
  * carries no file extension and is therefore not a frame; see traceFiles.
  */
 const TRACE_FRAME =
-  /^\s*at\s+(?:.*\()?((?:[A-Za-z]:)?[^\s():]+\.(?:ts|tsx|js|mjs|cjs)):(\d+):(\d+)\)?\s*$/;
+  /^\s*(?:L?\d+:\s*)?at\s+(?:.*\()?((?:[A-Za-z]:)?[^\s():]+\.(?:ts|tsx|js|mjs|cjs)):(\d+):(\d+)\)?\s*$/;
 
 /** One trace frame, reduced to the file it names and the line inside it. */
 export interface TraceFrame {

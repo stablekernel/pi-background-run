@@ -254,15 +254,45 @@ haiku→sonnet→opus, which is the axis `H7`/`H11` need.
 | rung | model | `red-tail-short` | `long-buried` | `trace-root` |
 |---|---|---|---|---|
 | weak | `anthropic/claude-haiku-4-5` | not run | not run | not run |
-| mid | `anthropic/claude-sonnet-4-6` | not run | not run | not run |
+| mid | `anthropic/claude-sonnet-4-6` | **done** — [Cell 1](#cell-1--red-tail-short-measured-2026-09-28) | not run | not run |
 | strong | `anthropic/claude-opus-5` | not run | not run | not run |
 | floor probe (not a rung) | `fireworks/gpt-oss-120b` | not run | not run | not run |
+
+## Cell 1 — `red-tail-short`, measured 2026-09-28
+
+The first real cell: six sessions (3 bgrun / 3 vanilla) at `anthropic/claude-sonnet-4-6`, the
+neutral prompt, one session directory each, interleaved. Full record, provenance and instrument
+notes: [runs/red-tail-short/CELL.md](runs/red-tail-short/CELL.md); raw numbers:
+[runs/red-tail-short/profile.csv](runs/red-tail-short/profile.csv).
+
+| metric, median [min–max] | bgrun | vanilla |
+|---|---|---|
+| wall_s | 45.4 [42.9–51.1] | 33.0 [32.5–38.2] |
+| blocked_s | 0.0 [0.0–0.0] | 22.5 [22.5–22.6] |
+| ctx_chars | 31,170 [29,403–31,782] | 27,817 [27,798–27,870] |
+| tool calls | 11 [9–12] | 1 [1–1] |
+| execs | 1.0 [1.0–1.0] | 1.0 [1.0–1.0] |
+| diag_reach | 3/3 | 3/3 |
+
+**Verdict on the prediction** (`H4 <negative-cells>`): supported. The diagnostic was one window
+away, so bgrun bought nothing here — it was *slower* (non-overlapping wall ranges), cost 12% more
+context, and had identical executions — while doing precisely what it promises on the one axis it
+owns: `blocked_s` 0.0 against 22.5. The unblocking was paid for in agent turns (9–12
+`bgtail`/`bggrep` windows versus vanilla's single call), so `idle_s` on the bgrun side is the
+job's runtime plus polling, not dead time.
+
+`cause_reached` came out 3/3 in both arms — degenerate on this fixture, where the trace's only
+file is the failing test that every session names. The column is informative only under
+`DUMMY_CAUSE_MODULE=1`, i.e. the `trace-root` cell. n=3 per arm: spreads are reported, and no
+significance is claimed.
 
 ## Blocked on
 
 - Phase 1 instrument work is closed: `locating`, the shape and evidence-path instruments,
-  and the unattended question (`H6`, negative — see above) are all answered. What remains
-  is the first cell, which needs the manual sessions.
+  and the unattended question (`H6`, negative — see above) are all answered. The first cell
+  has since been measured ([Cell 1](#cell-1--red-tail-short-measured-2026-09-28)); what
+  remains is `long-buried`, `trace-root`, and the ladder rungs above the mid rung — each
+  needs its own attended sessions.
 - The fixture's crutch is now a knob, not a blocker: `DUMMY_ANNOUNCE_FAILURE=0` removes
   the line that names the planted failure, and every diagnosis or discovery cell must run
   with it off. The default stays `1` so the measurements already taken against this

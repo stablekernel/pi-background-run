@@ -10,7 +10,7 @@ prediction: [../../predictions.md](../../predictions.md).
 |---|---|
 | prompt | `Run bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture in this repo and report the failure details.` |
 | fixture | `/private/tmp/red-tail-fixture` — 2 files, 8 tests, fails at part 02 step 04, exit 1; `DUMMY_SLEEP_MS=1`, `DUMMY_ANNOUNCE_FAILURE=0` |
-| fixture sha | `9b42b1ea3d980ef6` |
+| fixture sha | `0bfe00ed1d9866b9` (recomputed 2026-09-28 under the method above; the earlier `9b42b1ea3d980ef6` was not reproducible — the files' mtimes and all six transcripts confirm the content was unchanged, see [CELL.md](CELL.md)) |
 | model | `anthropic/claude-sonnet-4-6` |
 | working dir | `/Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc` |
 | sessions | each run gets its **own** `--session-dir`: a shared one profiles only its first `*.jsonl` |

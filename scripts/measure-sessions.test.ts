@@ -359,6 +359,27 @@ test("traceFiles: the inline shape names one file only — the failing test", ()
   assert.deepEqual(traceFiles(trace), [{ file: "/w/part-02.test.ts", line: 58 }]);
 });
 
+test("traceFiles: frames survive a line-numbered view", () => {
+  // bgtail/bggrep hand back numbered windows, in two spellings. One session in the
+  // first cell read its whole trace that way; an anchored pattern scored it as "no
+  // trace at all" while its transcript held five frames. Both spellings are real.
+  const numbered = [
+    "L331:       at /w/harness.ts:28:9",
+    "L332:       at load part 02 (/w/part-02.test.ts:41:25)",
+    "L333:       at fn (node:test:210:18)",
+  ].join("\n");
+  const greppped = [
+    "  331:    at /w/harness.ts:28:10",
+    "  332:    at fn (node:test:210:18)",
+  ].join("\n");
+
+  assert.deepEqual(
+    traceFiles(numbered).map((frame) => frame.file),
+    ["/w/harness.ts", "/w/part-02.test.ts"],
+  );
+  assert.deepEqual(traceFiles(greppped), [{ file: "/w/harness.ts", line: 28 }]);
+});
+
 test("cause: following the trace into the cause's file counts as reached", () => {
   const dir = session("cause-reached", [
     assistant(0, [toolCall("c1", "bash", "bun test /w")]),
