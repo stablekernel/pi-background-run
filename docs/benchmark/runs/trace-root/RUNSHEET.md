@@ -66,18 +66,33 @@ condenser (kept every frame, `H10` falsified as stated). Falsified by a flat mix
 
 ## Variants: re-running this cell after a change
 
-**Primary — the wake names the failure (proposed fix, no config change).** Cell 3's bgrun sessions
-never saw the cause file because the wake pointed at nothing, so they searched for failure words —
-a pattern that cannot match a frame line. If the wake carries the first failure and its deepest
-frame instead, this cell should show the cause file in the bgrun arm's context:
+**Primary — the pointer in the wake (variant B).** Cell 3a showed that *framing alone* fixed this cell
+(`--variant framewake`: the cause file went 0/3 → 3/3 with no preset and no digest change). What
+remains is whether a pointer arriving **in the wake** saves the extra read. B measures that increment,
+not the fix.
 
-```sh
-./run-cell.sh trace-root --variant framewake
+The digest entry is the experimental condition, so it is set by hand, in the project's own config —
+the tool does not write config files (see the nudge's contract), and a tool that configured its own
+experiment would be measuring itself. Replace the `command` entry in `.pi/pi-bgrun.json` with:
+
+```json
+{ "type": "test", "preset": "js-trace", "on": "failure" }
 ```
 
-Then compare against Cell 3: `harness.ts` occurrences in context (0/3 → expect 3/3), `cause_file`
-(`part-02.test.ts` → expect `harness.ts`), and `tool_calls` (must stay 2 — if finding the frame costs
-extra calls, the wake is not carrying it).
+(Only one digest block is appended per wake, which is why the counts entry is replaced rather than
+joined; `on: "failure"` is enforced by the framework, so a passing job cannot produce a pointer even
+if its log contains `Error:`.)
+
+```sh
+./run-cell.sh trace-root --variant tracepreset
+```
+
+Compare against Cell 3a: tool calls (3 → does it drop to 2?), `ctx_chars` (14,009 → lower if the
+pointer replaces the `bgtail` read), `cause_file` (must stay `harness.ts`), and polls/claims (0).
+A null result here is a finding too: a 96-line log is cheap to read, and the pointer's value should
+show on logs where that read is not.
+
+Restore the config afterwards — a changed digest silently changes every later cell.
 
 **Secondary — a digest that names the failure.** Answers the narrower question, *was the missing
 pointer the whole defect?*, without any product change. If the primary fix lands, this matters less,
