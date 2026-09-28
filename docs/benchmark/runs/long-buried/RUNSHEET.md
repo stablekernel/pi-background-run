@@ -79,6 +79,34 @@ larger than `H7` predicted, the credit belongs to the pointer, not to the job me
 - No edits to the repo or the fixture mid-cell.
 - One session at a time.
 
+## Variant runs
+
+**The pointer variant runs one arm, on purpose.** The question is whether the wake's pointer changes
+the *bgrun* arm, so vanilla is not the control that matters here — and this cell's vanilla numbers
+already exist (283.8–732.4s, three sessions) from the baseline above. Dropping it also drops the
+interleaving, which the runner announces when it happens; that is acceptable in this cell because
+bgrun's wall is 225.9s of which ~204s is the job itself, so drift lands on the ~22s remainder, and the
+metrics of interest (calls, context) are job-independent. For a *new* fixture the other arm must stay:
+it has no baseline yet.
+
+```sh
+./run-cell.sh long-buried --variant tracepreset-fixed --arms bgrun   # after the js-trace evidence fix
+```
+
+Name it something new each time: the runner refuses to write into a session dir that already has
+transcripts, so a re-run cannot shadow the run it is compared against. That gives a three-way
+comparison, each step changing one thing:
+
+| run | pointer | calls (median) | ctx_chars (median) |
+|---|---|---|---|
+| `long-buried` | none (no digest configured) | 4 | 18,760 |
+| `long-buried-tracepreset` | wrong (named a passing test) | 5 | 28,633 |
+| `long-buried-tracepreset-fixed` | fixed (or silent) | — | — |
+
+Outcomes, all informative: calls and context drop (the pointer earns its place); the preset emits
+nothing and the arm matches the baseline (silence working as designed); or it still costs more (the
+pointer's value is genuinely low in this regime rather than mis-tuned).
+
 ## After the six
 
 I profile each transcript with `bun scripts/measure-sessions.ts <the files>`, write the

@@ -13,6 +13,15 @@
 # own profile (`.bench-runs/<cell>-<variant>/`), so a re-run can never shadow the runs it is
 # being compared against — which is the same reason the refusal guard below exists.
 #
+# A variant of an already-controlled cell can run one arm only:
+#
+#   ./run-cell.sh long-buried --variant tracepreset --arms bgrun
+#
+# Justified when the question is a within-fixture change to one arm (does this preset help the
+# bgrun arm?) and the other arm's control already exists from the cell being variant-ed. NOT
+# justified for a new fixture, where the other arm has no baseline yet. Dropping an arm also
+# drops the interleaving, which is the drift control; the script says so when it happens.
+#
 # Runs are interleaved bgrun/vanilla (b1, v1, b2, v2, b3, v3): the six sessions span
 # roughly half an hour, and interleaving means any drift in host load or thermals lands
 # on both arms instead of on whichever arm ran last.
@@ -20,13 +29,21 @@ set -uo pipefail
 
 cell="${1:-}"
 variant=""
+arms="both"
 dry=0
 shift || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) dry=1 ;;
     --variant) variant="${2:-}"; shift ;;
-    *) echo "usage: $0 {red-tail-short|trace-root|long-buried} [--dry-run] [--variant NAME]" >&2; exit 2 ;;
+    --arms)
+      arms="${2:-}"; shift
+      case "$arms" in
+        bgrun|vanilla|both) ;;
+        *) echo "error: --arms must be bgrun, vanilla or both (got '$arms')" >&2; exit 2 ;;
+      esac
+      ;;
+    *) echo "usage: $0 {red-tail-short|trace-root|long-buried} [--dry-run] [--variant NAME] [--arms bgrun|vanilla|both]" >&2; exit 2 ;;
   esac
   shift
 done
@@ -35,7 +52,7 @@ case "$cell" in
   red-tail-short) fixture=/private/tmp/red-tail-fixture; prefix=rt ;;
   trace-root)     fixture=/private/tmp/trace-root-fixture; prefix=tr ;;
   long-buried)    fixture=/private/tmp/long-buried-fixture; prefix=lb ;;
-  ""|*) echo "usage: $0 {red-tail-short|trace-root|long-buried} [--dry-run] [--variant NAME]" >&2; exit 2 ;;
+  ""|*) echo "usage: $0 {red-tail-short|trace-root|long-buried} [--dry-run] [--variant NAME] [--arms bgrun|vanilla|both]" >&2; exit 2 ;;
 esac
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -53,7 +70,14 @@ prompt="Run $suite $fixture in this repo and report the failure details."
 echo "cell:    $tag"
 echo "fixture: $fixture"
 echo "repo:    $repo"
-echo "order:   bgrun-1, vanilla-1, bgrun-2, vanilla-2, bgrun-3, vanilla-3"
+case "$arms" in
+  both)    order="bgrun-1, vanilla-1, bgrun-2, vanilla-2, bgrun-3, vanilla-3"; total=6 ;;
+  bgrun)   order="bgrun-1, bgrun-2, bgrun-3"; total=3 ;;
+  vanilla) order="vanilla-1, vanilla-2, vanilla-3"; total=3 ;;
+esac
+echo "arms:    $arms"
+echo "order:   $order"
+[ "$arms" = both ] || echo "note:    single-arm run — the other arm is omitted, and so is the interleaving (the drift control). Compare against the same-arm baseline in the cell's RUNSHEET."
 echo
 
 run_one() {
@@ -105,8 +129,11 @@ run_one() {
 }
 
 for n in 1 2 3; do
-  run_one bgrun "$n"
-  run_one vanilla "$n"
+  case "$arms" in
+    both)    run_one bgrun "$n"; run_one vanilla "$n" ;;
+    bgrun)   run_one bgrun "$n" ;;
+    vanilla) run_one vanilla "$n" ;;
+  esac
 done
 
 if [ "$dry" = 1 ]; then
@@ -115,7 +142,7 @@ if [ "$dry" = 1 ]; then
 fi
 
 echo "────────────────────────────────────────────────────────────"
-echo "all six transcripts in place. Profiling."
+echo "all $total transcripts in place. Profiling."
 outdir="$repo/.bench-runs/$tag"
 mkdir -p "$outdir"
 ( cd "$repo" && bun scripts/measure-sessions.ts "$cells"/* ) | tee "$outdir/profile.txt"
