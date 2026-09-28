@@ -1526,6 +1526,17 @@ export function digestNudgeMarkerPath(
 export const DIGEST_NUDGE_TEXT =
   "pi-bgrun: no digest configured for this project — use the digest-config skill to set one up.";
 
+/**
+ * The failure-time variant of DIGEST_NUDGE_TEXT, toasted at the first non-zero
+ * exit in a trusted project with no digest configured (see
+ * maybeNudgeDigest). Moment-aware: a failure just happened, so it says what a
+ * digest would have changed. Same one-shot marker as the session-start nudge,
+ * so a project is nudged at most once either way. Exported so tests assert the
+ * real string.
+ */
+export const DIGEST_FAILURE_NUDGE_TEXT =
+  "pi-bgrun: a job just failed and this project has no digest — a digest would surface the failure in the wake instead of leaving it in the log. Use the digest-config skill to set one up.";
+
 // Job and config `type` values are short routing tokens. Both sides cap at the
 // same length; if only the job side truncated, a >MAX_TYPE_LEN config type
 // would silently never match the job's truncated type.
@@ -1556,6 +1567,7 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
     label?: unknown;
     preset?: unknown;
     command?: unknown;
+    on?: unknown;
   };
 
   // `type` and `match` compose (AND): both are kept and both must match at
@@ -1629,6 +1641,19 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   // Neither preset nor command → nothing this entry can score. Drop it.
   if (!preset && !command) return undefined;
 
+  // `on: "failure"` is the only accepted gate: the FRAMEWORK (not the command)
+  // appends this entry's output only for a non-zero exit. Anything else is a
+  // config error and drops the entry, like a bad `match`/`type`.
+  let on: "failure" | undefined;
+  if (entry.on !== undefined) {
+    if (entry.on === "failure") {
+      on = "failure";
+    } else {
+      warnDigestInvalid("on", entry.on);
+      return undefined;
+    }
+  }
+
   const out: DigestEntry = {};
   if (type) out.type = type;
   if (match) out.match = match;
@@ -1637,6 +1662,7 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   }
   if (preset) out.preset = preset;
   if (command) out.command = command;
+  if (on) out.on = on;
   return out;
 }
 
@@ -2031,7 +2057,7 @@ export default function (pi: ExtensionAPI) {
   // fixed-size buffer, no full-file read). Missing/unreadable file → null:
   // the Stats line then just omits the line count — best-effort, never
   // breaks a wake.
-  function countLogLines(logPath: string): number | null {
+  function scanLog(logPath: string): number | null {
     let fd: number;
     try {
       fd = openSync(logPath, "r");
@@ -2854,8 +2880,7 @@ export default function (pi: ExtensionAPI) {
     "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
     "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
     "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard — bgrun's `started:` line names them when you omit it.",
-    "After bgrun returns a job id, continue other work; you will be woken automatically when it finishes.",
-    "Do not poll a job you just started — no bgstatus/bgtail round after bgrun: the wake is the signal and carries the outcome (exit code, stats, the log's last line, and the digest when the project configures one). Read the log only when the wake is not enough — typically the detail behind a failure.",
+    "Launching the job is the whole task: end your turn after a bgrun handoff — there is nothing to wait for. The wake arrives as a new turn carrying the outcome (exit code, stats, the log's last line, and the digest when the project configures one), but it is a summary, never the full record — on a failing job the context around the failure exists only in the log, so read a window around it before concluding a cause. Do not call bgstatus/bgtail/bggrep before it.",
     "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search, or read the log's path directly for whole-log analysis.",
   ];
 
@@ -2864,8 +2889,9 @@ export default function (pi: ExtensionAPI) {
     name: "bgrun",
     label: "Run in Background",
     description: toolDescription(
-      "Run a long shell command detached in the background. Returns 'started: <job-id>' immediately. " +
-        "You will be woken automatically when the job finishes. Use this instead of bash for any command " +
+      "Run a long shell command detached in the background. Returns 'started: <job-id>' immediately — " +
+        "your part is done there: end your turn, and you'll be woken when the job finishes. " +
+        "Use this instead of bash for any command " +
         "expected to run >30s or emit >100 lines (tests, builds, linters) — and whenever the output must " +
         "outlive the session, since the job's log survives a restart and stays greppable. Optionally pass " +
         "`name` for a short human-readable label used in the job id, status output, and wake messages, and " +
@@ -3088,7 +3114,7 @@ export default function (pi: ExtensionAPI) {
           // Universal stats — duration + log line count. Non-heuristic, always
           // present, never pattern-based. A missing log contributes no line
           // count (duration is always known).
-          const logLines = countLogLines(logPath);
+          const logLines = scanLog(logPath);
           const statsParts = [formatDuration(rec.exitedAt - rec.started)];
           if (logLines !== null)
             statsParts.push(`${logLines.toLocaleString("en-US")} lines`);
@@ -3147,7 +3173,14 @@ export default function (pi: ExtensionAPI) {
               command: rec.cmd,
             };
             const selected = selectDigestEntry(digestEntries, digestTarget);
-            if (selected) {
+            // A failure-only entry is the FRAMEWORK's call, not the command's:
+            // a digest command receives only the log path, never the exit code,
+            // so `on: "failure"` is enforced here. A green job contributes
+            // nothing from such an entry — even when its log happens to contain
+            // an `Error:` line a command would match.
+            const failureGatedOff =
+              selected?.on === "failure" && exitCode === 0;
+            if (selected && !failureGatedOff) {
               if (truncatedAt !== null) {
                 // A scorecard reads the log's END (summary lines, failure
                 // lists) — exactly what a head cap drops. Its numbers would be
@@ -3163,7 +3196,7 @@ export default function (pi: ExtensionAPI) {
                 const text = raw === undefined ? undefined : capDigestOutput(raw);
                 if (text) digestBlock = { label: selected.label, text };
               }
-            } else if (digestEntries?.length) {
+            } else if (!selected && digestEntries?.length) {
               // Configured but nothing selected — otherwise silent. Surface the
               // job's type/name plus the configured types, once per distinct
               // diagnostic (capped), so a type mismatch or dead glob is visible.
@@ -3205,13 +3238,16 @@ export default function (pi: ExtensionAPI) {
           } else if (digestNoMatchNote) {
             wake += `${digestNoMatchNote}\n`;
           }
-          // A failure is what needs the log; on success the wake already IS the
-          // result. An unconditional "call bgtail" here would undo the point of the
-          // wake, because it is the last instruction the agent reads.
+          // The wake is a summary, never the diagnosis: it must not license a
+          // conclusion about a cause. Both closing lines say so — an
+          // unconditional "call bgtail" on success would undo the point of the
+          // wake, since it is the last instruction the agent reads. The failure
+          // wording is true whatever the ecosystem: the log holds the context,
+          // and a failure named by a trace digest is one failure, not the story.
           wake +=
             exitCode === 0
-              ? "The exit code, stats and last output above are the result — report it, and continue the task that depended on this. Read the log only for detail they do not carry."
-              : "Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it — then continue the task that depended on this.";
+              ? "The exit code, stats and last output above are a summary, not the diagnosis — the log holds the detail, including the context around any failure. For a failing job, read a window around the failure before concluding a cause."
+              : "Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it. This wake is a summary, not the diagnosis — the log holds the context around the failure, and any failure named here (by a trace digest) is one failure, not the whole story. Then continue the task that depended on this.";
           try {
             if (rec.ctx.isIdle()) {
               pi.sendUserMessage(wake);
@@ -3235,6 +3271,15 @@ export default function (pi: ExtensionAPI) {
               `${exitEmoji} ${toastLabel} → exit ${exitStr}`,
               exitCode === 0 ? "info" : "error",
             );
+          }
+
+          // Failure-time digest nudge: a failure is the moment a digest's value
+          // becomes legible, so offer the failure-worded nudge here for a
+          // trusted, digest-less project. Shares the per-project one-shot marker
+          // with the session_start nudge, so a project nudged either way stays
+          // silent. Toast only — never enters LLM context.
+          if (exitCode !== 0) {
+            maybeNudgeDigest(rec.ctx, DIGEST_FAILURE_NUDGE_TEXT);
           }
 
           // Update/clear the widget.
@@ -3264,7 +3309,7 @@ export default function (pi: ExtensionAPI) {
         }
         startedLines.push(
           `  log: ${logPath}`,
-          `  You'll be woken automatically when it finishes — no need to poll; the wake carries the exit code, the stats and the log's last line.`,
+          `  ✅ Your part is done — end your turn now. Nothing to wait for: the wake will arrive as a new turn with the exit code, the stats and the log's last line.`,
         );
         return {
           content: [{ type: "text", text: startedLines.join("\n") }],
@@ -3412,13 +3457,20 @@ export default function (pi: ExtensionAPI) {
   let digestNoMatchSuppressed = false;
   const DIGEST_NO_MATCH_WARN_CAP = 3;
 
-  // ── Digest nudge: one-shot session_start toast for digest-less projects ────
+  // ── Digest nudge: one-shot toast for digest-less projects ─────────────────
   // When a trusted project has actually used bgrun (≥1 finished job log in the
   // jobs dir) but never configured a digest, point the human at the
-  // digest-config skill once. Toast only — never sendUserMessage, so it costs
-  // zero LLM context. Dismissal is a per-project marker file in the jobs dir;
-  // the user's config files are never written.
-  function maybeNudgeDigest(ctx: ExtensionContext): void {
+  // digest-config skill once. Called from session_start (default text) and from
+  // the first non-zero exit of a job (DIGEST_FAILURE_NUDGE_TEXT) — the failure
+  // moment is when the value of a digest is legible, and the failure wording
+  // says so. Both share the same per-project marker, so a project is nudged at
+  // most once either way. Toast only — never sendUserMessage, so it costs zero
+  // LLM context. Dismissal is a per-project marker file in the jobs dir; the
+  // user's config files are never written.
+  function maybeNudgeDigest(
+    ctx: ExtensionContext,
+    text: string = DIGEST_NUDGE_TEXT,
+  ): void {
     try {
       if (!ctx.isProjectTrusted?.()) return;
       const cfg = resolveConfig(ctx);
@@ -3430,11 +3482,11 @@ export default function (pi: ExtensionAPI) {
       if (!existsSync(jobUsageMarkerPath(cfg.jobsDir, projectDir))) return;
       const markerPath = digestNudgeMarkerPath(cfg.jobsDir, projectDir);
       if (existsSync(markerPath)) return; // already nudged once — stay silent
-      ctx.ui.notify(DIGEST_NUDGE_TEXT, "info");
+      ctx.ui.notify(text, "info");
       try {
         writeFileSync(markerPath, String(Date.now()));
       } catch {
-        // best-effort — a marker write failure must never break session_start
+        // best-effort — a marker write failure must never break the caller
       }
     } catch (err) {
       logWarn(`[pi-bgrun] digest nudge failed: ${(err as Error).message}`);
@@ -3522,8 +3574,9 @@ export default function (pi: ExtensionAPI) {
   // Delta tailing: each read bookmarks the total raw line count at read time
   // (the high-water mark of what the caller has had the opportunity to see).
   // The FIRST read for a job returns the full last-N tail; repeat reads return
-  // only lines appended since, so polling a running job never re-pays context
-  // for lines already seen. Deliberately-skipped prefix lines are never
+  // only lines appended since, so lines already seen are never sent twice. A
+  // still-running job is answered with its state instead of any of this unless
+  // `peek: true` (see runningNote). Deliberately-skipped prefix lines are never
   // replayed as "new". raw: true keeps the verbatim last-N window (no delta
   // header) but still advances the bookmark. A shrunken log (rotated/replaced)
   // resets to a full tail. Bookmarks are in-memory only (see tailBookmarks
@@ -3731,12 +3784,95 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  /**
+   * The state line a read of a still-running job stands in for. The readers used
+   * to report only the log's growth ("+62 new lines since last read"), never the
+   * job's own state, so a session that assumed it had been woken ("Wake
+   * received." 3.2s into a 23s job) found every delta read consistent with that
+   * assumption and kept polling — 9-12 calls per session, measured in the first
+   * benchmark cell. The tool description already forbade polling and was not
+   * obeyed, so the read itself stops paying off: content comes back only under
+   * the explicit `peek: true`, and the line names the completion semantics the
+   * session is supposed to act on. `withPeek: false` is bgstatus, which returns
+   * no log content and so has no opt-in to point at.
+   */
+  function runningNote(
+    started: number,
+    withPeek: boolean,
+    now = Date.now(),
+  ): string {
+    const elapsed = ((now - started) / 1000).toFixed(1);
+    return (
+      `⏳ still running — ${elapsed}s elapsed, no exit code yet. Launching was the task; the wake is your next input. ` +
+      (withPeek
+        ? `Nothing to read until it exits — pass peek: true only if you need the live log now.`
+        : `Nothing to read until it exits.`)
+    );
+  }
+
+  /**
+   * When the job started — the record's stamp, else the epoch its id encodes,
+   * else the log's birth time.
+   */
+  function jobStartedFor(
+    rec: JobRecord | undefined,
+    id: string,
+    logPath: string,
+  ): number {
+    if (rec) return rec.started;
+    const epoch = jobEpochFromId(id);
+    if (epoch !== undefined) return epoch * 1000;
+    try {
+      return statSync(logPath).birthtimeMs;
+    } catch {
+      return Date.now();
+    }
+  }
+
+  /**
+   * The note a read of `id` must carry, or "" once the job has exited. State
+   * comes from the same source bgstatusCore's by-id path uses: the in-memory
+   * record (a live child is authoritative), and for a record with no live handle
+   * — reconstructed, adopted, or discovered only from the jobs dir — the log's
+   * exit marker, then pid liveness. A job bgrun cannot positively tie to a live
+   * process is NOT claimed as running: the note must never appear over a
+   * finished job's read, whose output stays byte-identical.
+   */
+  function runningNoteFor(
+    id: string,
+    ctx: ExtensionContext | undefined,
+    now = Date.now(),
+  ): string {
+    // A native job's state is the host's to report; bgrun has no record of it.
+    if (nativeOutputFor(id, ctx)) return "";
+    const rec = jobs.get(id);
+    const logPath =
+      rec?.logPath ?? join(resolveConfig(ctx).jobsDir, `${id}.log`);
+    let exit = rec?.exitCode;
+    if (exit === undefined && !rec?.child) {
+      const fromLog = parseExitFromLogPath(logPath);
+      if (fromLog !== null) exit = fromLog;
+      else {
+        const pid = rec ? rec.pid : pidFromId(id);
+        if (pid === null || pid <= 0 || !isRunningPid(pid)) exit = -1;
+      }
+    }
+    if (exit !== undefined) return "";
+    return runningNote(jobStartedFor(rec, id, logPath), true, now);
+  }
+
   // Shared by the bgtail tool (agent-facing) and the /bgtail slash command
   // (human-facing). Returns the read *unstamped*: both callers pass the result
   // through annotateNative() so a read of a native job's artifact says so — the
   // stamp needs the job id, which is the caller's parameter, not this one's.
   async function bgtailCore(
-    params: { id: string; lines?: number; raw?: boolean; bytes?: number },
+    params: {
+      id: string;
+      lines?: number;
+      raw?: boolean;
+      bytes?: number;
+      peek?: boolean;
+    },
     ctx?: ExtensionContext,
   ): Promise<{
     content: { type: "text"; text: string }[];
@@ -3761,6 +3897,26 @@ export default function (pi: ExtensionAPI) {
         isError: true,
       };
     }
+    // A read of a still-running job returns the state and NOTHING else — not
+    // even the delta. Serving that content is what paid the poller for each of
+    // the 9-12 calls measured in the first benchmark cell, so the payoff goes
+    // away; `peek: true` is the deliberate opt-in (watching a live long job is
+    // legitimate, it just must not be the default path). Gated before the
+    // bookkeeping below, so a later peek is still a first read, not a delta
+    // claiming lines the caller never saw.
+    const running = runningNoteFor(id, ctx);
+    if (running !== "" && params.peek !== true) {
+      return {
+        content: [{ type: "text", text: running }],
+        details: {
+          id,
+          logPath: resolved.logPath,
+          notFound: false,
+          running: true,
+        },
+      };
+    }
+    const statePrefix = running === "" ? "" : `${running}\n`;
     const { logPath, content, size } = resolved;
     // The cap dropped bytes off the END, so every "last N lines" view below is
     // the end of what was KEPT. Flag it in the output, or a mid-run line reads
@@ -3828,7 +3984,8 @@ export default function (pi: ExtensionAPI) {
     let newLines: number | undefined;
     // Trailing content lines the caller will have been shown by this read.
     // Bookmarked so a later read can tell "asked for a wider window" (wants
-    // older lines it has not seen) apart from "polling" (wants appended lines).
+    // older lines it has not seen) apart from a plain repeat read (wants
+    // appended lines).
     let served: number;
     if (raw || prev === undefined || shrank || replaced || windowChanged || pathChanged) {
       // Full tail: first read, raw mode, a shrunken/replaced log, or a changed
@@ -3856,7 +4013,7 @@ export default function (pi: ExtensionAPI) {
         // replies to the wrong question and reads as "nothing more to see", so
         // hand back the slice between the two windows instead. When everything
         // is already covered (served === total) there is nothing older to give,
-        // and the cheap poll response stands.
+        // and the small no-new-lines response stands.
         const widenedTo = Math.min(lines, total);
         if (lines > prev.served && total > prev.served) {
           const older = rawLines.slice(
@@ -3881,7 +4038,7 @@ export default function (pi: ExtensionAPI) {
               {
                 type: "text",
                 text:
-                  `no new lines since last read — showing the ${older.length} earlier line${older.length === 1 ? "" : "s"} of the widened window ` +
+                  `${statePrefix}no new lines since last read — showing the ${older.length} earlier line${older.length === 1 ? "" : "s"} of the widened window ` +
                   `(now the last ${widenedTo} of ${total})\n${condensed.text}${olderNotes}${capNote}${windowNote}${lineNote}`,
               },
             ],
@@ -3911,7 +4068,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `(no new lines since last read — log at ${total} line${total === 1 ? "" : "s"})${capNote}${windowNote}${lineNote}`,
+              text: `${statePrefix}(no new lines since last read — log at ${total} line${total === 1 ? "" : "s"})${capNote}${windowNote}${lineNote}`,
             },
           ],
           details: {
@@ -3958,7 +4115,7 @@ export default function (pi: ExtensionAPI) {
       content: [
         {
           type: "text",
-          text: head + body + notes + capNote + windowNote + lineNote,
+          text: statePrefix + head + body + notes + capNote + windowNote + lineNote,
         },
       ],
       details: {
@@ -3980,7 +4137,7 @@ export default function (pi: ExtensionAPI) {
     name: "bgtail",
     label: "Tail Background Log",
     description:
-      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); REPEAT reads return only lines appended since your last read (delta tailing) — polling a running job never re-pays for the same lines. A larger `lines` than you have already been shown is a widening request: it returns the lines above your current coverage rather than the whole window again (coverage is a trailing run, so a line seen before an intervening gap can repeat). raw: true returns the unprocessed last-N window. A shrunken, replaced, or differently-windowed log resets to a full tail. Reads only the log's last 2 MiB by default (`bytes` widens it, max 64 MiB) and says so when the log is bigger. For pattern search use bggrep; for whole-log analysis, read the log path directly (it is printed by bgstatus and in these notes).",
+      "Read the newest lines of a background job's log, condensed for context: ANSI escapes stripped, repeated lines collapsed, long lines truncated, output capped (~8KB). Strips the exit-marker line. The first read returns the last N lines (default 40); repeat reads return only lines appended since your last read (delta tailing), so a line already shown is never sent twice. While the job is still running this returns its state and nothing else — pass `peek: true` to read the live log anyway. A larger `lines` than you have already been shown is a widening request: it returns the lines above your current coverage rather than the whole window again (coverage is a trailing run, so a line seen before an intervening gap can repeat). raw: true returns the unprocessed last-N window. A shrunken, replaced, or differently-windowed log resets to a full tail. Reads only the log's last 2 MiB by default (`bytes` widens it, max 64 MiB) and says so when the log is bigger. For pattern search use bggrep; for whole-log analysis, read the log path directly (it is printed by bgstatus and in these notes).",
     promptSnippet: "Read the last N lines of a bgrun job's log",
     parameters: Type.Object({
       id: Type.String({
@@ -4005,6 +4162,12 @@ export default function (pi: ExtensionAPI) {
           minimum: 1,
         }),
       ),
+      peek: Type.Optional(
+        Type.Boolean({
+          description:
+            "Read the log even while the job is running (default false: a running job returns its state only, since the wake carries the outcome).",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       return annotateNative(await bgtailCore(params, ctx), params.id, ctx);
@@ -4023,9 +4186,14 @@ export default function (pi: ExtensionAPI) {
   const MAX_GREP_MATCHES = 50;
 
   async function bggrepCore(
-    params: { id: string; pattern?: string; context?: number; bytes?: number },
+    params: {
+      id: string;
+      pattern?: string;
+      context?: number;
+      bytes?: number;
+      peek?: boolean;
+    },
     ctx?: ExtensionContext,
-  
   ): Promise<{
     content: { type: "text"; text: string }[];
     details: Record<string, unknown>;
@@ -4064,6 +4232,25 @@ export default function (pi: ExtensionAPI) {
         isError: true,
       };
     }
+    // Same gate as bgtail: while the job is still running, a search returns the
+    // state, not the matches — the search result was the payoff that kept the
+    // poll loops going. `peek: true` is the explicit opt-in. Gated before the
+    // search, so the worker is not even spent on a read whose content would be
+    // withheld.
+    const running = runningNoteFor(id, ctx);
+    if (running !== "" && params.peek !== true) {
+      return {
+        content: [{ type: "text", text: running }],
+        details: {
+          id,
+          matches: 0,
+          logPath: resolved.logPath,
+          notFound: false,
+          running: true,
+        },
+      };
+    }
+    const statePrefix = running === "" ? "" : `${running}\n`;
     const { logPath, content, size } = resolved;
     // A capped log is missing its END, and "no matches" is exactly what a
     // failure pattern looks like when the failures were past the cap — so the
@@ -4145,7 +4332,7 @@ export default function (pi: ExtensionAPI) {
     if (matchIdx.length === 0) {
       return {
         content: [
-          { type: "text", text: `${header} — none${truncNote}${windowNote}${lineNote}` },
+          { type: "text", text: `${statePrefix}${header} — none${truncNote}${windowNote}${lineNote}` },
         ],
         details: {
           id,
@@ -4187,7 +4374,7 @@ export default function (pi: ExtensionAPI) {
       content: [
         {
           type: "text",
-          text: `${header}${capNote}\n${text}${notes}${truncNote}${windowNote}${lineNote}`,
+          text: `${statePrefix}${header}${capNote}\n${text}${notes}${truncNote}${windowNote}${lineNote}`,
         },
       ],
       details: {
@@ -4215,7 +4402,7 @@ export default function (pi: ExtensionAPI) {
     name: "bggrep",
     label: "Grep Background Log",
     description: toolDescription(
-      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. JavaScript regex syntax: a LEADING `(?i)`, `(?m)` or `(?s)` group is accepted and translated to the equivalent flags — `(?i)error` searches case-insensitively. A *scoped* group (`(?i:error)`) is understood natively, anywhere. A bare flag group anywhere else is rejected with an explanation, since JS has no unscoped inline flags. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; reading that path directly is the whole-log escape hatch. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
+      "Search the tail of a background job's log with a regex — the last 2 MiB by default, widen with `bytes` (each line is pre-truncated to 10k chars before matching); returns only matching lines with line numbers (optional context lines), capped (~50 matches, ~8KB) and condensed. JavaScript regex syntax: a LEADING `(?i)`, `(?m)` or `(?s)` group is accepted and translated to the equivalent flags — `(?i)error` searches case-insensitively. A *scoped* group (`(?i:error)`) is understood natively, anywhere. A bare flag group anywhere else is rejected with an explanation, since JS has no unscoped inline flags. Matching runs under a wall-clock budget (default 2s, PI_BGRUN_GREP_TIMEOUT_MS), so a runaway regex fails instead of hanging. Resolves the job id to the configured jobs dir itself, so there is no log path to reconstruct; reading that path directly is the whole-log escape hatch. While the job is still running this returns its state and nothing else — pass `peek: true` to search the live log anyway. Pass your own pattern whenever you know the log's format; with no pattern a generic failure-signature default is used (a convenience only — not a guarantee).",
       BGGREP_GUIDELINES,
     ),
     promptSnippet: "Search a bgrun job's log for a pattern",
@@ -4242,6 +4429,12 @@ export default function (pi: ExtensionAPI) {
           description:
             "Search window in bytes (default 2097152 = 2 MiB; capped at the configured log ceiling plus the wrapper's overhead — 67108864 = 64 MiB by default). Widening affects how much is SCANNED (and what the scan costs in CPU and memory) — the returned matches stay capped (~50 matches, ~8KB).",
           minimum: 1,
+        }),
+      ),
+      peek: Type.Optional(
+        Type.Boolean({
+          description:
+            "Search the log even while the job is running (default false: a running job returns its state only, since the wake carries the outcome).",
         }),
       ),
     }),
@@ -4289,6 +4482,10 @@ export default function (pi: ExtensionAPI) {
         if (rec.name) lines.push(`  name: ${rec.name}`);
         if (rec.type) lines.push(`  type: ${rec.type}`);
         lines.push(`  cmd: ${rec.cmd}`, `  log: ${rec.logPath}`);
+        // Asking for status of a running job is itself a poll: the state is
+        // already the answer, but the consequence has to be spelled out or the
+        // next call is a tail. No `peek` sentence — this result carries no log.
+        if (state === "running") lines.push(runningNote(rec.started, false));
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: {
@@ -4374,11 +4571,15 @@ export default function (pi: ExtensionAPI) {
         if (pid !== null && (pid <= 0 || !isRunningPid(pid))) exit = -1;
       }
       const state = exit === null ? "running" : "done";
+      // Same consequence as the in-memory branch above: a log-only job that is
+      // still alive is a poll's target, not a result.
+      const note =
+        state === "running" ? `\n${runningNote(jobStartedFor(undefined, id, logPath), false)}` : "";
       return {
         content: [
           {
             type: "text",
-            text: `${id}: ${state}${exit === null ? "" : ` exit=${exit}`} (recovered from log)\n  log: ${logPath}`,
+            text: `${id}: ${state}${exit === null ? "" : ` exit=${exit}`} (recovered from log)\n  log: ${logPath}${note}`,
           },
         ],
         details: {
@@ -4876,10 +5077,12 @@ export default function (pi: ExtensionAPI) {
       const n = Number(tokens[1]);
       // Stamped like the tool path: a native job's artifact is the host's file
       // and the reader must say so. Both callers apply annotateNative() — see
-      // bgtailCore's note.
+      // bgtailCore's note. peek: true because a human typing /bgtail on a
+      // running job is asking for the log, which is exactly the explicit opt-in
+      // the agent-facing gate wants to be.
       const res = annotateNative(
         await bgtailCore(
-          { id, lines: Number.isFinite(n) && n > 0 ? n : undefined },
+          { id, lines: Number.isFinite(n) && n > 0 ? n : undefined, peek: true },
           ctx,
         ),
         id,

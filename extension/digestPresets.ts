@@ -24,6 +24,15 @@ export interface DigestPreset {
  suggestedType: string;
 }
 
+// Bun's transpiler re-encodes non-ASCII inside String.raw templates as
+// `\uXXXX`; a raw string keeps that VERBATIM (backslash included), and awk drops
+// the backslash — so a literal "—" reaches awk as the five characters "u2014".
+// Interpolating these normal-string constants (which DO evaluate the escape)
+// keeps the raw template safe for regex backslashes while still handing awk real
+// UTF-8. Only the trace presets need non-ASCII.
+const TRACE_SEP = " — ";
+const TRACE_GLYPHS = "✗|✘|✖|×";
+
 export const DIGEST_PRESETS: DigestPreset[] = [
  {
   id: "go-test",
@@ -56,16 +65,74 @@ export const DIGEST_PRESETS: DigestPreset[] = [
  },
  {
   id: "junit-xml",
-  description: "JUnit XML: <failure>/<error> counts + failing testcase names",
+  description:
+   "JUnit XML: <failure>/<error> counts + failing testcase names, with file:line when the emitter carries one",
   suggestedType: "test",
   // Count failure/error elements (attributes like failures="0" don't match —
-  // they lack the `<`), then pull the enclosing testcase's name attribute.
-  // Real pytest --junitxml emits the whole document on ONE line, so the scan
-  // is record-based (`RS='<testcase'`, not line-based); it trims each record at
-  // `</testcase>` and matches `[[:space:]]name="` so it never picks up
-  // `classname="..."` nor a `<failure` from text after the element.
-  command:
-   'printf \'failures: %s  errors: %s\\n\' "$(grep -o \'<failure\' "$1" | wc -l | tr -d \' \')" "$(grep -o \'<error\' "$1" | wc -l | tr -d \' \')"; awk -v RS=\'<testcase\' \'NR>1 { r=$0; e=index(r,"</testcase>"); if (e) r=substr(r,1,e-1); if (match(r,/[[:space:]]name="[^"]*"/)) { n=substr(r,RSTART+7,RLENGTH-8); if (r ~ /<failure|<error/) print n } }\' "$1" | sort -u | head -10',
+  // they lack the `<`), then pull each failing testcase's name plus, when
+  // present, a `file`/`line` location. Real pytest --junitxml emits the whole
+  // document on ONE line, so the scan is record-based (`RS='<testcase'`, not
+  // line-based); it trims each record at `</testcase>` and matches
+  // `[[:space:]]name="` so it never picks up `classname="..."` nor a `<failure`
+  // from text after the element. `file`/`line` are searched over the whole
+  // record — emitters disagree on where they sit (pytest/PHPUnit put them on
+  // <testcase>, some put them on the failing element) and some carry neither
+  // (node:test emits `file` only; Go's gotestsum emits none), so the location
+  // is appended only when the emitted attribute exists and the name still
+  // prints alone otherwise.
+   command:
+    'printf \'failures: %s  errors: %s\\n\' "$(grep -o \'<failure\' "$1" | wc -l | tr -d \' \')" "$(grep -o \'<error\' "$1" | wc -l | tr -d \' \')"; awk -v RS=\'<testcase\' \'function attr(s,k, q,p){q="\\"";p="[[:space:]]"k"="q"[^"q"]*"q;return match(s,p)?substr(s,RSTART+length(k)+3,RLENGTH-length(k)-4):""} NR>1 { r=$0; e=index(r,"</testcase>"); if (e) r=substr(r,1,e-1); if (r ~ /<failure|<error/ && match(r,/[[:space:]]name="[^"]*"/)) { n=substr(r,RSTART+7,RLENGTH-8); f=attr(r,"file"); l=attr(r,"line"); print n (f!="" ? " (" f (l!="" ? ":" l : "") ")" : "") } }\' "$1" | sort -u | head -10',
+ },
+ {
+  id: "js-trace",
+  description:
+   "JS/TS, Go, Rust and JVM stack traces (innermost frame printed first): first failure signature + the deepest source frame, scanned forwards or backwards",
+  suggestedType: "test",
+  // One awk pass. (1) First signature line — V8/bun `(fail)`, node:test/ Jest
+  // `✗`/`✖`, go `--- FAIL`, cargo `FAILED`, `AssertionError`, JVM
+  // `Exception in thread`. A signature must be EVIDENCE of a failing test: the
+  // runner's `(fail)` / `--- FAIL` markers are line-leading records, so they are
+  // anchored (`^[[:space:]]*`) — a mid-line mention of "(fail)" in a test's
+  // printed name is not a failure. A line that is itself a pass record
+  // (`(pass) …`) is never a signature, whatever it contains: a passing test's
+  // name can carry "FAILED"/"AssertionError"/"(fail)" as text (a suite that
+  // prints captured failure logs does exactly this), and a wrong pointer costs
+  // more than none. With no genuine signature the preset prints nothing. (2) The
+  // first NON-runtime frame within a 60-line forward cap (runtime/internal
+  // frames — node:internal, /rustc/, Go's GOROOT
+  // src (…/go/src/ or …/libexec/src/), /library/std|core/ — are excluded by
+  // path, so the user frame wins
+  // over the stdlib one Go/Rust print first). (3) If none, the earliest frame of
+  // the contiguous run ABOVE the signature, because a V8 stack is printed
+  // above the `(fail)` line. The 60-line cap is where the old built-in
+  // FRAME_LOOKAHEAD lives on; the backward run is FRAME_LOOKBEHIND. Prints
+  // nothing when no signature is found.
+  command: String.raw`awk 'function trim(s){gsub(/^[ \t]+|[ \t]+$/,"",s);return s} function ex(l){return l ~ /node:internal|\/rustc\/|\/libexec\/src\/|\/go\/src\/|\/library\/(std|core)\/|\(node:/} function fr(l){ return !ex(l) && ( (l ~ /^[ \t]*at[ \t]+([^(]+[ \t]+\()?[^ \t()]+\.(ts|tsx|js|jsx|mjs|cjs|mts|cts|go|rs|java|kt|scala|swift|cs|c|h|cpp|php|lua):[0-9]+:[0-9]+\)?[ \t]*$/) || (l ~ /^[ \t]+[^ \t]+\.go:[0-9]+( \+0x[0-9a-f]+)?[ \t]*$/) || (l ~ /^[ \t]*at [^()]+\([^()]+\.(java|kt|scala):[0-9]+\)[ \t]*$/) ) } {L[NR]=$0} END{ for(i=1;i<=NR;i++) if((L[i] ~ /(^[[:space:]]*\(fail\)|${TRACE_GLYPHS}|^[[:space:]]*--- FAIL)|(^|[^[:alnum:]_])FAIL(ED|URE)?([^[:alnum:]_]|$)|AssertionError|Exception in thread/) && L[i] !~ /^[ \t]*\(pass\)/){f=i;break} if(!f)exit; for(j=f+1;j<=NR&&j<=f+60;j++) if(fr(L[j])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[j]);exit} s=f-1; while(s>=1&&fr(L[s]))s--; if(s+1<=f-1&&fr(L[s+1])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[s+1]);exit} print "Failure: "trim(L[f]) }' "$1" | head -1`,
+ },
+ {
+  id: "py-trace",
+  description:
+   "Python tracebacks (outermost frame printed first): first failure header + the LAST `File \"…\", line N, in fn` frame, which is the deepest — not the first",
+  suggestedType: "test",
+  // One awk pass. (1) First signature — unittest `FAIL:`/`ERROR:`, a bare
+  // `Traceback (most recent call last)`, pytest's `E AssertionError`, or a bare
+  // `AssertionError`. (2) Keep the LAST `File "…", line N, in fn` frame within
+  // the 60-line forward cap (Python prints outermost-first, so the deepest is
+  // the last of the run). (3) If the traceback sits ABOVE the header (pytest's
+  // E-line form), take the nearest `File` frame above it instead. Prints
+  // nothing when no signature is found.
+  command: String.raw`awk 'function trim(s){gsub(/^[ \t]+|[ \t]+$/,"",s);return s} function fr(l){return l ~ /^[ \t]*File "[^"]+", line [0-9]+, in /} {L[NR]=$0} END{ for(i=1;i<=NR;i++) if(L[i] ~ /(^|[^[:alnum:]_])(FAIL|ERROR)(ED|URE)?([^[:alnum:]_]|$)|Traceback \(most recent call last\)|AssertionError/){f=i;break} if(!f)exit; last=""; for(j=f+1;j<=NR&&j<=f+60;j++) if(fr(L[j]))last=trim(L[j]); if(last!=""){print "Failure: "trim(L[f])"${TRACE_SEP}"last;exit} b=""; for(k=f-1;k>=1&&k>=f-60;k--) if(fr(L[k])){b=trim(L[k]);break} if(b!=""){print "Failure: "trim(L[f])"${TRACE_SEP}"b;exit} print "Failure: "trim(L[f]) }' "$1" | head -1`,
+ },
+ {
+  id: "rb-trace",
+  description:
+   "Ruby / Minitest: the `N) Error:` / `N) Failure:` header + its first `path:line:in 'fn'` frame (Ruby prints the raise site first, so the first is the deepest)",
+  suggestedType: "test",
+  // One awk pass. (1) The numbered Minitest error/failure header. (2) The first
+  // `path.rb:line:in ` frame after it. Ruby's backtrace is ordered from the
+  // raise point outward, so the first frame IS the deepest. Prints nothing when
+  // no header is found.
+  command: String.raw`awk 'function trim(s){gsub(/^[ \t]+|[ \t]+$/,"",s);return s} function fr(l){return l ~ /^[ \t]*[^ \t]+\.rb:[0-9]+:in /} {L[NR]=$0} END{ for(i=1;i<=NR;i++) if(L[i] ~ /^[ \t]*[0-9]+\)[ \t]*(Error|Failure):/){f=i;break} if(!f)exit; for(j=f+1;j<=NR&&j<=f+60;j++) if(fr(L[j])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[j]);exit} print "Failure: "trim(L[f]) }' "$1" | head -1`,
  },
 ];
 
@@ -103,6 +170,14 @@ export interface DigestEntry {
  label?: string;
  preset?: string;
  command?: string;
+ /**
+  * When `"failure"`, the entry's output is appended ONLY for a job that exited
+  * non-zero. The framework owns this check — a digest command receives only the
+  * log path, never the exit code — so a green log that happens to contain an
+  * `Error:` line cannot inject a failure into the wake. Absent means "always"
+  * (the pre-existing behaviour).
+  */
+ on?: "failure";
 }
 
 /**
@@ -120,6 +195,8 @@ export interface DigestJobTarget {
 export interface SelectedDigest {
  command: string;
  label: string;
+ /** Carried from the entry so the wake path can gate on the exit code. */
+ on?: "failure";
 }
 
 /**
@@ -340,7 +417,12 @@ export function selectDigestEntry(
   // A type-matching entry always carries a non-empty type, so `entry.type` is
   // the label fallback — no need for the preset-id default here.
   if (hit?.entry.type) {
-   return { command: hit.command, label: hit.entry.label || hit.entry.type };
+   const out: SelectedDigest = {
+    command: hit.command,
+    label: hit.entry.label || hit.entry.type,
+   };
+   if (hit.entry.on) out.on = hit.entry.on;
+   return out;
   }
  }
 
@@ -350,10 +432,12 @@ export function selectDigestEntry(
   const entry = hit.entry;
   const matchLabel =
    entry.match?.name === undefined ? "" : labelFromMatchName(entry.match.name);
-  return {
+  const out: SelectedDigest = {
    command: hit.command,
    label: entry.label || matchLabel || defaultDigestLabel(entry),
   };
+  if (entry.on) out.on = entry.on;
+  return out;
  }
  return undefined;
 }

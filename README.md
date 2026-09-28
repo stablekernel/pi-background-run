@@ -80,8 +80,8 @@ The host also decides several details, all handled internally:
 | ------ | --------- |
 | `bgrun` | Launch a command detached in the background. Optional `name` gives the job a short human-readable label. Returns `started: <job-id>` immediately. Wakes the session automatically on completion. |
 | `bgstatus` | Show job status. With an id: any job's state + exit code — a `bg_N` id (the host's own background job on omp) is answered with its state, where its output went and how to cancel it, rather than "not found". Without: this session's running jobs (finished jobs hidden by default — pass `includeDone: true` or set `showCompletedJobs`), then the host's background jobs under their own heading. Other sessions' *running* jobs are listed only when `adoptForeignJobs` is enabled; finished foreign logs from the shared dir can also appear when finished jobs are included. |
-| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB + 4 KiB of wrapper overhead), **condensed for context**: ANSI escapes stripped, repeated lines collapsed (a run of 3+ folds into one line carrying its `[xN]` count; a pair is kept as two lines — a fold needs its count to stay legible), long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing) — polling a running job never re-pays for lines already seen. A repeat read asking for **more** lines than you have already been shown is a widening, not a poll: it returns the lines above your current coverage rather than the whole window again — coverage is a trailing run, so a line seen before an intervening gap can repeat. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). On omp, a native `bg_N` job's spilled output is read the same way, stamped as the host's file. |
-| `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB + 4 KiB of wrapper overhead; on omp, a native `bg_N` job's spilled output is searchable the same way): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. JavaScript regex syntax: a **leading** `(?i)`/`(?m)`/`(?s)` group is accepted and translated to the equivalent flags (`(?i)error` searches case-insensitively); a *scoped* group (`(?i:error)`) is native anywhere; a bare flag group anywhere else is rejected with an explanation — JS `RegExp` has no unscoped inline flags. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
+| `bgtail` | Read the newest lines of a job's log (default 40; it reads the log's **last 2 MB** — widen with `bytes`, max 64 MiB + 4 KiB of wrapper overhead), **condensed for context**: ANSI escapes stripped, repeated lines collapsed (a run of 3+ folds into one line carrying its `[xN]` count; a pair is kept as two lines — a fold needs its count to stay legible), long lines and total size capped. First read = full last-N tail; repeat reads return **only lines appended since your last read** (delta tailing), so a line already shown is never sent twice. While the job is still running it returns its state and nothing else — launching was the task, the wake is the next input; `peek: true` reads the live log anyway. A repeat read asking for **more** lines than you have already been shown is a widening, not a poll: it returns the lines above your current coverage rather than the whole window again — coverage is a trailing run, so a line seen before an intervening gap can repeat. Pass `raw: true` for the unprocessed last-N window (still advances the bookmark). On omp, a native `bg_N` job's spilled output is read the same way, stamped as the host's file. |
+| `bggrep` | Regex search over the **last 2 MB** of a job's log (`bytes` widens the window, max 64 MiB + 4 KiB of wrapper overhead; on omp, a native `bg_N` job's spilled output is searchable the same way): line-numbered matches, optional `context` lines, each line pre-truncated to 10 000 chars before matching, results capped (~50 matches, ~8KB) and condensed. JavaScript regex syntax: a **leading** `(?i)`/`(?m)`/`(?s)` group is accepted and translated to the equivalent flags (`(?i)error` searches case-insensitively); a *scoped* group (`(?i:error)`) is native anywhere; a bare flag group anywhere else is rejected with an explanation — JS `RegExp` has no unscoped inline flags. Resolves the job id to the configured jobs dir itself — no log path to reconstruct. While the job is still running it returns its state and nothing else; `peek: true` searches the live log anyway. `ctx_execute_file` can read the same file (it takes an absolute path; only your Read-deny rules apply), but it needs that path. Matching runs under a wall-clock budget ([Bounded matching](#bounded-matching)). With no `pattern`, a generic failure-signature default is used (override it — convenience, not guarantee). |
 | `bgclean` | Remove old job logs. **Default scope: this session's jobs only** — other sessions' logs are untouched — and it also drops stale per-project digest markers (`.bgrun-used-*`, `.digest-nudge-*`) in the session's jobs dir (markers are not session data). Pass `all: true` to sweep every shared jobs dir — under the project-local default that is the project's dir plus the machine-global one, while an explicit absolute `jobsDir` is swept alone — and do the same marker sweep across them. Retention: `cleanupDays` config (7 days); `days` must be a positive number (`days: 0` is rejected rather than purging everything). Never removes a running job's log. |
 | `bgkill` | Stop a running job. Optional `force: true` sends `SIGKILL` instead of `SIGTERM`. Signals the job's **whole process group** (the child is spawned detached, so the command and anything it started go together; where a platform cannot signal groups, it falls back to the single pid and says so). Refuses an id that already finished, one that is not a bgrun job (`bg_N` belongs to the host — `hub cancel`), another session's job unless `includeForeign: true`, and a pid that cannot be the job's — gone, unusable, or recycled onto an unrelated process. It reports the signal it sent, not a guess at the outcome: the authoritative result is the wake, or the stale-check for a foreign job. |
 
@@ -203,19 +203,25 @@ ever enter the conversation:
 
 - **Quick peek:** `bgtail <id>` — condensed newest lines (ANSI stripped, repeats
   collapsed only where the count can be shown, ~2KB/line and ~8KB caps). The first read is the last-40-lines tail; each later
-  read returns only what was appended since, so repeated polling is nearly
-  free. Asking for **more lines than you have been shown** widens the view
-  instead of polling: you get the lines above your coverage, so widening costs
+  read returns only what was appended since. A still-running job is answered with
+  its **state**, not the log — launching was the task and the wake is the next
+  input, so a poll has nothing to pay it off; `peek: true` reads a live log when
+  you really need it. Asking for **more lines than you have been shown** widens the view
+  instead of re-sending the tail: you get the lines above your coverage, so widening costs
   the difference rather than the whole window again (a line seen before an
   intervening gap can repeat). The wake message itself
-  already carries the exit code and the log's last line, so many turns need no
-  follow-up read at all.
+  already carries the exit code, the stats and the log's last line; a configured
+  trace digest (`js-trace` / `py-trace` / `rb-trace`, see the digest section) can
+  additionally name the failure and its source frame. Either way it is a summary,
+  never the full record: on a failed run the context around the failure lives
+  only in the log, so read a window around the failure before concluding a cause.
 - **Pattern search:** `bggrep <id> [pattern] [context]` — line-numbered matches,
   capped and condensed (~50 matches, ~2KB/line, ~8KB); takes the job id, so
   there is no log path to reconstruct. Searches the **last 2 MB** by default —
   pass `bytes` to widen (max 64 MiB), or use `ctx_execute_file` on the path for
   whole-file code-based analysis. Pass your own pattern when you know the log's
-  format. A **wider window costs latency and memory, not context**: the returned
+  format. A still-running job returns its state, not matches (`peek: true` opts
+  in). A **wider window costs latency and memory, not context**: the returned
   matches stay capped either way.
 - **Whole-log analysis:** `ctx_execute_file` on the job's log path (reachable
   when logs are project-local) to extract only failure lines. Never `cat` or
@@ -444,6 +450,14 @@ command's own log line count (the internal exit marker is excluded). A project
 can additionally opt into a **digest scorecard**: a one-line pass/fail summary
 extracted from the log and appended to the wake.
 
+A scorecard that reports **counts only** — pass/fail totals, failing test names —
+will not point at a failure: it says a job went red, not where or why. The three
+**trace** presets (`js-trace`, `py-trace`, `rb-trace`) exist for that; they name
+the failure and its source frame. The tool deliberately does **not** try to
+detect that a scorecard "produced no failure signal" — that judgement would need
+per-ecosystem knowledge of what a failure looks like, so it is left to you: a
+count-only scorecard is a red/green indicator, and the cause is in the log.
+
 #### Job identity: name, type, command
 
 Every `bgrun` job carries three identifiers, and the digest selector reads all
@@ -473,8 +487,9 @@ Three ways, easiest first — pick the first one you're comfortable with:
    result on both a green and a red log, and writes the config. It sees your
    actual output format, which is exactly what a good digest depends on —
    and you never have to read a log yourself. The one-shot toast some
-   projects see on session start ("no digest configured") — once per project
-   that has run a bgrun job — is pointing at this same skill.
+   projects see ("no digest configured") — once per project that has run a
+   bgrun job, toasted either at session start or at its first failing job —
+   is pointing at this same skill.
 2. **One-line preset if you know your stack.** Create
    `<project>/$CONFIG_DIR/pi-bgrun.json` (or merge into an existing one):
 
@@ -487,12 +502,28 @@ Three ways, easiest first — pick the first one you're comfortable with:
    | `go-test` | Go test output: package ok/FAIL counts + failing test names | `test` |
    | `jest` | Jest output: Tests/Test Suites summary + failed test names | `test` |
    | `pytest` | pytest output: final passed/failed/error summary line + FAILED test ids | `test` |
-   | `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names | `test` |
+   | `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names, with `file:line` when the emitter carries one | `test` |
+   | `js-trace` | JS/TS, Go, Rust, JVM stack traces (innermost frame first): first failure signature + the deepest source frame, forwards or backwards | `test` |
+   | `py-trace` | Python tracebacks (outermost frame first): first failure header + the deepest `File "…", line N` frame (the LAST one, not the first) | `test` |
+   | `rb-trace` | Ruby / Minitest: the `N) Error:`/`N) Failure:` header + its first `path:line:in 'fn'` frame (the raise site) | `test` |
 
    All shipped presets are test runners, so they all suggest the conventional
    type `test`. The suggestion is documentation, not behavior: you still write
    the `type` on the entry yourself, and a preset entry with no `type` applies
    to every job as before.
+
+   The three `*-trace` presets name a failure and its source frame; the built-in
+   wake no longer guesses one, so this is how a wake gets a pointer at all. Use
+   them with `on` (below) so a green log that happens to contain an `Error:` line
+   cannot inject a failure:
+
+   ```json
+   { "digest": { "type": "test", "preset": "js-trace", "on": "failure" } }
+   ```
+
+   They recognise exactly the shapes in their descriptions and print nothing for
+   any other runner — that runner's failure is still in the log, just not pointed
+   at by the wake.
 
 3. **Custom command.** For formats the presets don't cover:
 
@@ -523,6 +554,22 @@ Three ways, easiest first — pick the first one you're comfortable with:
    skill does this validation for you; if you'd rather hand-tune a command
    yourself, you can also ask your agent to validate a specific command
    against specific job logs.
+
+#### Failure-only scorecards (`on`)
+
+An entry may carry `"on": "failure"`, which appends its output **only when the
+job exited non-zero**:
+
+```json
+{ "digest": { "type": "test", "preset": "js-trace", "on": "failure" } }
+```
+
+The **framework** enforces this, not the command: a digest command receives only
+the log path, never the exit code, so a green job's wake must never show a
+failure a command guessed from the text. That matters for the `*-trace` presets
+— a green log can legitimately contain an `Error:` line. `on` defaults to absent
+("always append"), so existing configs are unchanged; any value other than
+`"failure"` is a config error and drops the entry, like a bad `match` or `type`.
 
 #### Multiple scorecards (one per job type)
 
@@ -623,7 +670,7 @@ Command: go test ./...
 Stats: 42.3s, 1204 lines
 Last output: FAIL example.com/api/handlers
 digest (go-test): 7 ok / 1 FAIL: TestResolveNotFound
-Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it — then continue the task that depended on this.
+Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it. This wake is a summary, not the diagnosis — the log holds the context around the failure, and any failure named here (by a trace digest) is one failure, not the whole story. Then continue the task that depended on this.
 ```
 
 Shell safety: the command comes from trust-gated config and runs with your
