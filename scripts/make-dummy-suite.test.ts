@@ -14,9 +14,41 @@
  *
  * node:test rather than bun:test, matching extension/index.test.ts: these run
  * under both runners with @types/node alone.
+ *
+ * BACKWARD-EQUIVALENCE CONTRACT (mirrors the header of make-dummy-suite.ts)
+ * ------------------------------------------------------------------------
+ * The bytes the generator emits are a frozen contract for every recorded fixture.
+ *   1. Any change MUST leave each recorded fixture's bytes unchanged for its
+ *      recorded knobs. A silent byte change invalidates a cell's recorded fixture
+ *      hash and everything measured against it — the afb2bd1 blank-line drift did
+ *      exactly this and went unnoticed.
+ *   2. Adding a fixture means adding a row to RECORDED_FIXTURES below, with its
+ *      exact knobs, its recorded absolute path and its expected hash.
+ *   3. This test is what enforces the contract. An INTENTIONAL byte change
+ *      requires regenerating the affected fixture at its recorded path and
+ *      updating its record — never silencing or loosening the test.
+ *
+ * The recorded hash is the fixture's files sorted by path, their contents
+ * concatenated, sha1, first 16 hex — computed at the fixture's RECORDED ABSOLUTE
+ * PATH. The generated files embed their own out-dir path in the failure's stack
+ * trace, so the hash means nothing without that path: the same knobs regenerated
+ * at a scratch path hash differently. The table test therefore normalises the
+ * scratch out-dir path back to the recorded one before hashing.
+ *
+ * A fixture hash pins ONE cell's workload, never the set: the recorded fixtures
+ * were generated at different generator revisions (red-tail and equiv predate
+ * afb2bd1; long-buried and trace-root were generated at it). The table below is
+ * what keeps each one's bytes honest.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -138,4 +170,119 @@ test("cause module: a value other than 0 or 1 is rejected, not ignored", () => {
   const { status, stderr } = generate("cause-bad", { DUMMY_CAUSE_MODULE: "2" });
   assert.equal(status, 2);
   assert.match(stderr, /DUMMY_CAUSE_MODULE must be 0 or 1/);
+});
+
+// ── Backward-equivalence contract: the recorded fixtures ────────────────────
+// Each row is a fixture whose bytes are frozen (see the contract at the top of
+// this file and the generator's header). `sha` is the value the generator MUST
+// reproduce for `knobs`, hashed at `path`. `recordNote` is where a cell's record
+// quotes a different value — either because the record is stale, or because the
+// fixture was generated before the afb2bd1 blank-line drift and the record still
+// carries the drifted bytes.
+interface FixtureRecord {
+  name: string;
+  knobs: Record<string, string>;
+  /** The absolute path the fixture was generated at; the hash depends on it. */
+  path: string;
+  /** Files sorted by path, contents concatenated, sha1, first 16 hex. */
+  sha: string;
+  recordNote?: string;
+}
+
+const RECORDED_FIXTURES: FixtureRecord[] = [
+  {
+    // Cell 1 (docs/benchmark/runs/red-tail-short/RUNSHEET.md) quotes this same
+    // value. It is the fixture the afb2bd1 drift broke: before the fix the same
+    // knobs produced dedf28f736923ad8 (one blank line too many after the imports).
+    name: "red-tail",
+    path: "/private/tmp/red-tail-fixture",
+    knobs: {
+      DUMMY_FILES: "2",
+      DUMMY_TESTS_PER_FILE: "4",
+      DUMMY_SLEEP_MS: "1",
+      DUMMY_FAIL_FILE: "2",
+      DUMMY_FAIL_STEP: "4",
+      DUMMY_LINES_PER_TEST: "2",
+      DUMMY_ANNOUNCE_FAILURE: "0",
+      DUMMY_CAUSE_MODULE: "0",
+    },
+    sha: "0bfe00ed1d9866b9",
+  },
+  {
+    // Cell 3 (docs/benchmark/runs/trace-root/RUNSHEET.md) quotes this same value.
+    // It is the cause-module shape; the fix must leave it byte-identical.
+    name: "trace-root",
+    path: "/private/tmp/trace-root-fixture",
+    knobs: {
+      DUMMY_FILES: "2",
+      DUMMY_TESTS_PER_FILE: "4",
+      DUMMY_SLEEP_MS: "1",
+      DUMMY_FAIL_FILE: "2",
+      DUMMY_FAIL_STEP: "4",
+      DUMMY_LINES_PER_TEST: "2",
+      DUMMY_ANNOUNCE_FAILURE: "0",
+      DUMMY_CAUSE_MODULE: "1",
+    },
+    sha: "605aba38baf5c6ad",
+  },
+  {
+    // This fixture is causeModule 0 and was generated at the DRIFTED generator, so
+    // its hash necessarily moves once red-tail's inline shape is restored — no
+    // single generator emits one blank line for red-tail and two for long-buried.
+    // The cells measured against it stand: a one-line shift touches no reported
+    // number. The row pins the bytes the fixed generator now produces.
+    name: "long-buried",
+    path: "/private/tmp/long-buried-fixture",
+    knobs: {
+      DUMMY_FILES: "10",
+      DUMMY_TESTS_PER_FILE: "30",
+      DUMMY_SLEEP_MS: "600",
+      DUMMY_FAIL_FILE: "5",
+      DUMMY_FAIL_STEP: "15",
+      DUMMY_LINES_PER_TEST: "2",
+      DUMMY_ANNOUNCE_FAILURE: "0",
+      DUMMY_CAUSE_MODULE: "0",
+      DUMMY_FAIL_FAST: "0",
+    },
+    sha: "a80876eac7089297",
+    recordNote:
+      "the fixture on disk at the time of these runs was generated at a generator revision that emitted an extra blank line, so the fixed generator yields a80876eac7089297 and this run's frame is quoted at part-05.test.ts:59 where a fresh fixture yields :58; no reported number depends on the difference",
+  },
+];
+
+/**
+ * The documented hash, computed the way the records state it: files sorted by
+ * path, contents concatenated, sha1, first 16 hex. The scratch out-dir path is
+ * normalised back to the recorded path first, because the generated files embed
+ * their own out-dir path in the failure's stack trace.
+ */
+function hashFixture(outDir: string, recordedPath: string): string {
+  const files = readdirSync(outDir)
+    .map((name) => join(outDir, name))
+    .sort();
+  const hash = createHash("sha1");
+  for (const file of files) {
+    hash.update(readFileSync(file, "utf8").split(outDir).join(recordedPath));
+  }
+  return hash.digest("hex").slice(0, 16);
+}
+
+test("recorded fixtures: each regenerates to the bytes the contract freezes", () => {
+  for (const fixture of RECORDED_FIXTURES) {
+    const outDir = join(root, `recorded-${fixture.name}`);
+    const result = spawnSync("bun", ["run", script], {
+      encoding: "utf8",
+      env: { ...process.env, DUMMY_OUT_DIR: outDir, ...fixture.knobs },
+    });
+    assert.equal(result.status, 0, `${fixture.name}: ${result.stderr}`);
+
+    // Regenerating into a temp dir and normalising the embedded path must recover
+    // the record's hash; if the generator's bytes moved, this is where it shows.
+    assert.equal(
+      hashFixture(outDir, fixture.path),
+      fixture.sha,
+      `${fixture.name}: regenerated bytes no longer match the frozen hash` +
+        (fixture.recordNote ? ` (${fixture.recordNote})` : ""),
+    );
+  }
 });
