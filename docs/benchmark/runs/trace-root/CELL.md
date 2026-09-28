@@ -39,19 +39,20 @@ session names it outright: *"Assertion error in `harness.ts:28`"*. The bgrun arm
 a **pattern search** over the log after the wake, does not contain it: the sessions searched for
 failure words (`(?i)(fail|✗|×|error|expect)`), which matches the assertion and the runner's `(fail)`
 line but **not** the frame lines themselves — `at loadStep (.../harness.ts:28:9)` contains no failure
-word. So the frame was filtered out by the search, and the wake's digest pointed at nothing better: in
-this project it is configured as counts only (`grep -E '[0-9]+ (pass|fail)$' | tail -5` — see
-[../../method.md](../../method.md)), so it names no test and no file. The extension ships presets that
-*do* name failures (`go-test`, `jest`, `pytest`, `junit-xml`), so what starved this session was the
-configuration, not a missing capability — which is itself testable, by re-running this cell with a
-naming digest. The bgrun answers cite `part-02.test.ts` with line numbers that actually belong to the
+word. So the frame was filtered out by the search — and the reason there was a search at all is the
+wake's framing: it closed with *"the exit code, stats and last output above **are the result**"*, so
+the session had no reason to open the window around the failure and reached for the failure words it
+could see. No digest was configured for this project — unlike the pilot cell, which ran in the product
+repo where one is — so the wake carried no digest block at all; what starved this session was the
+summary framing, not a missing capability — and that is exactly what Cell 3a tests, by changing the
+framing alone. The bgrun answers cite `part-02.test.ts` with line numbers that actually belong to the
 harness file (28 is the assertion inside `harness.ts`, 41 the call site): numbers without their file
 attribution. How those numbers reached a context with no `harness.ts` in it is not established from
 these transcripts and is left as an open question rather than a story.
 
 That is the mechanism this cell was built to expose — *"every layer that summarises between the
 session and the log is a way to lose that frame"* — except the layer that lost it here is the
-session's own grep, chosen because the digest gave it nothing better than counts to search with.
+session's own grep, chosen because the wake presented a summary as the result.
 
 ## What this says about cost and about `H9`
 
@@ -61,9 +62,9 @@ session's own grep, chosen because the digest gave it nothing better than counts
 - **And it bought that with the diagnosis.** Both arms reach the symptom; only vanilla reaches the
   file the cause lives in. On this cell the tool's saving and its blind spot are the same
   mechanism.
-- **`H9 <digest-starves>` gets its first behavioural entry in the narrow form:** the digest is
-  counts-only, so it cannot point at the frame, and the session's follow-up search — reasonable,
-  and sufficient on `red-tail-short` — was not sufficient here.
+- **`H9 <digest-starves>` gains nothing from this cell:** no digest was configured for this project,
+  so the wake carried no digest block and the cell cannot speak to it. H9's one behavioural entry
+  remains the pilot cell's, which did run with a digest configured (counts only).
 
 ## `H11` is *not* tested by this cell, and the metric needs reading in pairs
 
