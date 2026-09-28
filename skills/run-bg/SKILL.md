@@ -100,7 +100,8 @@ Which to use:
    the task: end your turn there — there is nothing to wait for, and the wake
    arrives as a new turn carrying the outcome.
 2. **On wake:** the wake *is* the result — exit code, duration, log line count, the
-   log's last line, and the digest scorecard when the project configures one.
+   log's last line, and the digest scorecard when the project configures one. On a
+   failed run it also names the failure line and its first source frame.
    - `exit: 0` → success. Report it. Do not open the log to confirm: the wake's own
      counters are the confirmation, and a read spends context you do not need to spend.
    - `exit: <non-zero>` → failure. Analyze the log (see below).
