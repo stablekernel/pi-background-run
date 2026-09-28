@@ -18,6 +18,14 @@ Cells: [`red-tail-short`](#red-tail-short--failure-near-the-end-of-a-short-run) 
 [`trace-root-framewake`](#trace-root-framewake--the-same-cell-one-closing-line-changed) ·
 [pointer variants](#the-three-way-pointer-result)
 
+**Run generation.** Every cell below was measured *after* the poll fix (`5e43fba` — a running
+job reports its state, not its log) **except `red-tail-short`, which is kept as that fix's
+*before* measurement.** Its post-fix counterpart is `red-tail-short-fixed`, and the gap
+between them — calls 11 → 2, context 31,170 → 9,892 — is itself the finding: the polling was
+licensed by a fabricated wake, not by impatience. Read the pair, not the cell alone. You can
+tell the generations apart by call count: a polling session makes 9–12 calls, a post-fix one
+2–4.
+
 ## `red-tail-short` — failure near the end of a short run
 
 **What it tested.** The repo's own suite plus a fixture that fails near the end of the
