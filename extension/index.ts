@@ -1526,6 +1526,17 @@ export function digestNudgeMarkerPath(
 export const DIGEST_NUDGE_TEXT =
   "pi-bgrun: no digest configured for this project — use the digest-config skill to set one up.";
 
+/**
+ * The failure-time variant of DIGEST_NUDGE_TEXT, toasted at the first non-zero
+ * exit in a trusted project with no digest configured (see
+ * maybeNudgeDigest). Moment-aware: a failure just happened, so it says what a
+ * digest would have changed. Same one-shot marker as the session-start nudge,
+ * so a project is nudged at most once either way. Exported so tests assert the
+ * real string.
+ */
+export const DIGEST_FAILURE_NUDGE_TEXT =
+  "pi-bgrun: a job just failed and this project has no digest — a digest would surface the failure in the wake instead of leaving it in the log. Use the digest-config skill to set one up.";
+
 // Job and config `type` values are short routing tokens. Both sides cap at the
 // same length; if only the job side truncated, a >MAX_TYPE_LEN config type
 // would silently never match the job's truncated type.
@@ -3262,6 +3273,15 @@ export default function (pi: ExtensionAPI) {
             );
           }
 
+          // Failure-time digest nudge: a failure is the moment a digest's value
+          // becomes legible, so offer the failure-worded nudge here for a
+          // trusted, digest-less project. Shares the per-project one-shot marker
+          // with the session_start nudge, so a project nudged either way stays
+          // silent. Toast only — never enters LLM context.
+          if (exitCode !== 0) {
+            maybeNudgeDigest(rec.ctx, DIGEST_FAILURE_NUDGE_TEXT);
+          }
+
           // Update/clear the widget.
           updateWidget(rec.ctx);
         });
@@ -3437,13 +3457,20 @@ export default function (pi: ExtensionAPI) {
   let digestNoMatchSuppressed = false;
   const DIGEST_NO_MATCH_WARN_CAP = 3;
 
-  // ── Digest nudge: one-shot session_start toast for digest-less projects ────
+  // ── Digest nudge: one-shot toast for digest-less projects ─────────────────
   // When a trusted project has actually used bgrun (≥1 finished job log in the
   // jobs dir) but never configured a digest, point the human at the
-  // digest-config skill once. Toast only — never sendUserMessage, so it costs
-  // zero LLM context. Dismissal is a per-project marker file in the jobs dir;
-  // the user's config files are never written.
-  function maybeNudgeDigest(ctx: ExtensionContext): void {
+  // digest-config skill once. Called from session_start (default text) and from
+  // the first non-zero exit of a job (DIGEST_FAILURE_NUDGE_TEXT) — the failure
+  // moment is when the value of a digest is legible, and the failure wording
+  // says so. Both share the same per-project marker, so a project is nudged at
+  // most once either way. Toast only — never sendUserMessage, so it costs zero
+  // LLM context. Dismissal is a per-project marker file in the jobs dir; the
+  // user's config files are never written.
+  function maybeNudgeDigest(
+    ctx: ExtensionContext,
+    text: string = DIGEST_NUDGE_TEXT,
+  ): void {
     try {
       if (!ctx.isProjectTrusted?.()) return;
       const cfg = resolveConfig(ctx);
@@ -3455,11 +3482,11 @@ export default function (pi: ExtensionAPI) {
       if (!existsSync(jobUsageMarkerPath(cfg.jobsDir, projectDir))) return;
       const markerPath = digestNudgeMarkerPath(cfg.jobsDir, projectDir);
       if (existsSync(markerPath)) return; // already nudged once — stay silent
-      ctx.ui.notify(DIGEST_NUDGE_TEXT, "info");
+      ctx.ui.notify(text, "info");
       try {
         writeFileSync(markerPath, String(Date.now()));
       } catch {
-        // best-effort — a marker write failure must never break session_start
+        // best-effort — a marker write failure must never break the caller
       }
     } catch (err) {
       logWarn(`[pi-bgrun] digest nudge failed: ${(err as Error).message}`);

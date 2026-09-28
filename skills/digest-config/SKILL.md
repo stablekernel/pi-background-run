@@ -91,6 +91,15 @@ carries a `suggestedType` (all `test`) — use it as the `type` when scaffolding
 an entry, e.g. `{ "type": "test", "preset": "go-test" }`. The suggestion is
 advisory; a preset entry with no `type` still applies to every job.
 
+A scorecard that reports **counts only** (pass/fail totals, failing test names)
+will not point at a failure — it says a job went red, not where or why. That is
+what the three **trace** presets (`js-trace`, `py-trace`, `rb-trace`) are for:
+they name the failure and its source frame. The tool does not try to detect a
+"count-only" scorecard as a missing failure signal; that judgement needs
+per-ecosystem knowledge and is left to you. When a project's logs carry stack
+traces/tracebacks, prefer a matching trace preset (paired with `on: "failure"`)
+over a count-only one.
+
 ## Procedure
 
 1. **Find done-job logs.** Locate the project's jobsDir from the config

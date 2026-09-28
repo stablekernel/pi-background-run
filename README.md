@@ -450,6 +450,14 @@ command's own log line count (the internal exit marker is excluded). A project
 can additionally opt into a **digest scorecard**: a one-line pass/fail summary
 extracted from the log and appended to the wake.
 
+A scorecard that reports **counts only** — pass/fail totals, failing test names —
+will not point at a failure: it says a job went red, not where or why. The three
+**trace** presets (`js-trace`, `py-trace`, `rb-trace`) exist for that; they name
+the failure and its source frame. The tool deliberately does **not** try to
+detect that a scorecard "produced no failure signal" — that judgement would need
+per-ecosystem knowledge of what a failure looks like, so it is left to you: a
+count-only scorecard is a red/green indicator, and the cause is in the log.
+
 #### Job identity: name, type, command
 
 Every `bgrun` job carries three identifiers, and the digest selector reads all
@@ -479,8 +487,9 @@ Three ways, easiest first — pick the first one you're comfortable with:
    result on both a green and a red log, and writes the config. It sees your
    actual output format, which is exactly what a good digest depends on —
    and you never have to read a log yourself. The one-shot toast some
-   projects see on session start ("no digest configured") — once per project
-   that has run a bgrun job — is pointing at this same skill.
+   projects see ("no digest configured") — once per project that has run a
+   bgrun job, toasted either at session start or at its first failing job —
+   is pointing at this same skill.
 2. **One-line preset if you know your stack.** Create
    `<project>/$CONFIG_DIR/pi-bgrun.json` (or merge into an existing one):
 
