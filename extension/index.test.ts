@@ -38,6 +38,7 @@ import {
   selectDigestEntry,
 } from "./digestPresets.ts";
 import {
+  DIGEST_FAILURE_NUDGE_TEXT,
   DIGEST_NUDGE_TEXT,
   digestNudgeMarkerPath,
   jobUsageMarkerPath,
@@ -6530,6 +6531,125 @@ test("digest nudge: a bgrun in a nested cwd writes the usage marker at the proje
     await loadExtension(pi);
     await fireSessionStart();
     assert.deepEqual(messages, [DIGEST_NUDGE_TEXT]);
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: a failing job in a trusted, digest-less project fires the failure nudge once and writes the marker", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-nudge-fail",
+      { command: "exit 3" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+
+    // Filter to the nudge: the human toast (`… → exit 3`) is also a notify.
+    const nudges = messages.filter((m) => m === DIGEST_FAILURE_NUDGE_TEXT);
+    assert.equal(nudges.length, 1, "failure nudge toasted once");
+    assert.ok(existsSync(nudgeMarker(dir, proj)), "marker file created");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: a passing job does not fire the failure nudge (marker untouched)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-nudge-ok",
+      { command: "echo green" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+
+    assert.ok(
+      !messages.includes(DIGEST_FAILURE_NUDGE_TEXT),
+      "no failure nudge on a green job",
+    );
+    assert.ok(!existsSync(nudgeMarker(dir, proj)), "no marker written");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: a second failing job does not repeat the failure nudge", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-nudge-fail-1",
+      { command: "exit 1" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    await bgrun.execute(
+      "call-nudge-fail-2",
+      { command: "exit 2" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 2);
+
+    const nudges = messages.filter((m) => m === DIGEST_FAILURE_NUDGE_TEXT);
+    assert.equal(nudges.length, 1, "one-shot marker suppresses the repeat");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("digest nudge: a configured project does not fire the failure nudge (marker untouched)", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "go-test" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    const messages = captureNotify(ctx);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-nudge-configured",
+      { command: "exit 4" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+
+    assert.ok(
+      !messages.includes(DIGEST_FAILURE_NUDGE_TEXT),
+      "no failure nudge when a digest is configured",
+    );
+    assert.ok(!existsSync(nudgeMarker(dir, proj)), "no marker written");
   } finally {
     teardownDigestEnv(dir, proj, home);
   }
