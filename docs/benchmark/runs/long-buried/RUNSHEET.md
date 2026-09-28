@@ -62,6 +62,15 @@ and blocked time; context may go either way. Falsified by a positional strategy 
 the buried failure without a search, or by bgrun paying more context for the same
 information.
 
+## Premise note (2026-09-28, before these runs)
+
+This cell was designed around a failure no positional window reaches. As of the wake change, the
+bgrun arm is **handed** the first failure and its deepest frame in the wake, while the vanilla arm
+still has to find it somewhere in ~994 lines. So the cell now measures *who hands you the failure*
+rather than *whether a buried failure can be found*, and its pre-fix bgrun baseline is unmeasured —
+these runs are on the fixed extension, as Cell 3's were. If the bgrun arm's advantage here looks
+larger than `H7` predicted, the credit belongs to the pointer, not to the job mechanics.
+
 ## While the cell runs
 
 - Nothing else heavy on the machine; I stay off it. **This cell is the one where that
