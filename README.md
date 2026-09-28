@@ -210,9 +210,11 @@ ever enter the conversation:
   instead of re-sending the tail: you get the lines above your coverage, so widening costs
   the difference rather than the whole window again (a line seen before an
   intervening gap can repeat). The wake message itself
-  already carries the exit code, the stats and the log's last line, and — on a
-  failed run — the failure line with its first source frame, so many turns need no
-  follow-up read at all.
+  already carries the exit code, the stats and the log's last line; a configured
+  trace digest (`js-trace` / `py-trace` / `rb-trace`, see the digest section) can
+  additionally name the failure and its source frame. Either way it is a summary,
+  never the full record: on a failed run the context around the failure lives
+  only in the log, so read a window around the failure before concluding a cause.
 - **Pattern search:** `bggrep <id> [pattern] [context]` — line-numbered matches,
   capped and condensed (~50 matches, ~2KB/line, ~8KB); takes the job id, so
   there is no log path to reconstruct. Searches the **last 2 MB** by default —
@@ -491,12 +493,28 @@ Three ways, easiest first — pick the first one you're comfortable with:
    | `go-test` | Go test output: package ok/FAIL counts + failing test names | `test` |
    | `jest` | Jest output: Tests/Test Suites summary + failed test names | `test` |
    | `pytest` | pytest output: final passed/failed/error summary line + FAILED test ids | `test` |
-   | `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names | `test` |
+   | `junit-xml` | JUnit XML: `<failure>`/`<error>` counts + failing testcase names, with `file:line` when the emitter carries one | `test` |
+   | `js-trace` | JS/TS, Go, Rust, JVM stack traces (innermost frame first): first failure signature + the deepest source frame, forwards or backwards | `test` |
+   | `py-trace` | Python tracebacks (outermost frame first): first failure header + the deepest `File "…", line N` frame (the LAST one, not the first) | `test` |
+   | `rb-trace` | Ruby / Minitest: the `N) Error:`/`N) Failure:` header + its first `path:line:in 'fn'` frame (the raise site) | `test` |
 
    All shipped presets are test runners, so they all suggest the conventional
    type `test`. The suggestion is documentation, not behavior: you still write
    the `type` on the entry yourself, and a preset entry with no `type` applies
    to every job as before.
+
+   The three `*-trace` presets name a failure and its source frame; the built-in
+   wake no longer guesses one, so this is how a wake gets a pointer at all. Use
+   them with `on` (below) so a green log that happens to contain an `Error:` line
+   cannot inject a failure:
+
+   ```json
+   { "digest": { "type": "test", "preset": "js-trace", "on": "failure" } }
+   ```
+
+   They recognise exactly the shapes in their descriptions and print nothing for
+   any other runner — that runner's failure is still in the log, just not pointed
+   at by the wake.
 
 3. **Custom command.** For formats the presets don't cover:
 
@@ -527,6 +545,22 @@ Three ways, easiest first — pick the first one you're comfortable with:
    skill does this validation for you; if you'd rather hand-tune a command
    yourself, you can also ask your agent to validate a specific command
    against specific job logs.
+
+#### Failure-only scorecards (`on`)
+
+An entry may carry `"on": "failure"`, which appends its output **only when the
+job exited non-zero**:
+
+```json
+{ "digest": { "type": "test", "preset": "js-trace", "on": "failure" } }
+```
+
+The **framework** enforces this, not the command: a digest command receives only
+the log path, never the exit code, so a green job's wake must never show a
+failure a command guessed from the text. That matters for the `*-trace` presets
+— a green log can legitimately contain an `Error:` line. `on` defaults to absent
+("always append"), so existing configs are unchanged; any value other than
+`"failure"` is a config error and drops the entry, like a bad `match` or `type`.
 
 #### Multiple scorecards (one per job type)
 
@@ -627,7 +661,7 @@ Command: go test ./...
 Stats: 42.3s, 1204 lines
 Last output: FAIL example.com/api/handlers
 digest (go-test): 7 ok / 1 FAIL: TestResolveNotFound
-Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it — then continue the task that depended on this.
+Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it. This wake is a summary, not the diagnosis — the log holds the context around the failure, and any failure named here (by a trace digest) is one failure, not the whole story. Then continue the task that depended on this.
 ```
 
 Shell safety: the command comes from trust-gated config and runs with your

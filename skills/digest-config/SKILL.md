@@ -1,6 +1,6 @@
 ---
 name: digest-config
-description: Set up the pi-bgrun digest scorecard for this project. Use when the user asks to configure a digest, enable digest heuristics, or when a pi-bgrun nudge points at this skill. Samples the project's real job logs, picks a shipped preset (go-test, jest, pytest, junit-xml) or drafts a custom digest command, validates it against green AND red logs, then writes the digest section into the project's pi-bgrun.json.
+description: Set up the pi-bgrun digest scorecard for this project. Use when the user asks to configure a digest, enable digest heuristics, or when a pi-bgrun nudge points at this skill. Samples the project's real job logs, picks a shipped preset (go-test, jest, pytest, junit-xml, js-trace, py-trace, rb-trace) or drafts a custom digest command, validates it against green AND red logs, then writes the digest section into the project's pi-bgrun.json.
 ---
 
 # Configure a project digest scorecard
@@ -66,6 +66,11 @@ Selection (exactly one entry, or none):
   get a scorecard.
 - `label` sets the wake tag; without it a type entry uses its `type` string, a
   glob entry uses the matched `match.name`, else the preset id (or `command`).
+- `"on": "failure"` appends the entry's output **only when the job exited
+  non-zero**. The framework enforces this (a digest command never sees the exit
+  code), so a green log containing an `Error:` line cannot inject a failure.
+  Use it for the `*-trace` presets. Absent means "always"; any other value is a
+  config error and drops the entry.
 - An invalid `match` (non-string), an invalid `type`, or an entry with no valid
   `preset`/`command` is dropped silently; an empty/all-invalid list counts as
   unconfigured.
@@ -73,7 +78,15 @@ Selection (exactly one entry, or none):
 Shipped presets: `go-test` (package ok/FAIL counts + failing test names),
 `jest` (Tests/Test Suites summary + failed test names), `pytest` (final
 passed/failed/error summary line + FAILED test ids), `junit-xml`
-(`<failure>`/`<error>` counts + failing testcase names). Each preset also
+(`<failure>`/`<error>` counts + failing testcase names, with `file:line` when
+the emitter carries one), and three **trace** presets that name a failure and
+its source frame (there is no built-in wake pointer — these are it, and they
+print nothing when their shape is not recognised):
+`js-trace` (JS/TS, Go, Rust, JVM — innermost frame printed first: the deepest
+frame, forwards or backwards), `py-trace` (Python — outermost printed first: the
+**last** `File "…", line N` frame, which is the deepest), `rb-trace` (Ruby /
+Minitest — `N) Error:` header + the first `path:line:in 'fn'` frame, the raise
+site). Pair each with `"on": "failure"`. Each preset also
 carries a `suggestedType` (all `test`) — use it as the `type` when scaffolding
 an entry, e.g. `{ "type": "test", "preset": "go-test" }`. The suggestion is
 advisory; a preset entry with no `type` still applies to every job.
