@@ -210,7 +210,8 @@ ever enter the conversation:
   instead of re-sending the tail: you get the lines above your coverage, so widening costs
   the difference rather than the whole window again (a line seen before an
   intervening gap can repeat). The wake message itself
-  already carries the exit code and the log's last line, so many turns need no
+  already carries the exit code, the stats and the log's last line, and — on a
+  failed run — the failure line with its first source frame, so many turns need no
   follow-up read at all.
 - **Pattern search:** `bggrep <id> [pattern] [context]` — line-numbered matches,
   capped and condensed (~50 matches, ~2KB/line, ~8KB); takes the job id, so

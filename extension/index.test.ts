@@ -4245,6 +4245,189 @@ test("wake message: Stats line also present on a red (non-zero exit) run", async
   });
 });
 
+// ── failure locator (wake) ─────────────────────────────────────────────────
+
+test("wake failure locator: names the failure line and its source frame (one wake)", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-fail1",
+      {
+        command:
+          "printf '(fail) load part 02 > step 04 [1.29ms]\\n    at loadStep (/private/tmp/trace-root-fixture/harness.ts:28:9)\\n    at Test.runInAsyncScope (node:async_hooks:206:9)\\n'; exit 1",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    // One wake, carrying exit code + stats + the named failure together.
+    assert.equal(wakes.length, 1, "the failure rides the wake, not a second message");
+    const wake = wakes[0].text;
+    assert.match(wake, /exit 1/);
+    assert.match(wake, /^Stats: /m);
+    assert.match(
+      wake,
+      /^Failure: \(fail\) load part 02 > step 04 \[1\.29ms\] — at loadStep \(\/private\/tmp\/trace-root-fixture\/harness\.ts:28:9\)$/m,
+      "failure line and its frame, frame's path:line:col kept whole",
+    );
+  });
+});
+
+test("wake failure locator: a block failure's frame across a payload is still found (trace-root shape)", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+
+    // The benchmark fixture's real shape: an AssertionError header, a printed
+    // diff payload, THEN the stack — the header and its frame 10 lines apart.
+    await bgrun.execute(
+      "call-failblock",
+      {
+        command:
+          "printf 'AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\\n+ actual - expected\\n\\n  {\\n+   actual: 1\\n+   got: 1\\n-   expected: 2\\n-   got: 2\\n  }\\n\\n    at loadStep (/private/tmp/trace-root-fixture/harness.ts:28:9)\\n    at load part 02 (/private/tmp/trace-root-fixture/part-02.test.ts:41:25)\\n'; exit 1",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    assert.match(
+      wakes[0].text,
+      /^Failure: AssertionError \[ERR_ASSERTION\]: Expected values to be strictly deep-equal: — at loadStep \(\/private\/tmp\/trace-root-fixture\/harness\.ts:28:9\)$/m,
+    );
+  });
+});
+
+test("wake failure locator: a spaced function name in the frame still matches", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+
+    // `load part 02` is a real frame name our own fixture prints; a no-space
+    // name pattern would silently drop it and leave the wake frame-less.
+    await bgrun.execute(
+      "call-failspaced",
+      {
+        command:
+          "printf '(fail) load part 02 > step 04 [1.29ms]\\n    at load part 02 (/private/tmp/trace-root-fixture/part-02.test.ts:41:25)\\n'; exit 1",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    assert.match(
+      wakes[0].text,
+      /^Failure: \(fail\) load part 02 > step 04 \[1\.29ms\] — at load part 02 \(\/private\/tmp\/trace-root-fixture\/part-02\.test\.ts:41:25\)$/m,
+    );
+  });
+});
+
+test("wake failure locator: a failure line with no frame still prints, without an at-fragment", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-fail2",
+      { command: "printf 'AssertionError: nope\\nplain one\\nplain two\\n'; exit 1" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const failureLine = wakes[0].text
+      .split("\n")
+      .find((l) => l.startsWith("Failure: "));
+    assert.equal(failureLine, "Failure: AssertionError: nope");
+    assert.ok(!failureLine!.includes(" at "), "no frame → no at-fragment");
+  });
+});
+
+test("wake failure locator: a failure buried mid-log is still found (whole-log scan, not tail)", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-fail3",
+      {
+        command:
+          "printf '(fail) buried\\n    at deep (/tmp/x/harness.ts:77:3)\\n'; for i in $(seq 1 200); do echo \"filler-$i\"; done; exit 1",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    assert.match(
+      wake,
+      /^Failure: \(fail\) buried — at deep \(\/tmp\/x\/harness\.ts:77:3\)$/m,
+    );
+    // The last line is filler, so the locator found something the tail did not.
+    assert.match(wake, /^Last output: filler-200$/m);
+  });
+});
+
+test("wake failure locator: a passing job's log with Error: and a frame stays clean", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-fail4",
+      {
+        command:
+          "printf 'Error: harmless prose\\n    at frame (/tmp/a/harness.ts:5:1)\\n'",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    assert.match(wake, /exit 0/);
+    assert.ok(!wake.includes("Failure:"), "a green run never announces a failure");
+  });
+});
+
+test("wake failure locator: two failure blocks — the first is named once, nothing throws", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+
+    await bgrun.execute(
+      "call-fail5",
+      {
+        command:
+          "printf '(fail) first test\\n    at firstFn (/tmp/a/first.ts:10:5)\\n(fail) second test\\n    at secondFn (/tmp/a/second.ts:20:6)\\n'; exit 1",
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    assert.match(
+      wake,
+      /^Failure: \(fail\) first test — at firstFn \(\/tmp\/a\/first\.ts:10:5\)$/m,
+    );
+    assert.equal(
+      wake.split("Failure:").length - 1,
+      1,
+      "one failure line, no total and no second block",
+    );
+    assert.ok(
+      !wake.split("\n").some((l) => l.startsWith("Failure: ") && l.includes("second")),
+      "the second block is not named",
+    );
+  });
+});
+
 test("wake message: missing log file — Stats shows duration only, wake still sent", async () => {
   await withJobsDir(async (dir, h) => {
     const { wakes, tools, ctx } = h;

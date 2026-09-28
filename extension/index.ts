@@ -766,6 +766,100 @@ function readLastLineFromContent(content: string, maxLen = 200): string | null {
   return last.length > maxLen ? last.slice(0, maxLen) + "…" : last;
 }
 
+// ── Failure locator (wake) ──────────────────────────────────────────────────
+//
+// A failed job's wake should name the failure and the source frame nearest it,
+// so a session is not left guessing a bggrep pattern that misses the file the
+// failure was *thrown from* — a runner's `at <fn> (<file>:<line>:<col>)` line
+// carries no failure word, so the obvious pattern never surfaces it. One
+// signature list, one JS/TS frame shape, scanned in the SAME bounded pass that
+// counts the log's lines. Silent when nothing matches (and never consulted for
+// a passing job, whose wake must stay byte-identical).
+//
+// "First in the log" is deliberately arbitrary, not a priority: runners execute
+// files concurrently, so the first failure found is *a* real failure with a
+// real frame — which is all this pointer claims. The wake stays a pointer, not
+// a report: the log holds the rest, and a count would be a back-door lie (a
+// test whose name contains "fail" inflates it).
+interface FailurePointer {
+  /** The trimmed failure-signature line (truncated for the wake). */
+  failure: string;
+  /** The first source frame within 5 lines after it. */
+  frame?: string;
+}
+
+// Failure signatures common to test runners / build tools. `^Error:` is
+// line-anchored: an "Error:" mid-line is usually prose, not a failure header.
+const FAILURE_SIGNATURE_RE =
+  /\(fail\)|✗|✘|×|--- FAIL|\bFAIL\b|AssertionError|^Error:/;
+
+// A source frame whose path ends in a JS/TS extension — `at fn (path.ts:28:9)`
+// or bare `at path.ts:28:9`. The name may contain spaces (a `describe`-scoped
+// frame, `at load part 02 (part-02.test.ts:41:25)`, which our own fixture
+// prints), so it is `.+?` up to the ` (` rather than a no-space run.
+// Runtime-internal frames (`node:async_hooks:206:9`) deliberately do not match:
+// they name the runtime, not the caller's code.
+const SOURCE_FRAME_RE =
+  /^\s*at\s+(?:(.+?)\s+\()?([^\s()]+\.(?:tsx?|jsx?|mjs|cjs|mts|cts)):(\d+):(\d+)\)?\s*$/;
+
+const FAILURE_LINE_MAX = 160;
+// How far past a failure line to look for its first frame. A runner's terse
+// shape puts the frame on the very next line, but a *block* failure (an
+// assertion header, the printed payload — a diff, an object dump — then the
+// stack) separates them by more: the benchmark's trace-root fixture has its
+// `AssertionError` header 10 lines above `at loadStep (harness.ts:28:9)`.
+// Sized to span that payload while staying bounded and still stopping at the
+// first frame.
+const FRAME_LOOKAHEAD = 20;
+
+/**
+ * One-pass failure scan over decoded log text. Stops the moment it has a frame,
+ * or after FRAME_LOOKAHEAD lines past a failure with none found (the failure
+ * line alone is still worth reporting). `enabled` is false for a passing job:
+ * then it never matches, so no `Failure:` can appear on a green wake.
+ */
+function makeFailureScanner(enabled: boolean): {
+  feed: (line: string) => void;
+  result: () => FailurePointer | null;
+  readonly done: boolean;
+} {
+  let failure: string | null = null;
+  let frame: string | null = null;
+  let afterFailure = 0;
+  let done = !enabled;
+  return {
+    feed(rawLine: string) {
+      if (done) return;
+      const line = rawLine.trim();
+      if (failure === null) {
+        if (FAILURE_SIGNATURE_RE.test(line))
+          failure =
+            line.length > FAILURE_LINE_MAX
+              ? line.slice(0, FAILURE_LINE_MAX) + "…"
+              : line;
+        return;
+      }
+      const m = SOURCE_FRAME_RE.exec(line);
+      if (m) {
+        const [, fn, path, lineNo, col] = m;
+        frame = fn
+          ? `at ${fn} (${path}:${lineNo}:${col})`
+          : `at ${path}:${lineNo}:${col}`;
+        done = true;
+      } else if (++afterFailure >= FRAME_LOOKAHEAD) {
+        done = true;
+      }
+    },
+    result() {
+      if (failure === null) return null;
+      return frame ? { failure, frame } : { failure };
+    },
+    get done() {
+      return done;
+    },
+  };
+}
+
 function validateJobId(id: string, tool: string): void {
   // The single gate in front of every id. It rejects:
   //   * a path shape — an id can never address a file outside the jobs dir;
@@ -2030,24 +2124,34 @@ export default function (pi: ExtensionAPI) {
   // Count the log's total lines with a bounded-memory streaming scan (one
   // fixed-size buffer, no full-file read). Missing/unreadable file → null:
   // the Stats line then just omits the line count — best-effort, never
-  // breaks a wake.
-  function countLogLines(logPath: string): number | null {
+  // breaks a wake. With `findFailure` (a non-zero exit), the SAME streaming
+  // pass also runs the failure locator, so the wake can name the failure
+  // without a second read of the log.
+  function scanLog(
+    logPath: string,
+    findFailure: boolean,
+  ): { lines: number | null; failure: FailurePointer | null } {
+    const scanner = makeFailureScanner(findFailure);
     let fd: number;
     try {
       fd = openSync(logPath, "r");
     } catch {
-      return null;
+      return { lines: null, failure: null };
     }
     try {
       // fstat, not the scan's own progress: the tail pread below is positioned
       // by the REAL file size, so bounding the scan can never misplace it.
       const size = fstatSync(fd).size;
-      if (size === 0) return 0;
+      if (size === 0) return { lines: 0, failure: null };
       // readWindowMax, not the cap: a capped log is cap + notice + marker, so a
       // bound EQUAL to the cap would omit the line count for every capped job —
       // exactly where magnitude matters most.
-      if (size > readWindowMax()) return null;
+      if (size > readWindowMax()) return { lines: null, failure: null };
       const buf = Buffer.alloc(64 * 1024);
+      // TextDecoder's stream mode carries a multi-byte sequence split across two
+      // read() chunks, so a decoded line is never mojibake at a chunk boundary.
+      const decoder = new TextDecoder();
+      let carry = "";
       let newlines = 0;
       let seen = 0;
       let bytesRead = 0;
@@ -2058,10 +2162,26 @@ export default function (pi: ExtensionAPI) {
         for (let i = 0; i < bytesRead; i++) {
           if (buf[i] === 0x0a) newlines++;
         }
+        // Decode only while the locator is still looking: once it has its
+        // answer, the rest of the file is byte-counted, not re-parsed.
+        if (!scanner.done) {
+          const text =
+            carry + decoder.decode(buf.subarray(0, bytesRead), { stream: true });
+          const parts = text.split("\n");
+          carry = parts.pop() ?? "";
+          for (const part of parts) {
+            scanner.feed(part);
+            if (scanner.done) break;
+          }
+        }
       } while (bytesRead === buf.length);
       // A log that changed size mid-scan (rotated, or appended by a resumed
       // job) would produce a count that matches neither state.
-      if (seen !== size) return null;
+      if (seen !== size) return { lines: null, failure: null };
+      if (!scanner.done) {
+        const flushed = carry + decoder.decode();
+        if (flushed) scanner.feed(flushed);
+      }
       // One bounded pread of the tail for the final-byte + exit-marker check.
       const tailLen = Math.min(size, 512);
       const tail = Buffer.alloc(tailLen);
@@ -2079,7 +2199,7 @@ export default function (pi: ExtensionAPI) {
       const markerAt = tailText.lastIndexOf("\n" + EXIT_MARKER);
       if (markerAt === 0) {
         // The file is only the wrapper's "\n<marker>\n" — no command output.
-        return 0;
+        return { lines: 0, failure: scanner.result() };
       }
       if (markerAt !== -1) {
         const afterMarker = tailText.slice(markerAt + 1);
@@ -2104,9 +2224,9 @@ export default function (pi: ExtensionAPI) {
           extra++;
         count = Math.max(0, count - extra);
       }
-      return count;
+      return { lines: count, failure: scanner.result() };
     } catch {
-      return null;
+      return { lines: null, failure: null };
     } finally {
       closeSync(fd);
     }
@@ -3087,8 +3207,11 @@ export default function (pi: ExtensionAPI) {
 
           // Universal stats — duration + log line count. Non-heuristic, always
           // present, never pattern-based. A missing log contributes no line
-          // count (duration is always known).
-          const logLines = countLogLines(logPath);
+          // count (duration is always known). The same single pass locates the
+          // failure, but only for a non-zero exit: a green run's wake stays
+          // byte-identical (a passing log may still contain "Error:" prose).
+          const logScan = scanLog(logPath, exitCode !== 0);
+          const logLines = logScan.lines;
           const statsParts = [formatDuration(rec.exitedAt - rec.started)];
           if (logLines !== null)
             statsParts.push(`${logLines.toLocaleString("en-US")} lines`);
@@ -3199,6 +3322,11 @@ export default function (pi: ExtensionAPI) {
           let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
           wake += `Command: ${command}\n`;
           wake += `Stats: ${statsParts.join(", ")}\n`;
+          // One line, named cause: the failure signature and the first source
+          // frame after it. Silent when the log carries no signature (or the
+          // job passed), leaving the wake exactly as it reads today.
+          if (logScan.failure)
+            wake += `Failure: ${logScan.failure.failure}${logScan.failure.frame ? ` — ${logScan.failure.frame}` : ""}\n`;
           if (lastLine) wake += `Last output: ${lastLine}\n`;
           if (digestBlock) {
             wake += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
