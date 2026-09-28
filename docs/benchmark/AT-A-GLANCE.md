@@ -187,7 +187,12 @@ human-driven (`H6 <unattended>` is negative on this setup). `ctx_chars` counts c
 transcript text, not billed tokens. The fixture has no flaky tests, retries, parallel workers
 or enormous stack traces, and the pointer workload is the extension's own suite — a
 pathological digest input, so the pointer *rule* generalises further than the pointer
-*number*. Full statement of what the measurements do and do not support: [`BENCHMARK.md`](../../BENCHMARK.md).
+*number*. **The command in every cell also runs this repository's own test suite, and its
+size changes between revisions as tests are added** (the presets work alone added 718 lines
+to it). The fixture's workload is pinned behaviourally; that repo-suite margin is not, so the
+absolute figures belong to the revision each cell ran against — the mechanism findings do
+not depend on it. Tracked as [#40](https://github.com/stablekernel/pi-background-run/issues/40).
+Full statement of what the measurements do and do not support: [`BENCHMARK.md`](../../BENCHMARK.md).
 
 → [`BENCHMARK.md`](../../BENCHMARK.md) (full findings) · [`method.md`](method.md) (how it was
 measured) · [`results.md`](results.md) (every cell and outcome) · [`predictions.md`](predictions.md)
