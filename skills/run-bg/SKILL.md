@@ -84,8 +84,8 @@ Which to use:
 |---|---|
 | Start  | `bgrun(command: "make test-short", name: "unit-tests", type: "test")` → `started: <job-id>` (name is an optional short label; use it so jobs are recognizable in `bgstatus`, the live panel, and wake messages) |
 | Status | `bgstatus(<job-id>)` for one job, or `bgstatus()` for this session's running jobs — finished jobs are hidden by default; pass `includeDone: true` to list them |
-| Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing); a *bigger* `lines` than you have been shown is a widening and returns the lines above your coverage (a line seen before a gap can repeat) |
-| Grep   | `bggrep(<job-id>, "pattern", context?)` — line-numbered matches, capped and condensed; default pattern = generic failure signatures (override when you know the format). JavaScript regex: a leading `(?i)`/`(?m)`/`(?s)` group works (`(?i)error` = case-insensitive), a scoped `(?i:…)` group is native anywhere, and a bare flag group elsewhere is rejected |
+| Tail   | `bgtail(<job-id>, 40)` — first read: last-40 tail; later reads: only lines appended since (delta tailing); a *bigger* `lines` than you have been shown is a widening and returns the lines above your coverage (a line seen before a gap can repeat). While the job is still running this returns its state and nothing else — `peek: true` reads the live log anyway |
+| Grep   | `bggrep(<job-id>, "pattern", context?)` — line-numbered matches, capped and condensed; default pattern = generic failure signatures (override when you know the format). JavaScript regex: a leading `(?i)`/`(?m)`/`(?s)` group works (`(?i)error` = case-insensitive), a scoped `(?i:…)` group is native anywhere, and a bare flag group elsewhere is rejected. While the job is still running this returns its state and nothing else — `peek: true` searches the live log anyway |
 | Clean  | `bgclean()` for this session's old logs; `bgclean all` to sweep every session's (default 7-day retention) |
 | Kill   | `bgkill(<job-id>)` — SIGTERM to the job's process group; `force: true` for SIGKILL. Refuses finished ids, non-bgrun ids, and another session's job unless `includeForeign: true` |
 
@@ -96,8 +96,9 @@ Which to use:
    matching `type` (e.g. `type: "test"`) — like `name`, it helps the wake
    select the right digest scorecard. You do not have to go looking for the
    vocabulary: when a digest is configured and you omit `type`, the `started:`
-   result names the configured types. Note the returned job-id. Continue other
-   work; you will be woken automatically when the job finishes.
+   result names the configured types. Note the returned job-id. Launching was
+   the task: end your turn there — there is nothing to wait for, and the wake
+   arrives as a new turn carrying the outcome.
 2. **On wake:** the wake *is* the result — exit code, duration, log line count, the
    log's last line, and the digest scorecard when the project configures one.
    - `exit: 0` → success. Report it. Do not open the log to confirm: the wake's own
@@ -105,7 +106,9 @@ Which to use:
    - `exit: <non-zero>` → failure. Analyze the log (see below).
 3. **Checking before the wake is rarely worth it.** A job you just started will be
    `running`, and the wake arrives on its own — polling early buys nothing and costs
-   a call. Reach for `bgstatus` when the job is *not* one you just started: another
+   a call. The readers enforce the same thing: while a job is running, `bgtail` /
+   `bggrep` return its state and nothing else (`peek: true` is the opt-in for the
+   live log). Reach for `bgstatus` when the job is *not* one you just started: another
    session's, one from before a restart, or one whose wake never came.
    - `running` → keep doing other work. Do NOT spin a wait loop.
    - `done exit=0` → success.
@@ -126,7 +129,7 @@ first — it is a short pass/fail scorecard configured for this project and
 usually answers "what failed" without any follow-up read. `bgtail` stays the
 positional-peek tool for everything else.
 
-- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing) — polling a running job is nearly free. Asking for a **larger `lines`** than you have been shown widens the window instead: it returns the lines above your coverage, so widening costs the difference rather than re-sending the window (a line seen before a gap can repeat).
+- **Quick peek (≤40 lines):** call `bgtail` with the job id and `lines: 40` — strips the `__BGRUN_EXIT__` marker. The first read returns the last-40 tail; repeat reads return only lines appended since your last read (delta tailing). **A still-running job is answered with its state, not the log** — pass `peek: true` when you really do need the live output (the wake is the normal path). Asking for a **larger `lines`** than you have been shown widens the window instead: it returns the lines above your coverage, so widening costs the difference rather than re-sending the window (a line seen before a gap can repeat).
 - **Failure extraction:** `bggrep(<job-id>, "pattern")` — line-numbered matches with optional context lines, capped and condensed. Resolves the job id to the configured jobs dir itself — no path to reconstruct. (A sandboxed whole-log reader, context-mode's `ctx_execute_file`, can read the same file given its absolute path — see below.) Searches the last 2 MiB by default; `bytes: 67112960` (the 64 MiB ceiling plus the wrapper's 4 KiB of notices and exit marker) widens it to the whole kept log — the exact ceiling alone stops a few bytes short of the marker, dropping the head you asked for — more scanning costs latency and memory, **not context**, since the returned matches stay capped. Pass your own pattern whenever you know the tool's output format; the default only catches common failure signatures.
 - **Whole-log failure analysis:** read the log's **absolute path** directly
   (with a sandboxed whole-log reader if your environment has one — context-mode's

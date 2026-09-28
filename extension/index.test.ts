@@ -3495,6 +3495,159 @@ test("bgtail: delta tailing — first read full tail, then only new lines, then 
   });
 });
 
+// ── running jobs: content is gated behind an explicit `peek` ────────────────
+//
+// A read of a still-running job used to come back with content (or a delta),
+// which is exactly what paid for the 9-12 call loops measured in the first
+// benchmark cell. It now returns the job's state instead; `peek: true` is the
+// opt-in. A finished job's read is byte-identical (the delta tests above, and
+// the finished-case test below, hold that line).
+
+const LIVE_MARKER = "LIVE-LOG-MARKER";
+const RUNNING_NOTE_RE = /⏳ still running — [\d.]+s elapsed, no exit code yet/;
+
+// Wait until the wrapper's asynchronous write has landed: "no content while
+// running" proves nothing if the content was not in the log yet. A real child
+// process is writing to a real fd, so there is no fake-timer seam here — this
+// is integration plumbing, like waitForPath/waitForWakes above.
+async function waitForLogText(logPath: string, text: string): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    try {
+      if (readFileSync(logPath, "utf8").includes(text)) return;
+    } catch {
+      // not created yet
+    }
+    if (Date.now() - start > 3_000) {
+      throw new Error(`timed out waiting for ${JSON.stringify(text)} in ${logPath}`);
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+test("bgtail/bggrep: a running job returns the state line, not the log; peek: true returns both", async () => {
+  await withJobsDir(async (dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const bgtail = tools.get("bgtail")!;
+    const bggrep = tools.get("bggrep")!;
+    const bgstatus = tools.get("bgstatus")!;
+    const bgkill = tools.get("bgkill")!;
+
+    const res = await bgrun.execute(
+      "r1",
+      { command: `echo ${LIVE_MARKER}; sleep 30` },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const started = res.content[0].text as string;
+    const id = started.match(/^started: ([^\n]+)/)![1];
+    assert.match(started, /Your part is done — end your turn now/);
+    assert.match(started, /Nothing to wait for/);
+    const logPath = join(dir, `${id}.log`);
+    await waitForLogText(logPath, LIVE_MARKER);
+
+    try {
+      // No peek: the state line replaces the content entirely.
+      const tail = await bgtail.execute("r2", { id }, undefined, undefined, ctx);
+      const tailText = tail.content[0].text as string;
+      assert.match(tailText, RUNNING_NOTE_RE);
+      assert.match(tailText, /Launching was the task; the wake is your next input/);
+      assert.match(tailText, /pass peek: true only if you need the live log now/);
+      assert.ok(!tailText.includes(LIVE_MARKER), "no log content without peek");
+      assert.equal(tail.details.running, true);
+
+      const grep = await bggrep.execute(
+        "r3",
+        { id, pattern: LIVE_MARKER },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const grepText = grep.content[0].text as string;
+      assert.match(grepText, RUNNING_NOTE_RE);
+      assert.ok(!grepText.includes(LIVE_MARKER), "no match output without peek");
+      assert.equal(grep.details.running, true);
+
+      // bgstatus on the same job: state plus the consequence, no peek sentence
+      // (there is no log content there to opt into).
+      const status = await bgstatus.execute("r4", { id }, undefined, undefined, ctx);
+      const statusText = status.content[0].text as string;
+      assert.match(statusText, new RegExp(`^${id}: running\\n`));
+      assert.match(statusText, RUNNING_NOTE_RE);
+      assert.match(statusText, /Nothing to read until it exits\.$/m);
+      assert.ok(!statusText.includes("peek"), "status offers no peek");
+
+      // peek: true — the log AND the state line, so the read still says what
+      // the job is doing.
+      const peeked = await bgtail.execute(
+        "r5",
+        { id, peek: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const peekedText = peeked.content[0].text as string;
+      assert.match(peekedText, RUNNING_NOTE_RE);
+      assert.ok(peekedText.includes(LIVE_MARKER), "peek returns the log");
+
+      const peekedGrep = await bggrep.execute(
+        "r6",
+        { id, pattern: LIVE_MARKER, peek: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const peekedGrepText = peekedGrep.content[0].text as string;
+      assert.match(peekedGrepText, RUNNING_NOTE_RE);
+      assert.match(peekedGrepText, new RegExp(`L1: ${LIVE_MARKER}`));
+    } finally {
+      // The state has to be real, so the process has to be real: stop it, and
+      // let the exit wake land before the temp dir goes away.
+      await bgkill.execute("r7", { id, force: true }, undefined, undefined, ctx);
+      await waitForWakes(wakes, 1);
+    }
+  });
+});
+
+test("bgtail/bggrep/bgstatus: a finished job's output carries no state line", async () => {
+  await withJobsDir(async (_dir, h) => {
+    const { wakes, tools, ctx } = h;
+    const bgrun = tools.get("bgrun")!;
+    const res = await bgrun.execute(
+      "f1",
+      { command: `echo ${LIVE_MARKER}` },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const id = (res.content[0].text as string).match(/^started: ([^\n]+)/)![1];
+    await waitForWakes(wakes, 1);
+
+    const tail = await tools
+      .get("bgtail")!
+      .execute("f2", { id }, undefined, undefined, ctx);
+    const tailText = tail.content[0].text as string;
+    assert.match(tailText, new RegExp(LIVE_MARKER), "content as before");
+    assert.doesNotMatch(tailText, /still running/);
+
+    const grep = await tools
+      .get("bggrep")!
+      .execute("f3", { id, pattern: LIVE_MARKER }, undefined, undefined, ctx);
+    const grepText = grep.content[0].text as string;
+    assert.match(grepText, new RegExp(`L1: ${LIVE_MARKER}`));
+    assert.doesNotMatch(grepText, /still running/);
+
+    const status = await tools
+      .get("bgstatus")!
+      .execute("f4", { id }, undefined, undefined, ctx);
+    const statusText = status.content[0].text as string;
+    assert.match(statusText, new RegExp(`^${id}: done exit=0`));
+    assert.doesNotMatch(statusText, /still running/);
+  });
+});
+
 test("bgtail: a wider `lines` hands back the earlier lines not yet shown, never the seen ones", async () => {
   await withJobsDir(async (dir, h) => {
     const { wakes, tools, ctx } = h;
@@ -6361,7 +6514,10 @@ test("bggrep: the match budget trips and reports an error (timeout plumbing)", a
     const { pi, tools, ctx } = makeFakePi();
     await loadExtension(pi);
     const id = `grep-budget-${Math.floor(Date.now() / 1000)}-${process.pid}`;
-    writeFileSync(join(dir, `${id}.log`), "alpha\nbeta\ngamma\n");
+    // The marker makes this a finished log: a log with no marker whose pid is
+    // live reads as a still-running job, and the readers withhold content from
+    // those (this fixture is about the match budget, not liveness).
+    writeFileSync(join(dir, `${id}.log`), "alpha\nbeta\ngamma\n__BGRUN_EXIT__=0\n");
     const bggrep = tools.get("bggrep")!;
     const t0 = Date.now();
     const res = await bggrep.execute(
