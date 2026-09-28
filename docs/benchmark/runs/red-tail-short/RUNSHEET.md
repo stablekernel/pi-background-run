@@ -12,7 +12,7 @@ prediction: [../../predictions.md](../../predictions.md).
 | fixture | `/private/tmp/red-tail-fixture` — 2 files, 8 tests, fails at part 02 step 04, exit 1; `DUMMY_SLEEP_MS=1`, `DUMMY_ANNOUNCE_FAILURE=0` |
 | fixture sha | `0bfe00ed1d9866b9` (recomputed 2026-09-28 under the method above; the earlier `9b42b1ea3d980ef6` was not reproducible — the files' mtimes and all six transcripts confirm the content was unchanged, see [CELL.md](CELL.md)) |
 | model | `anthropic/claude-sonnet-4-6` |
-| working dir | `/Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc` |
+| working dir | `~/sk/pi-bgrun.bench-doc` |
 | sessions | each run gets its **own** `--session-dir`: a shared one profiles only its first `*.jsonl` |
 
 **Verified shape of the run** (agent environment, the command above): 96 lines, exit 1,
@@ -34,9 +34,9 @@ a session reaches for bgrun is the finding, not the instruction.
 | 6 | vanilla | `/private/tmp/cells/red-tail-short/vanilla-3` | `rt-vanilla-3` | — |
 
 ```sh
-cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc
+cd ~/sk/pi-bgrun.bench-doc
 pi -ne -ns \
-  -e /Users/lloyd.engebretsen/.pi/agent/npm/node_modules/@stablekernel/pi-bifrost/src/index.ts \
+  -e ~/.pi/agent/npm/node_modules/@stablekernel/pi-bifrost/src/index.ts \
   -e ./extension/index.ts \
   --provider bifrost-openai --model anthropic/claude-sonnet-4-6 \
   --session-dir /private/tmp/cells/red-tail-short/bgrun-1 -n rt-bgrun-1 \

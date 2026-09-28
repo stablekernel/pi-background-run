@@ -1,14 +1,14 @@
 label                 arm    execs fg handoff wall_s blocked_s idle_s sleep_s ctx_chars diag    locate    cause  calls
 bgrun-1               bgrun  1    0  1      42.9   0.0      42.9   0.0    31,170   up+down position  reached 12
 bgrun-2               bgrun  1    0  1      45.4   0.0      45.4   0.0    31,782   up+down position  reached 11
-bgrun-3               bgrun  1    0  1      51.1   0.0      51.1   0.0    29,403   up+down position  -      9
+bgrun-3               bgrun  1    0  1      51.1   0.0      51.1   0.0    29,403   up+down position  reached 9
 vanilla-1             vanilla 1    1  0      33.0   22.5     10.5   0.0    27,798   up+down position  reached 1
 vanilla-2             vanilla 1    1  0      32.5   22.6     9.9    0.0    27,817   up+down position  reached 1
 vanilla-3             vanilla 1    1  0      38.2   22.5     15.8   0.0    27,870   up+down position  reached 1
 
-bgrun-1  /private/tmp/cells/red-tail-short/bgrun-1/2026-09-28T13-39-03-163Z_01a0e83d-8d7b-7115-ba08-942c5b1975bd.jsonl
+bgrun-1  docs/benchmark/runs/red-tail-short/sessions/bgrun-1/2026-09-28T13-39-03-163Z_01a0e83d-8d7b-7115-ba08-942c5b1975bd.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bgrun     0.0     301     536       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture
+  1  bgrun     0.0     301     536       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture
   2  bgtail    0.0     763     1,497     position  bun-tests-1790602752-11625
   3  bgtail    0.0     5706    7,203     position  bun-tests-1790602752-11625
   4  bgtail    0.0     2102    9,305     position  bun-tests-1790602752-11625
@@ -21,9 +21,9 @@ bgrun-1  /private/tmp/cells/red-tail-short/bgrun-1/2026-09-28T13-39-03-163Z_01a0
   11 bgtail    0.0     1740    22,186    position  bun-tests-1790602752-11625
   12 bgtail    0.0     5931    28,117    position  bun-tests-1790602752-11625
 
-bgrun-2  /private/tmp/cells/red-tail-short/bgrun-2/2026-09-28T13-41-06-664Z_01a0e83f-6fe7-775d-a165-c0a30a1bfaf0.jsonl
+bgrun-2  docs/benchmark/runs/red-tail-short/sessions/bgrun-2/2026-09-28T13-41-06-664Z_01a0e83f-6fe7-775d-a165-c0a30a1bfaf0.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bgrun     0.0     301     540       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture
+  1  bgrun     0.0     301     540       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture
   2  bgtail    0.0     1140    1,900     position  bun-tests-1790602870-21137
   3  bgtail    0.0     6089    7,989     position  bun-tests-1790602870-21137
   4  bgtail    0.0     4580    12,569    position  bun-tests-1790602870-21137
@@ -35,9 +35,9 @@ bgrun-2  /private/tmp/cells/red-tail-short/bgrun-2/2026-09-28T13-41-06-664Z_01a0
   10 bgtail    0.0     1922    22,395    position  bun-tests-1790602870-21137
   11 bgtail    0.0     5922    28,317    position  bun-tests-1790602870-21137
 
-bgrun-3  /private/tmp/cells/red-tail-short/bgrun-3/2026-09-28T13-42-49-344Z_01a0e841-00ff-722b-9198-6925708d1437.jsonl
+bgrun-3  docs/benchmark/runs/red-tail-short/sessions/bgrun-3/2026-09-28T13-42-49-344Z_01a0e841-00ff-722b-9198-6925708d1437.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bgrun     0.0     301     536       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture
+  1  bgrun     0.0     301     536       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture
   2  bgtail    0.0     1456    2,205     position  bun-tests-1790602974-30131
   3  bggrep    0.0     4704    6,909     pattern   bun-tests-1790602974-30131
   4  bgtail    0.0     8145    15,054    position  bun-tests-1790602974-30131
@@ -47,17 +47,17 @@ bgrun-3  /private/tmp/cells/red-tail-short/bgrun-3/2026-09-28T13-42-49-344Z_01a0
   8  bggrep    0.0     1812    22,487    pattern   bun-tests-1790602974-30131
   9  bggrep    0.0     3433    25,920    pattern   bun-tests-1790602974-30131
 
-vanilla-1  /private/tmp/cells/red-tail-short/vanilla-1/2026-09-28T13-40-11-597Z_01a0e83e-98cc-7783-a9f6-4269476917d5.jsonl
+vanilla-1  docs/benchmark/runs/red-tail-short/sessions/vanilla-1/2026-09-28T13-40-11-597Z_01a0e83e-98cc-7783-a9f6-4269476917d5.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bash      22.5    26605   26,857    position  cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
+  1  bash      22.5    26605   26,857    position  cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
 
-vanilla-2  /private/tmp/cells/red-tail-short/vanilla-2/2026-09-28T13-42-02-694Z_01a0e840-4ac6-7726-80a9-9b1adf7ba16e.jsonl
+vanilla-2  docs/benchmark/runs/red-tail-short/sessions/vanilla-2/2026-09-28T13-42-02-694Z_01a0e840-4ac6-7726-80a9-9b1adf7ba16e.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bash      22.6    26605   26,845    position  cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
+  1  bash      22.6    26605   26,845    position  cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
 
-vanilla-3  /private/tmp/cells/red-tail-short/vanilla-3/2026-09-28T13-43-51-574Z_01a0e841-f415-71e5-8c4c-ea66f764f794.jsonl
+vanilla-3  docs/benchmark/runs/red-tail-short/sessions/vanilla-3/2026-09-28T13-43-51-574Z_01a0e841-f415-71e5-8c4c-ea66f764f794.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bash      22.5    26604   26,839    position  cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
+  1  bash      22.5    26604   26,839    position  cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
 
 summary (median [min–max]; arms with a single session have no median)
   vanilla (3 sessions)

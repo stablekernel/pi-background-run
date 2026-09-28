@@ -13,7 +13,7 @@ prompt, one session directory per run. Cell definition and fixture recipe:
 | fixture | `/private/tmp/long-buried-fixture` — 10 files, 300 tests, fails at part 05 step 15, exit 1; default knobs (`DUMMY_SLEEP_MS=600`, `DUMMY_LINES_PER_TEST=2`, `DUMMY_FAIL_FAST=0`), `DUMMY_ANNOUNCE_FAILURE=0` |
 | fixture sha | `6671002e6f186546` (sorted file contents, concatenated, sha1, first 16 hex) |
 | model | `anthropic/claude-sonnet-4-6` |
-| working dir | `/Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc` |
+| working dir | `~/sk/pi-bgrun.bench-doc` |
 | sessions | each run gets its **own** `--session-dir`: a shared one profiles only its first `*.jsonl` |
 
 **Verified shape of the run** (the exact command above, run from this worktree's shell):
@@ -39,9 +39,9 @@ to the end after failing: ~180s of work a background job is supposed to absorb.
 | 6 | vanilla | `/private/tmp/cells/long-buried/vanilla-3` | `lb-vanilla-3` | — |
 
 ```sh
-cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc
+cd ~/sk/pi-bgrun.bench-doc
 pi -ne -ns \
-  -e /Users/lloyd.engebretsen/.pi/agent/npm/node_modules/@stablekernel/pi-bifrost/src/index.ts \
+  -e ~/.pi/agent/npm/node_modules/@stablekernel/pi-bifrost/src/index.ts \
   -e ./extension/index.ts \
   --provider bifrost-openai --model anthropic/claude-sonnet-4-6 \
   --session-dir /private/tmp/cells/long-buried/bgrun-1 -n lb-bgrun-1 \

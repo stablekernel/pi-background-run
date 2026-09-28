@@ -13,7 +13,7 @@ prompt, one session directory per run. Cell definition and fixture recipe:
 | fixture | `/private/tmp/trace-root-fixture` — 2 files, 8 tests, fails at part 02 step 04, exit 1; `DUMMY_SLEEP_MS=1`, `DUMMY_ANNOUNCE_FAILURE=0`, `DUMMY_CAUSE_MODULE=1` |
 | fixture sha | `605aba38baf5c6ad` (sorted file contents, concatenated, sha1, first 16 hex) |
 | model | `anthropic/claude-sonnet-4-6` |
-| working dir | `/Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc` |
+| working dir | `~/sk/pi-bgrun.bench-doc` |
 | sessions | each run gets its **own** `--session-dir`: a shared one profiles only its first `*.jsonl` |
 
 **Verified shape of the run** (the exact command above, run from this worktree's shell):
@@ -40,9 +40,9 @@ only in the fixture — diagnosis depth, not the command.
 | 6 | vanilla | `/private/tmp/cells/trace-root/vanilla-3` | `tr-vanilla-3` | — |
 
 ```sh
-cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc
+cd ~/sk/pi-bgrun.bench-doc
 pi -ne -ns \
-  -e /Users/lloyd.engebretsen/.pi/agent/npm/node_modules/@stablekernel/pi-bifrost/src/index.ts \
+  -e ~/.pi/agent/npm/node_modules/@stablekernel/pi-bifrost/src/index.ts \
   -e ./extension/index.ts \
   --provider bifrost-openai --model anthropic/claude-sonnet-4-6 \
   --session-dir /private/tmp/cells/trace-root/bgrun-1 -n tr-bgrun-1 \

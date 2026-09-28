@@ -60,7 +60,7 @@ repo="$(cd "$here/../../.." && pwd)"
 tag="$cell${variant:+-$variant}"
 cells="/private/tmp/cells/$tag"
 name_prefix="$prefix${variant:+-$variant}"
-bifrost=/Users/lloyd.engebretsen/.pi/agent/npm/node_modules/@stablekernel/pi-bifrost/src/index.ts
+bifrost="${PI_BIFROST_EXTENSION:-$HOME/.pi/agent/npm/node_modules/@stablekernel/pi-bifrost/src/index.ts}"
 suite="bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts"
 prompt="Run $suite $fixture in this repo and report the failure details."
 

@@ -21,7 +21,7 @@ job finishes).
 ## Your part — one command
 
 ```sh
-cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc/docs/benchmark/runs
+cd ~/sk/pi-bgrun.bench-doc/docs/benchmark/runs
 ./run-cell.sh red-tail-short              # six sessions, one at a time
 ./run-cell.sh red-tail-short --dry-run    # print the six commands, launch nothing
 # then: ./run-cell.sh trace-root, ./run-cell.sh long-buried
@@ -65,7 +65,7 @@ The run sheets below remain the record of what each cell fixes and what it is ju
 ## After your sessions
 
 ```sh
-cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc
+cd ~/sk/pi-bgrun.bench-doc
 bun scripts/measure-sessions.ts <the session dirs> --csv
 ```
 

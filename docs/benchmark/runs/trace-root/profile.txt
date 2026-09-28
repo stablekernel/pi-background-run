@@ -6,32 +6,32 @@ vanilla-1             vanilla 1    1  0      34.5   22.6     11.9   0.0    28,27
 vanilla-2             vanilla 1    1  0      34.4   22.8     11.6   0.0    28,248   up+down full-read reached 1
 vanilla-3             vanilla 1    1  0      36.2   22.5     13.7   0.0    28,379   up+down full-read reached 1
 
-bgrun-1  /private/tmp/cells/trace-root/bgrun-1/2026-09-28T15-00-56-689Z_01a0e888-86f1-76ab-87a3-d375337ff383.jsonl
+bgrun-1  docs/benchmark/runs/trace-root/sessions/bgrun-1/2026-09-28T15-00-56-689Z_01a0e888-86f1-76ab-87a3-d375337ff383.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bgrun     0.0     320     634       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+  1  bgrun     0.0     320     634       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
   2  bggrep    0.0     7520    8,749     pattern   bun-tests-1790607661-76860
 
-bgrun-2  /private/tmp/cells/trace-root/bgrun-2/2026-09-28T15-09-12-321Z_01a0e890-1700-735a-8560-70d8b3032283.jsonl
+bgrun-2  docs/benchmark/runs/trace-root/sessions/bgrun-2/2026-09-28T15-09-12-321Z_01a0e890-1700-735a-8560-70d8b3032283.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bgrun     0.0     318     657       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+  1  bgrun     0.0     318     657       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
   2  bggrep    0.0     7531    8,757     pattern   bun-tests-1790608157-5556
 
-bgrun-3  /private/tmp/cells/trace-root/bgrun-3/2026-09-28T15-11-40-096Z_01a0e892-583f-716b-952d-bfe93a8bca27.jsonl
+bgrun-3  docs/benchmark/runs/trace-root/sessions/bgrun-3/2026-09-28T15-11-40-096Z_01a0e892-583f-716b-952d-bfe93a8bca27.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bgrun     0.0     320     559       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture
+  1  bgrun     0.0     320     559       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture
   2  bggrep    0.0     7522    8,684     pattern   bun-tests-1790608304-17453
 
-vanilla-1  /private/tmp/cells/trace-root/vanilla-1/2026-09-28T15-01-49-436Z_01a0e889-54fb-74c4-aeb4-7afeb2f54b50.jsonl
+vanilla-1  docs/benchmark/runs/trace-root/sessions/vanilla-1/2026-09-28T15-01-49-436Z_01a0e889-54fb-74c4-aeb4-7afeb2f54b50.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bash      22.6    26980   27,217    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+  1  bash      22.6    26980   27,217    full-read cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
 
-vanilla-2  /private/tmp/cells/trace-root/vanilla-2/2026-09-28T15-09-57-352Z_01a0e890-c6e8-73c0-96db-4433194fbf2c.jsonl
+vanilla-2  docs/benchmark/runs/trace-root/sessions/vanilla-2/2026-09-28T15-09-57-352Z_01a0e890-c6e8-73c0-96db-4433194fbf2c.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bash      22.8    26990   27,220    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+  1  bash      22.8    26990   27,220    full-read cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
 
-vanilla-3  /private/tmp/cells/trace-root/vanilla-3/2026-09-28T15-12-39-868Z_01a0e893-41bb-7753-a602-f18f23c17ffa.jsonl
+vanilla-3  docs/benchmark/runs/trace-root/sessions/vanilla-3/2026-09-28T15-12-39-868Z_01a0e893-41bb-7753-a602-f18f23c17ffa.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bash      22.5    26990   27,196    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+  1  bash      22.5    26990   27,196    full-read cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
 
 summary (median [min–max]; arms with a single session have no median)
   vanilla (3 sessions)

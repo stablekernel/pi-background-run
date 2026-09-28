@@ -6,54 +6,54 @@ vanilla-1             vanilla 8    8  0      732.4  707.3    25.1   0.0    66,79
 vanilla-2             vanilla 2    2  0      283.8  263.6    20.2   0.0    86,836   up+down full-read reached 2
 vanilla-3             vanilla 4    4  0      696.2  660.2    36.0   0.0    79,901   up+down full-read reached 6
 
-bgrun-1  /private/tmp/cells/long-buried/bgrun-1/2026-09-28T17-59-39-097Z_01a0e92c-2358-7057-ac28-7a73f848e8f1.jsonl
+bgrun-1  docs/benchmark/runs/long-buried/sessions/bgrun-1/2026-09-28T17-59-39-097Z_01a0e92c-2358-7057-ac28-7a73f848e8f1.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
   1  bgrun     0.0     320     642       -         bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
   2  bggrep    0.0     8193    9,544     pattern   bun-tests-1790618383-48718
   3  bggrep    0.0     5479    15,210    pattern   bun-tests-1790618383-48718
 
-bgrun-2  /private/tmp/cells/long-buried/bgrun-2/2026-09-28T18-27-30-843Z_01a0e945-a59b-7753-84cb-a544269b8cbf.jsonl
+bgrun-2  docs/benchmark/runs/long-buried/sessions/bgrun-2/2026-09-28T18-27-30-843Z_01a0e945-a59b-7753-84cb-a544269b8cbf.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bgrun     0.0     320     664       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
+  1  bgrun     0.0     320     664       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
   2  bggrep    0.0     8179    9,639     pattern   bun-tests-1790620055-30572
   3  bgtail    0.0     3884    13,885    position  bun-tests-1790620055-30572
   4  bggrep    0.0     6219    20,104    pattern   bun-tests-1790620055-30572 [batched]
 
-bgrun-3  /private/tmp/cells/long-buried/bgrun-3/2026-09-28T18-40-29-400Z_01a0e951-86d8-725c-92c4-ee33ba19611b.jsonl
+bgrun-3  docs/benchmark/runs/long-buried/sessions/bgrun-3/2026-09-28T18-40-29-400Z_01a0e951-86d8-725c-92c4-ee33ba19611b.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bgrun     0.0     320     671       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
+  1  bgrun     0.0     320     671       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
   2  bggrep    0.0     8186    9,653     pattern   bun-tests-1790620834-71709
   3  bggrep    0.0     4895    14,785    pattern   bun-tests-1790620834-71709
   4  bgtail    0.0     2830    17,782    position  bun-tests-1790620834-71709
 
-vanilla-1  /private/tmp/cells/long-buried/vanilla-1/2026-09-28T18-11-35-486Z_01a0e937-11bd-7627-a3e2-b43536bc5b4a.jsonl
+vanilla-1  docs/benchmark/runs/long-buried/sessions/vanilla-1/2026-09-28T18-11-35-486Z_01a0e937-11bd-7627-a3e2-b43536bc5b4a.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bash      120.0   50584   50,814    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
-  2  bash      0.0     274     51,216    pattern   grep -E "^\(fail\)|^✗|error:|Error:|FAIL|failed" /var/folders/fb/y3035y052kd71b4fr6jq2p2w0000gn/T/pi-bash-4033eaf5c3570a57.log | head -60
-  3  bash      0.0     5163    56,379    position  tail -100 /var/folders/fb/y3035y052kd71b4fr6jq2p2w0000gn/T/pi-bash-4033eaf5c3570a57.log [batched]
-  4  bash      23.7    1528    58,171    position  cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts 2>&1 | tail -20
-  5  bash      23.7    11      58,182    pattern   cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && timeout 300 bun test /private/tmp/long-buried-fixture 2>&1 | grep -E "^\(fail\)|^✗|^ (fail)|expect\(|AssertionError|Expected|Received|at " | head -80 [batched]
-  6  bash      0.0     11      58,193    pattern   cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && timeout 300 bun test /private/tmp/long-buried-fixture 2>&1 | grep -E "^\(fail\)|fail|FAIL|Error|error|expect" | head -60
-  7  bash      0.0     38      58,231    position  cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && timeout 300 bun test /private/tmp/long-buried-fixture 2>&1 | tail -10
-  8  bash      179.9   214     58,445    position  cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 | tail -10
-  9  bash      180.1   2240    60,733    pattern   cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 | grep -A 40 "fail.*load part 05.*step 15\|load part 05.*step 15.*fail"
-  10 bash      179.9   8       60,860    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture > /tmp/fixture-out.txt 2>&1; echo "exit: $?"
+  1  bash      120.0   50584   50,814    full-read cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
+  2  bash      0.0     274     51,216    pattern   grep -E "^\(fail\)|^✗|error:|Error:|FAIL|failed" /var/folders/fb/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/T/pi-bash-4033eaf5c3570a57.log | head -60
+  3  bash      0.0     5163    56,379    position  tail -100 /var/folders/fb/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/T/pi-bash-4033eaf5c3570a57.log [batched]
+  4  bash      23.7    1528    58,171    position  cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts 2>&1 | tail -20
+  5  bash      23.7    11      58,182    pattern   cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && timeout 300 bun test /private/tmp/long-buried-fixture 2>&1 | grep -E "^\(fail\)|^✗|^ (fail)|expect\(|AssertionError|Expected|Received|at " | head -80 [batched]
+  6  bash      0.0     11      58,193    pattern   cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && timeout 300 bun test /private/tmp/long-buried-fixture 2>&1 | grep -E "^\(fail\)|fail|FAIL|Error|error|expect" | head -60
+  7  bash      0.0     38      58,231    position  cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && timeout 300 bun test /private/tmp/long-buried-fixture 2>&1 | tail -10
+  8  bash      179.9   214     58,445    position  cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 | tail -10
+  9  bash      180.1   2240    60,733    pattern   cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 | grep -A 40 "fail.*load part 05.*step 15\|load part 05.*step 15.*fail"
+  10 bash      179.9   8       60,860    full-read cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture > /tmp/fixture-out.txt 2>&1; echo "exit: $?"
   11 bash      0.0     2851    63,711    pattern   grep -n "step 15\|expect\|AssertionError\|Expected\|Received\|●\|✗\|at " /tmp/fixture-out.txt | head -60
   12 bash      0.0     1864    65,575    position  sed -n '605,660p' /tmp/fixture-out.txt
 
-vanilla-2  /private/tmp/cells/long-buried/vanilla-2/2026-09-28T18-32-09-277Z_01a0e949-e53c-765c-95b1-102db3d6d6ca.jsonl
+vanilla-2  docs/benchmark/runs/long-buried/sessions/vanilla-2/2026-09-28T18-32-09-277Z_01a0e949-e53c-765c-95b1-102db3d6d6ca.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bash      60.0    34964   35,194    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
-  2  bash      203.6   49970   85,874    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
+  1  bash      60.0    34964   35,194    full-read cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
+  2  bash      203.6   49970   85,874    full-read cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
 
-vanilla-3  /private/tmp/cells/long-buried/vanilla-3/2026-09-28T18-44-28-546Z_01a0e955-2d01-747e-a6ce-15d7e878ec34.jsonl
+vanilla-3  docs/benchmark/runs/long-buried/sessions/vanilla-3/2026-09-28T18-44-28-546Z_01a0e955-2d01-747e-a6ce-15d7e878ec34.jsonl
   #  tool      wait_s  result  cum_ctx   locate    command
-  1  bash      120.0   50586   50,824    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
-  2  bash      0.0     11      51,100    pattern   grep -E "^\(fail\)|^error:|^ error " /var/folders/fb/y3035y052kd71b4fr6jq2p2w0000gn/T/pi-bash-e6329ced2426546c.log | head -60
-  3  bash      0.0     10323   61,423    position  tail -200 /var/folders/fb/y3035y052kd71b4fr6jq2p2w0000gn/T/pi-bash-e6329ced2426546c.log [batched]
-  4  bash      180.1   1635    63,945    pattern   cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 | grep -E "^\(fail\)|^\(pass\)|^error|Tests |Fail|Pass|summary" | tail -40
-  5  bash      179.9   11      64,091    pattern   cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 | grep -A 40 "^\(fail\)" | head -80
-  6  bash      180.2   14641   78,732    pattern   cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 > /tmp/fixture-run.log; grep -n "fail\|error\|Error\|expect\|assert\|threw\|throw" /tmp/fixture-run.log | head -60
+  1  bash      120.0   50586   50,824    full-read cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
+  2  bash      0.0     11      51,100    pattern   grep -E "^\(fail\)|^error:|^ error " /var/folders/fb/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/T/pi-bash-e6329ced2426546c.log | head -60
+  3  bash      0.0     10323   61,423    position  tail -200 /var/folders/fb/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/T/pi-bash-e6329ced2426546c.log [batched]
+  4  bash      180.1   1635    63,945    pattern   cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 | grep -E "^\(fail\)|^\(pass\)|^error|Tests |Fail|Pass|summary" | tail -40
+  5  bash      179.9   11      64,091    pattern   cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 | grep -A 40 "^\(fail\)" | head -80
+  6  bash      180.2   14641   78,732    pattern   cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test /private/tmp/long-buried-fixture 2>&1 > /tmp/fixture-run.log; grep -n "fail\|error\|Error\|expect\|assert\|threw\|throw" /tmp/fixture-run.log | head -60
 
 summary (median [min–max]; arms with a single session have no median)
   vanilla (3 sessions)
