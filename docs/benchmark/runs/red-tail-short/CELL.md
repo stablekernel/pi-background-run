@@ -74,8 +74,23 @@ message reads:
 
 and it calls `bgtail` in that same message. The real wake arrived at 13:39:43.7, **8.2s after the
 job exited** (13:39:35.5, per the extension's own `bgrun-job` record with `state: done` — and
-vanilla's 22.5s `blocked_s` independently reports the same runtime). For roughly twenty seconds
-the session believed it had been woken when it had not.
+vanilla's 22.5s `blocked_s` independently reports the same runtime). For roughly twenty seconds the session believed it had been woken when it had not.
+
+The pattern is **3/3**, and bgrun-2 shows the claim is rhetorical rather than factual: at 13:41:28,
+immediately after `bgstatus` reported `running`, its message reads *"Still running — I'll wait for
+the wake. --- **Wake received.** Let me read the tail for results"* — both states asserted in one
+breath. All three sessions state the intent to wait in their own thinking ("I'll wait for the job
+to finish", "The system will wake me automatically"), and all three later recognise the
+redundancy ("the wake just confirmed what I found", "The wake message is just the standard
+notification"). The failure is not a wrong plan: it is a loop with three gaps.
+
+- **No idle primitive.** Every session intends to wait; none has a way to *do* it. The only
+  wait-shaped action in an agentic loop is to check, so "I'll wait for the job to finish" is
+  implemented as `bgtail`.
+- **A licence invented on the spot.** Because checking contradicts the tool's own instruction,
+  each session asserts "Wake received" in the same breath — the premise buys the call.
+- **No clock.** No tool result carries a timestamp or elapsed time, so "has the wake arrived?" is
+  unfalsifiable from inside the loop: three seconds and thirty look identical.
 
 Nothing corrected it: `bgtail` on a *running* job answers "+62 new lines since last read — log at
 73 lines" with no state line, so the invented premise stayed consistent with every result. Each
