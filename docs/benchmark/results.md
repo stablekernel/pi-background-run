@@ -310,6 +310,38 @@ the session searched it (`bggrep`, `locate` flipping from `position` to `pattern
 reading it in pieces. Wall time did **not** invert: the cell stays negative, exactly as the floor
 argument predicted, because the job is 23.2s and the wake lands ~7s after it exits.
 
+## Cell 3 — `trace-root`, measured 2026-09-28
+
+Six sessions on the fixed extension (bench `d948560`), same fixture sha `605aba38baf5c6ad`. Full
+record: [runs/trace-root/CELL.md](runs/trace-root/CELL.md).
+
+| metric (median) | bgrun | vanilla |
+|---|---|---|
+| wall_s | 37.5 [37.1–39.5] | 34.5 [34.4–36.2] |
+| blocked_s | 0.0 | 22.6 |
+| ctx_chars | **9,758** | 28,271 |
+| calls | 2 | 1 |
+| `harness.ts` in context | **0, 0, 0** | **2, 2, 2** |
+| deepest frame seen | `part-02.test.ts` | `harness.ts` |
+| diag_reach | 3/3 | 3/3 |
+
+**The bgrun arm never saw the cause.** The fixture puts it in a file of its own; vanilla's single
+synchronous read carries the whole log and names it (*"Assertion error in `harness.ts:28`"*), while
+the bgrun arm's pattern search — for failure words, which the frame line
+`at loadStep (.../harness.ts:28:9)` does not contain — filtered it out, and the counts-only wake
+digest pointed at nothing better. That is the cell's prediction confirmed by its intended mechanism,
+with the loss coming from the session's own grep rather than from condensation (`H10` stays
+falsified).
+
+**The efficiency result is real and it was bought with the diagnosis:** 65% less context and 3s more
+wall, on a cell whose whole point is following the symptom to the root. `H9 <digest-starves>` gets
+its first behavioural entry in the narrow form. `H11` is **not** tested here: `cause_reached` reads 1
+in both arms for definitional reasons (it is session-relative — the deepest frame *that session saw*),
+so it must be read with `cause_file`; on a fixture with a separate cause file, the informative
+question is whether that file appears at all, and it appeared 0/3 against 3/3. The ladder is what
+would test `H11`, and a weak rung on the vanilla arm would still see `harness.ts` — a confound the
+ladder will have to control for.
+
 ## Blocked on
 
 - Phase 1 instrument work is closed: `locating`, the shape and evidence-path instruments,
