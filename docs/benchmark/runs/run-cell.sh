@@ -93,7 +93,7 @@ run_one() {
   echo "prompt: $prompt"
   echo
 
-  if [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+  if [ "$dry" != 1 ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
     echo "error: $dir already holds a transcript." >&2
     echo "       Move it aside, or use --variant NAME to write a fresh set:" >&2
     echo "       the profiler reads the first *.jsonl in a dir, so a stale one" >&2
