@@ -5,17 +5,33 @@
 are yours. Everything that could be built and verified without a session is built, verified
 and committed.
 
-## Your part
+## Your part — one command
 
-Each cell is six sessions: three with bgrun, three without, one session directory per run,
-quit gracefully afterwards (`/quit` — a session killed mid-turn writes no transcript, and
-the transcript *is* the measurement). Each run sheet is self-contained:
+```sh
+cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc/docs/benchmark/runs
+./run-cell.sh red-tail-short              # six sessions, one at a time
+./run-cell.sh red-tail-short --dry-run    # print the six commands, launch nothing
+# then: ./run-cell.sh trace-root, ./run-cell.sh long-buried
+```
+
+Each run hands the terminal to `pi`; you drive the session and quit it with `/quit` once the
+failure has been reported. The script does the rest: the banner and exact command, a per-run
+**transcript check** (it stops rather than let a half-written session pass), a refusal to start
+a run whose session dir already holds a transcript (the profiler reads the first `*.jsonl`, so
+a stale one would shadow the new run), and the cell's profile at the end —
+`.bench-runs/<cell>/profile.{txt,csv}`.
+
+Runs are **interleaved** (`bgrun-1, vanilla-1, bgrun-2, …`): six sessions span roughly half an
+hour, and interleaving puts any drift in host load or thermals on both arms instead of on
+whichever arm ran last.
+
+The run sheets below remain the record of what each cell fixes and what it is judged on:
 
 | cell | fixture | cost per run |
 |---|---|---|
-| [red-tail-short](runs/red-tail-short/RUNSHEET.md) | `/private/tmp/red-tail-fixture` (ready) | ~30s |
-| [trace-root](runs/trace-root/RUNSHEET.md) | `/private/tmp/trace-root-fixture` (ready) | ~30s |
-| [long-buried](runs/long-buried/RUNSHEET.md) | `/private/tmp/long-buried-fixture` (ready) | ~180s |
+| [red-tail-short](red-tail-short/RUNSHEET.md) | `/private/tmp/red-tail-fixture` (ready) | ~30s |
+| [trace-root](trace-root/RUNSHEET.md) | `/private/tmp/trace-root-fixture` (ready) | ~30s |
+| [long-buried](long-buried/RUNSHEET.md) | `/private/tmp/long-buried-fixture` (ready) | ~180s |
 
 ## Done in the meantime (no sessions needed)
 
