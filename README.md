@@ -735,8 +735,9 @@ slower; for an expensive one (~204s, 570 tests, 1,281 lines) it pays the job onc
 (225.9s against vanilla's 696.2s) at a quarter of the context (18,760 against
 79,901), because the synchronous session re-runs the suite. Diagnosis is a tie there.
 The load-bearing change behind the wake's failure pointer was two sentences of
-language-neutral framing, not ecosystem-specific parsing, and a pointer that can be
-wrong costs more than no pointer. Limits — n=3, one model, one synthetic fixture
+language-neutral framing, not ecosystem-specific parsing, and a pointer is a lead the
+session must still verify: with a cheap search available, that costs more than it saves,
+whether or not the pointer is correct. Limits — n=3, one model, one synthetic fixture
 family — and what the runs do *not* establish are in the document.
 
 ## Releasing

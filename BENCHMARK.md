@@ -28,8 +28,8 @@ counts characters of transcript text, not billed tokens. Source: `method.md`.
 **Limits, stated here rather than in a footnote.** n=3 per arm; one model; one fixture
 family; one machine. The fixture is synthetic — it has no flaky tests, retries, parallel
 workers or enormous stack traces. Three runs demonstrate an effect; they do not
-generalise, and no significance is claimed anywhere in this document. The one number
-quoted with a caveat is the pointer variant in Cell 4, and the caveat is stated with it.
+generalise, and no significance is claimed anywhere in this document. The numbers
+quoted with a caveat are Cell 4's two pointer runs, and the caveat is stated with each.
 
 ## The regime split
 
@@ -91,33 +91,45 @@ point: the fix is language-neutral instruction, not ecosystem-specific parsing. 
 JS/TS-tuned built-in locator was deleted in favour of this framing plus optional presets,
 and a nine-entry multi-runner corpus re-run showed nothing regressed (commit `e7c1934`).
 
-## A pointer that can be wrong costs more than no pointer
+## A pointer is a lead the session still has to verify — and that costs
 
 The presets and the `on: "failure"` gate put a *pointer* — a named failure and its source
-frame — in the wake. Cell 4's variant (`runs/long-buried-tracepreset/profile.csv`,
-summarised in `runs/long-buried/CELL.md`) was that layer's first behavioural exercise, and
-it went wrong in an instructive way:
+frame — in the wake. Cell 4 ran that layer three ways, each run changing one thing
+(`runs/long-buried/CELL.md`, profiles beside it):
 
-| Cell 4 | no pointer | pointer |
-|---|---|---|
-| `calls` | 3, 4, 4 | 5, 5, 6 |
-| `ctx_chars` | 18,760 | 28,633 [21,867–31,481] |
-| `wall_s` | 225.9 | 233.1 |
+| Cell 4, bgrun arm | no pointer | pointer, wrong | pointer, correct |
+|---|---|---|---|
+| `calls` | 3, 4, 4 | 5, 5, 6 | 5, 5, 8 |
+| `ctx_chars` | 18,760 [16,365–21,056] | 28,633 [21,867–31,481] | 33,799 [29,180–36,355] |
+| `wall_s` | 225.9 | 233.1 | 234.0 |
 
-The `js-trace` preset fired and named
-`Failure: (pass) preset js-trace corpus (captured): …` — **a passing test's name**. The
+Ranges do not overlap on calls (baseline max 4, both variants min 5) or context (baseline
+max 21,056, correct variant min 29,180). Both variants reached the same
+`part-05.test.ts`.
+
+**First run — the pointer was wrong.** The `js-trace` preset named
+`Failure: (pass) preset js-trace corpus (captured): …`, **a passing test's name**. The
 cause is self-reference: the suite under test contains the preset's own corpus tests,
 which print captured failure text, so the log holds failure-shaped strings from passing
-tests, and a text scanner cannot tell them from a real one. The sessions did not trust the
-pointer — calls rose and context rose ~50% — and reached the same `part-05.test.ts`
-anyway. The scan itself costs ~20ms against a 204s job; the price is that a claim which
-may be wrong must be verified.
+tests, and an unanchored scanner cannot tell them from a real one.
 
-**The design rule this buys: a pointer that can be wrong must be conservative — a wrong
-pointer costs more than no pointer.** The fix, accordingly, is conservative *emission*
-(say nothing rather than guess), not better guessing. The attribution caveat: this
-workload is the extension's own test suite, which is a pathological digest input, so the
-*rule* generalises further than the *number* does.
+**Second run — the pointer was fixed and still cost more.** After the preset required
+anchored evidence, all three wakes named the true failure
+(`AssertionError … at TestContext.<anonymous> (/private/tmp/long-buried-fixture/part-05.test.ts:59:9)`),
+and the cost rose again, not fell. The sequences say why: `bgrun bggrep bggrep bgtail bggrep`
+— every session *verified* the pointer and searched anyway, doing more work than a baseline
+which had nothing to verify. `calls_after_exit` is 4, 4, 6 against the baseline's 2, 2, 3.
+The wake's own honest hedge — *"any failure named here (by a trace digest) is one failure,
+not the whole story"* — makes a pointer a lead rather than an answer, and dropping that hedge
+to make the pointer land would be tuning the instrument to the result.
+
+**The rule: a pointer is a hypothesis the session must still verify, and where it can search
+cheaply that costs more than it saves.** Its value should be conditional on the session
+*lacking* a cheap search — a log too large or too hostile to grep, a tool-less agent, or a
+weaker model, which is `H7`/`H8`'s territory. The defect fix stands on its own merits
+(conservative emission: say nothing rather than guess). Attribution caveat: this workload is
+the extension's own test suite, a pathological digest input, so the *rule* generalises further
+than the *number* does.
 
 ## The layer boundary
 
@@ -166,10 +178,12 @@ tempting. It is a mechanism result about the tool, not a claim about agents in g
   `parallel-jobs`, `resume-midrun`, `peek-midrun`, `fast-verbose`, `fail-fast`,
   `green-short`) are **not run** — see the status table in `results.md`. Nothing in this
   document speaks to them.
-- **Whether the pointer *adds* anything on top of the framing** is not established: the
-  Cell 4 variant measured the pointer against the framing-only baseline and the pointer
-  cost more, on a pathological input. A clean measurement on a project where the suite
-  does not contain the preset's own corpus is not in the record.
+- **Whether the pointer *adds* diagnostic value on top of the framing** is answered in the
+  negative *for this regime*: with the preset corrected, the pointer cost more than no
+  pointer — calls 5, 5, 8 and context 33,799 against 3, 4, 4 and 18,760 — because the
+  session verified it and searched anyway. What is still not in the record is a project
+  whose suite does not contain the preset's own corpus, or a session without a cheap
+  search. That is why the rule is stated as conditional rather than the layer removed.
 - **Unattended cells are impossible on this setup** (`H6 <unattended>`: negative), so
   every cell above was driven with a human in the session. That bounds what may be claimed
   for them, and it is a method difference between cells, not a footnote.
