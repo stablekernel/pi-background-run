@@ -90,8 +90,16 @@ export const DIGEST_PRESETS: DigestPreset[] = [
   suggestedType: "test",
   // One awk pass. (1) First signature line — V8/bun `(fail)`, node:test/ Jest
   // `✗`/`✖`, go `--- FAIL`, cargo `FAILED`, `AssertionError`, JVM
-  // `Exception in thread`. (2) The first NON-runtime frame within a 60-line
-  // forward cap (runtime/internal frames — node:internal, /rustc/, Go's GOROOT
+  // `Exception in thread`. A signature must be EVIDENCE of a failing test: the
+  // runner's `(fail)` / `--- FAIL` markers are line-leading records, so they are
+  // anchored (`^[[:space:]]*`) — a mid-line mention of "(fail)" in a test's
+  // printed name is not a failure. A line that is itself a pass record
+  // (`(pass) …`) is never a signature, whatever it contains: a passing test's
+  // name can carry "FAILED"/"AssertionError"/"(fail)" as text (a suite that
+  // prints captured failure logs does exactly this), and a wrong pointer costs
+  // more than none. With no genuine signature the preset prints nothing. (2) The
+  // first NON-runtime frame within a 60-line forward cap (runtime/internal
+  // frames — node:internal, /rustc/, Go's GOROOT
   // src (…/go/src/ or …/libexec/src/), /library/std|core/ — are excluded by
   // path, so the user frame wins
   // over the stdlib one Go/Rust print first). (3) If none, the earliest frame of
@@ -99,7 +107,7 @@ export const DIGEST_PRESETS: DigestPreset[] = [
   // above the `(fail)` line. The 60-line cap is where the old built-in
   // FRAME_LOOKAHEAD lives on; the backward run is FRAME_LOOKBEHIND. Prints
   // nothing when no signature is found.
-  command: String.raw`awk 'function trim(s){gsub(/^[ \t]+|[ \t]+$/,"",s);return s} function ex(l){return l ~ /node:internal|\/rustc\/|\/libexec\/src\/|\/go\/src\/|\/library\/(std|core)\/|\(node:/} function fr(l){ return !ex(l) && ( (l ~ /^[ \t]*at[ \t]+([^(]+[ \t]+\()?[^ \t()]+\.(ts|tsx|js|jsx|mjs|cjs|mts|cts|go|rs|java|kt|scala|swift|cs|c|h|cpp|php|lua):[0-9]+:[0-9]+\)?[ \t]*$/) || (l ~ /^[ \t]+[^ \t]+\.go:[0-9]+( \+0x[0-9a-f]+)?[ \t]*$/) || (l ~ /^[ \t]*at [^()]+\([^()]+\.(java|kt|scala):[0-9]+\)[ \t]*$/) ) } {L[NR]=$0} END{ for(i=1;i<=NR;i++) if(L[i] ~ /(\(fail\)|${TRACE_GLYPHS}|--- FAIL)|(^|[^[:alnum:]_])FAIL(ED|URE)?([^[:alnum:]_]|$)|AssertionError|Exception in thread/){f=i;break} if(!f)exit; for(j=f+1;j<=NR&&j<=f+60;j++) if(fr(L[j])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[j]);exit} s=f-1; while(s>=1&&fr(L[s]))s--; if(s+1<=f-1&&fr(L[s+1])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[s+1]);exit} print "Failure: "trim(L[f]) }' "$1" | head -1`,
+  command: String.raw`awk 'function trim(s){gsub(/^[ \t]+|[ \t]+$/,"",s);return s} function ex(l){return l ~ /node:internal|\/rustc\/|\/libexec\/src\/|\/go\/src\/|\/library\/(std|core)\/|\(node:/} function fr(l){ return !ex(l) && ( (l ~ /^[ \t]*at[ \t]+([^(]+[ \t]+\()?[^ \t()]+\.(ts|tsx|js|jsx|mjs|cjs|mts|cts|go|rs|java|kt|scala|swift|cs|c|h|cpp|php|lua):[0-9]+:[0-9]+\)?[ \t]*$/) || (l ~ /^[ \t]+[^ \t]+\.go:[0-9]+( \+0x[0-9a-f]+)?[ \t]*$/) || (l ~ /^[ \t]*at [^()]+\([^()]+\.(java|kt|scala):[0-9]+\)[ \t]*$/) ) } {L[NR]=$0} END{ for(i=1;i<=NR;i++) if((L[i] ~ /(^[[:space:]]*\(fail\)|${TRACE_GLYPHS}|^[[:space:]]*--- FAIL)|(^|[^[:alnum:]_])FAIL(ED|URE)?([^[:alnum:]_]|$)|AssertionError|Exception in thread/) && L[i] !~ /^[ \t]*\(pass\)/){f=i;break} if(!f)exit; for(j=f+1;j<=NR&&j<=f+60;j++) if(fr(L[j])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[j]);exit} s=f-1; while(s>=1&&fr(L[s]))s--; if(s+1<=f-1&&fr(L[s+1])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[s+1]);exit} print "Failure: "trim(L[f]) }' "$1" | head -1`,
  },
  {
   id: "py-trace",

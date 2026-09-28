@@ -4496,6 +4496,39 @@ for (const c of TRACE_CORPUS) {
   });
 }
 
+// A preset must anchor on evidence of a failing test, not on any line that
+// merely contains a failure word. This suite's own PASSING tests print captured
+// failure logs, so a real `bun test` run over it contains `(pass)` lines whose
+// names carry `(fail)` / `FAILED` / `AssertionError` as text. When the only such
+// line is a pass record the preset must stay silent: a wrong pointer costs more
+// than none.
+test("preset js-trace: a passing test named after `(fail)` never wins over the real failure", () => {
+  // Minimized verbatim slice of the real job log (lines 101, 893, 900, 944): a
+  // PASSING corpus test whose name mentions the `(fail)` summary precedes the
+  // actual failing test's `AssertionError` and its frame.
+  const log = [
+    "(pass) preset js-trace corpus (captured): bun test — stack above the `(fail)` summary (backward + earliest-of-run) [19.06ms]",
+    "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:",
+    "    at TestContext.<anonymous> (/private/tmp/long-buried-fixture/part-05.test.ts:59:9)",
+    "(fail) load part 05 > step 15 [1.29ms]",
+  ].join("\n");
+  assert.equal(
+    runPreset("js-trace", log),
+    "Failure: AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal: — at TestContext.<anonymous> (/private/tmp/long-buried-fixture/part-05.test.ts:59:9)\n",
+  );
+});
+
+test("preset js-trace: failure words only inside pass records yield no pointer", () => {
+  // Real `(pass)` lines 102 and 104: their names carry `AssertionError` and
+  // `FAILED` as text. No genuine failure signature exists, so the preset prints
+  // nothing rather than name a passing test.
+  const log = [
+    "(pass) preset js-trace corpus (captured): node --test — AssertionError header, payload, then stack [16.37ms]",
+    "(pass) preset js-trace corpus (captured): cargo test — FAILED header; rust std frames skipped, user frame wins [16.17ms]",
+  ].join("\n");
+  assert.equal(runPreset("js-trace", log), "");
+});
+
 // ── failure-only digest (`on: "failure"`), enforced by the framework ───────
 //
 // A digest command receives only the log path — never the exit code — so the
