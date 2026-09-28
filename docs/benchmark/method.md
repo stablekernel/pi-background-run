@@ -282,3 +282,41 @@ number here can be re-checked from the transcripts it came from.
   so wherever it matters.
 - Live sessions are expensive to reproduce, which is itself a property of the tool
   worth naming.
+
+## Recording and presentation rules
+
+Each of these was learned the hard way in this benchmark. They govern what a record shows and
+how it is written — not how a cell is measured.
+
+1. **Numbers shown are the current tool's.** A cell section leads with the newest run of that
+   cell. Superseded runs are kept as *labelled* history inside the section whose finding they
+   support ("before the poll fix"), never as a competing headline. If a reader has to work out
+   which generation a displayed number came from, the document is broken.
+2. **A superseded cell is re-run, not re-presented.** If the tool moved under a cell and no run
+   of the current version exists, mark the cell as **needing a re-run** rather than displaying
+   numbers for a build nobody uses. The three states are: current, labelled history, awaiting a
+   re-run.
+3. **Pin behaviour, not bytes.** A fixture is identified by what it *does* — file and test
+   counts, the failing test's name, the trace shape, the duration class — plus the knobs that
+   generate it. A sha is a digest recorded for reference, never the contract: a blank line
+   moving a hash is not a finding, and the conformance test asserts behaviour, so a pure byte
+   change must not fail it.
+4. **Pins live in tests, not in prose.** A claim that must stay true belongs somewhere that
+   enforces it; `scripts/make-dummy-suite.test.ts` is the model. Prose pins rot and need a human
+   to keep them honest, while a test cannot quietly stop being true.
+5. **Cite what resolves.** A hash in a document must be reachable from the branch the reader is
+   on. Squash-merges mean the pre-squash commits are not ancestors of `main` — cite the squash
+   commit, or describe the change without a hash. A dead end teaches the reader to distrust the
+   rest.
+6. **Every number maps to a source.** A figure in prose names its `profile.csv` column or
+   `CELL.md` line. Summaries especially: that is where unsourced numbers breed.
+7. **Narration comes from the transcripts.** "Why the numbers came out that way" is read from
+   the session records and quoted — not reconstructed from plausibility.
+8. **Records are records.** `RUNSHEET.md`, `CELL.md`, `profile.*` and `sessions/` are evidence of
+   what ran. Do not retrofit a newer standard into them; annotate with a dated line instead.
+   Rewriting a record makes it stop being one.
+9. **Gaps go in the issue tracker.** A checked-in gap list duplicates the tracker, cannot be
+   closed, and splits the source of truth. File an issue rather than adding a `KNOWN-GAPS.md`.
+10. **Keep the boundary.** Unrun cells, falsified hypotheses and stated limits stay in the
+    record. Collapse the prose around them when it is bloated, but never delete the markers: a
+    benchmark that drops its untested cases claims more than it measured.
