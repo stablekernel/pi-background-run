@@ -116,7 +116,7 @@ the earlier four runs remain valid as run-to-run stability evidence within one
 environment.
 
 **Provenance**: `bun scripts/pty-shape.ts`, run in
-`~/sk/pi-bgrun.ptyshape` at `8e63fc8`, then re-run in both
+`~/sk/pi-bgrun.ptyshape` at the since-removed `pi-bgrun.ptyshape` checkout - reproducible instead from `scripts/pty-shape.ts`, which generates its own fixture, then re-run in both
 environments to confirm; `bun test scripts/pty-shape.test.ts` — 4 tests pass;
 `tsc --noEmit` clean.
 
