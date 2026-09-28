@@ -41,3 +41,9 @@ rather than an instruction.
 - **It found a trap, which is what an instrument check is for**: the profiler's directory
   target is *one* session (its first `*.jsonl`, sorted). A flat shared session dir
   therefore profiled one run and silently dropped the other.
+
+**The two manual pilot transcripts are not in this repository.** They were committed once and
+later removed, and because a removed file stays in git history while remaining fetchable, both
+were purged from this branch's history on 2026-09-28 (rewrite of `bench/dogfooding`, unpushed,
+so no published history changed). The rows above are kept as the pilot's record; the transcripts
+themselves survive outside any repository. Their numbers were never used in `results.md`.
