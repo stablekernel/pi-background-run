@@ -71,5 +71,44 @@ digest input for this reason. That makes the *number* less general than the *rul
 underlying preset defect (naming a passing test) needs fixing on its own merits, from this log —
 which is kept at `<bench>/.pi-bgrun/jobs/bun-tests-1790622377-55299.log`.
 
+## Variant 2 — the fixed pointer (2026-09-28)
+
+After `75a2c1f` anchored the preset on real evidence, the same cell ran again
+(`--variant tracepreset-fixed --arms bgrun`, three sessions; vanilla omitted by design — see the
+RUNSHEET). All three wakes now named the *true* failure, identically:
+
+```
+digest (test): Failure: AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal: — at TestContext.<anonymous> (/private/tmp/long-buried-fixture/part-05.test.ts:59:9)
+```
+
+That is the right file and the right frame. The cost went **up**, not down:
+
+| run | pointer | calls | ctx_chars | wall_s |
+|---|---|---|---|---|
+| `long-buried` | none | 3, 4, 4 | 18,760 [16,365–21,056] | 225.9 |
+| `long-buried-tracepreset` | wrong | 5, 5, 6 | 28,633 [21,867–31,481] | 233.1 |
+| `long-buried-tracepreset-fixed` | **correct** | 5, 5, 8 | **33,799** [29,180–36,355] | 234.0 |
+
+The ranges do not overlap on calls (baseline max 4, both variants min 5) or on context (baseline max
+21,056, fixed variant min 29,180). The sequences say why: `bgrun bggrep bggrep bgtail bggrep` — every
+session *verified* the pointer and then searched anyway, doing more work than the baseline that had no
+pointer to verify. `calls_after_exit` is 4, 4, 6 against the baseline's 2, 2, 3.
+
+Why it cannot simply be blamed on the wrong pointer being wrong: the wake's own honest hedge —
+*"any failure named here (by a trace digest) is one failure, not the whole story"* — marks the pointer
+as a lead rather than an answer, and a lead must be checked. Removing the hedge to make the pointer
+land would be tuning the instrument to the result, which is the failure mode this whole exercise
+exists to avoid.
+
+**The rule, now with a correct pointer as evidence: a pointer is a hypothesis the session must still
+verify. Where the session can search cheaply, that hypothesis costs more than it saves.** The pointer's
+value should therefore be conditional on the session *lacking* a cheap search — a log too large or too
+hostile to grep, a tool-less agent, or a weaker model (which is what `H7`/`H8` would test). With
+`bggrep` available and a 1,281-line log, it is a cost.
+
+Two footnotes: the workload grew by two tests between runs (570 → 572, ~0.4s, from the new preset
+regression tests), and `Ran 572 tests across 13 files. [203.55s]` shows the job itself is unchanged —
+so the ~8s of extra wall is the sessions' own extra calls.
+
 Restore by **deleting** `.pi/pi-bgrun.json`; the battery's other cells all ran without one. The
 pilot cell (in the product repo) remains the only cell that has ever run with a digest configured.

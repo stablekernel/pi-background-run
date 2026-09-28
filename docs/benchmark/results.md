@@ -405,10 +405,19 @@ not trust it — calls rose from 3–4 to 5–6, context ~50% — and still reac
 scan cost is irrelevant (~20ms against 204s); the price is that a claim which may be wrong must be
 verified.
 
-**Design rule, now measured: a pointer that can be wrong must be conservative — a wrong pointer costs
-more than no pointer** (4 calls / 18.8k with none, against 5.3 calls / 28.6k with this one). The
-preset defect is being fixed from the kept log,
-`<bench>/.pi/pi-bgrun/jobs/bun-tests-1790622377-55299.log`. Attribution caveat: the workload is the
+**Design rule, now measured twice: a pointer is a hypothesis the session must still verify, and where
+it can search cheaply that costs more than it saves.** A third run — the preset *fixed* to require real
+evidence, after which every wake named the true failure
+(`AssertionError … at /private/tmp/long-buried-fixture/part-05.test.ts:59:9`) — cost the *most*: calls
+5, 5, 8 and context 33,799 [29,180–36,355], against 3, 4, 4 and 18,760 for no pointer at all. Calls
+and context are non-overlapping between the baseline and both pointer variants. The sessions verified
+the pointer and searched anyway (`bgrun bggrep bggrep bgtail bggrep`), because the wake's honest hedge
+— "any failure named here is one failure, not the whole story" — makes it a lead rather than an answer.
+The pointer's value should therefore be conditional on the session lacking a cheap search: a log too
+large or hostile to grep, a tool-less agent, or a weaker model (what `H7`/`H8` would test). The
+wrong-pointer run's number for comparison: 4 calls / 18.8k with none, 5.3 / 28.6k with a wrong one,
+5.7 / 33.8k with a correct one. The preset defect itself is fixed from the kept log; the design rule is
+what the three-way shows. Attribution caveat: the workload is the
 extension's own suite, which is a pathological digest input, so the *rule* generalises further than
 the *number* does.
 

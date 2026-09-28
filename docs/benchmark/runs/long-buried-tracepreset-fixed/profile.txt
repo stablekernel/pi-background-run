@@ -1,0 +1,41 @@
+label                 arm    execs fg handoff wall_s blocked_s idle_s sleep_s ctx_chars diag    locate    cause  calls
+bgrun-1               bgrun  1    0  1      234.0  0.0      234.0  0.0    33,799   up+down pattern   reached 5
+bgrun-2               bgrun  1    0  1      232.8  0.0      232.8  0.0    29,180   up+down pattern   reached 5
+bgrun-3               bgrun  1    0  1      256.3  0.0      256.3  0.0    36,355   up+down pattern   reached 8
+
+bgrun-1  /private/tmp/cells/long-buried-tracepreset-fixed/bgrun-1/2026-09-28T21-01-34-780Z_01a0e9d2-b2bb-7688-9db4-06c20dc58aea.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bgrun     0.0     320     670       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
+  2  bggrep    0.0     8155    9,854     pattern   bun-tests-1790629300-17169
+  3  bggrep    0.0     8179    18,339    pattern   bun-tests-1790629300-17169
+  4  bgtail    0.0     5953    24,564    position  bun-tests-1790629300-17169
+  5  bggrep    0.0     8010    32,637    pattern   bun-tests-1790629300-17169
+
+bgrun-2  /private/tmp/cells/long-buried-tracepreset-fixed/bgrun-2/2026-09-28T21-07-14-125Z_01a0e9d7-e04c-7419-8217-f102a2d5acae.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bgrun     0.0     320     637       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture
+  2  bggrep    0.0     8199    9,784     pattern   bun-tests-1790629638-39252
+  3  bggrep    0.0     8136    18,168    pattern   bun-tests-1790629638-39252
+  4  bggrep    0.0     8213    26,697    pattern   bun-tests-1790629638-39252
+  5  bgtail    0.0     1260    28,073    position  bun-tests-1790629638-39252
+
+bgrun-3  /private/tmp/cells/long-buried-tracepreset-fixed/bgrun-3/2026-09-28T21-12-22-628Z_01a0e9dc-9564-779a-add4-d27b6b3f59c0.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bgrun     0.0     320     635       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/long-buried-fixture 2>&1
+  2  bggrep    0.0     8170    9,792     pattern   bun-tests-1790629947-56941
+  3  bggrep    0.0     8160    18,205    pattern   bun-tests-1790629947-56941
+  4  bgtail    0.0     3884    22,455    position  bun-tests-1790629947-56941
+  5  bggrep    0.0     175     22,630    pattern   bun-tests-1790629947-56941 [batched]
+  6  bggrep    0.0     8232    30,968    pattern   bun-tests-1790629947-56941
+  7  bash      0.0     2272    33,347    pattern   grep -n "part 05\|part-05\|step 15\|AssertionError\|Expected\|+ \|- \|at " /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc/.pi-bgrun/jobs/bun-tests-1790629947-56941.log | grep -A5 -B5 "part 05.*step 15\|part-05.*59" | head -60
+  8  read      0.0     1860    35,301    position  /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc/.pi-bgrun/jobs/bun-tests-1790629947-56941.log
+
+summary (median [min–max]; arms with a single session have no median)
+  bgrun (3 sessions)
+    execs      1.0 [1.0–1.0]
+    wall_s     234.0 [232.8–256.3]
+    blocked_s  0.0 [0.0–0.0]
+    idle_s     234.0 [232.8–256.3]
+    sleep_s    0.0 [0.0–0.0]
+    ctx_chars  33,799 [29,180–36,355]
+    diag_reach 3/3
