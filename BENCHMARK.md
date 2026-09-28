@@ -11,6 +11,11 @@ every number comes from a named cell, and the record behind each one — the pro
 the predictions written before the runs, the per-cell transcripts — is listed under
 [Provenance](#provenance).
 
+**In a hurry?** [`docs/benchmark/AT-A-GLANCE.md`](docs/benchmark/AT-A-GLANCE.md) is the
+same case in a few minutes: one section per measured cell (what it tested, the bgrun-versus-
+vanilla numbers, and what each arm's agent actually did), where bgrun does not help, and the
+three-way pointer result. This document is the full treatment behind it.
+
 ## How a cell is run
 
 A cell is a **fixture × arm × context** at one model. The `bgrun` arm runs this repo's

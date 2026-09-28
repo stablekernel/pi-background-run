@@ -728,6 +728,9 @@ by hand:
 
 ## Benchmark
 
+At a glance — the case in a few minutes, including where bgrun does not help:
+[`docs/benchmark/AT-A-GLANCE.md`](docs/benchmark/AT-A-GLANCE.md).
+
 Measured against a foreground session, on the same prompt and fixture, at one model,
 n=3 per arm: [`BENCHMARK.md`](BENCHMARK.md). The short version — for a cheap job
 (23–34s) the wake's round trip costs more than it saves and the background arm is
