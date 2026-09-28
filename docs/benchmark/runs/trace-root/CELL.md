@@ -6,7 +6,7 @@ the cell-register row that expects bgrun to struggle here).
 
 | field | value |
 |---|---|
-| extension | the fixed one: bench commit `d948560`, sha `18f022248c9f4552` |
+| extension | the fixed one: bench commit `8750f0e`, sha `18f022248c9f4552` |
 | fixture | `/private/tmp/trace-root-fixture`, sha `605aba38baf5c6ad` — the failing test calls a helper **module**, so the trace's deepest frame names `harness.ts`, a file with no other reason to be opened |
 | prompt | the neutral prompt in the run sheet, unmodified |
 | profile | [profile.txt](profile.txt), [profile.csv](profile.csv), [wake-claims.csv](wake-claims.csv) |

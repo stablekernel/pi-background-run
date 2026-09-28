@@ -15,7 +15,7 @@ fabricated — the failures below are provenance and correctness gaps, not inven
 
 | # | gap | evidence | status |
 |---|---|---|---|
-| B1 | **Cell 1's fixture cannot be regenerated.** `/private/tmp/red-tail-fixture` (sha `0bfe00ed1d9866b9`) has no recorded recipe, and the committed generator now emits different bytes: `a60cd7b` added a conditional import line plus a blank line, so with `DUMMY_CAUSE_MODULE=0` the planted assertion shifts `part-02.test.ts:58` → `:59`. Regenerating at HEAD gives `dedf28f736923ad8`. The same applies to the pilot fixture `8bf97128414cba0b`. | `runs/red-tail-short/RUNSHEET.md:12` gives the shape, not the knobs; `method.md`'s fixture table omits this fixture | **open** — either record every fixture's exact env knobs and the generator commit, or commit the fixture bytes themselves. Cell 1 and the pilot are otherwise unreproducible |
+| B1 | **Cell 1's fixture cannot be regenerated.** `/private/tmp/red-tail-fixture` (sha `0bfe00ed1d9866b9`) has no recorded recipe, and the committed generator now emits different bytes: `afb2bd1` added a conditional import line plus a blank line, so with `DUMMY_CAUSE_MODULE=0` the planted assertion shifts `part-02.test.ts:58` → `:59`. Regenerating at HEAD gives `dedf28f736923ad8`. The same applies to the pilot fixture `8bf97128414cba0b`. | `runs/red-tail-short/RUNSHEET.md:12` gives the shape, not the knobs; `method.md`'s fixture table omits this fixture | **open** — either record every fixture's exact env knobs and the generator commit, or commit the fixture bytes themselves. Cell 1 and the pilot are otherwise unreproducible |
 | B2 | ~~The runner's own first command fails.~~ `./run-cell.sh red-tail-short --dry-run` — the command `START-HERE.md:25` tells a newcomer to run — exited 3 because the refusal guard ran before the dry-run branch, and every cell dir already holds transcripts. | `run-cell.sh:95-102` guarded before the dry-run return at `:113-115` | **fixed** — a dry run launches nothing, so it cannot shadow anything; the guard now applies only to real runs |
 | B3 | ~~Nothing runs on another machine: the `bifrost` extension path was hardcoded.~~ | `run-cell.sh:63` | **fixed** — defaults to `$HOME/.pi/...`, overridable via `PI_BIFROST_EXTENSION`. Still undocumented: the provider/model literals, and that a live `pi` is required |
 | B4 | **The outstanding experiment can't be run without editing the runner.** Model and provider are literals, so the capability ladder (`haiku-4-5` → `sonnet-4-6` → `opus-5`) needs either a code edit mid-battery or hand-transcribed commands. | `run-cell.sh:36-48, 106`; the ladder is 'not run' throughout `results.md` | **open** — add `--model`/`--provider` |
@@ -44,7 +44,7 @@ issue #34.
 
 ## The history rewrite — done 2026-09-28
 
-Two pilot transcripts were committed in `965a39d` and deleted in `57e4218`, but a deleted file stays
+Two pilot transcripts were committed in `249fc35` and deleted in `a751f0b`, but a deleted file stays
 fetchable from history, so a clone still carried the personal context that was redacted everywhere
 else. Both blobs (`8dc540974b3e11cdb0bb91d7675b88681219763e`, `a94b186b8f8f099d35cb656bb292b65d0917723e`)
 are now unreachable, and `git rev-list --objects bench/dogfooding | grep pilot/manual` returns nothing.

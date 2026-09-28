@@ -7,7 +7,7 @@ any failure. For a failing job, read a window around the failure before concludi
 
 **Nothing else changed.** No digest was configured for this project at all — the transcripts confirm
 it, since no wake carries a digest block — so no preset, no pointer, and no ecosystem-specific code
-were in play. Extension: bench `7949ea0` (trace presets and the failure gate present but *unused*
+were in play. Extension: bench `7cfd23a` (trace presets and the failure gate present but *unused*
 here).
 
 | field | value |

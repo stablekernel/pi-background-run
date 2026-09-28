@@ -7,7 +7,7 @@ tool code.
 
 | field | value |
 |---|---|
-| extension | bench commit `d948560`; sha `18f022248c9f4552` — product branch `fix/no-poll-before-wake`, commit `5e43fba` |
+| extension | bench commit `8750f0e`; sha `18f022248c9f4552` — product branch `fix/no-poll-before-wake`, commit `5e43fba` |
 | Cell 1's extension | sha `b6539e3fab30bb99` |
 | what changed | `bgrun`'s result states the task is done at handoff; `bgtail`/`bggrep` answer a still-running job with its state (elapsed, no exit code) instead of its log; `peek: true` is the live-read opt-in |
 | profile | [profile.txt](profile.txt), [profile.csv](profile.csv), [wake-claims.csv](wake-claims.csv) |

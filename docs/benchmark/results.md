@@ -289,7 +289,7 @@ significance is claimed.
 ### Cell 1b — the same cell after the no-poll change (2026-09-28)
 
 Cell 1's mechanism was fixed in the extension and the cell re-run, with the fixture, model, prompt
-and command held fixed — the only difference is the tool code (bench `d948560`, extension sha
+and command held fixed — the only difference is the tool code (bench `8750f0e`, extension sha
 `18f022248c9f4552`; product branch `fix/no-poll-before-wake`, commit `5e43fba`, against Cell 1's
 `b6539e3fab30bb99`). Full record and artifacts:
 [runs/red-tail-short-fixed/CELL.md](runs/red-tail-short-fixed/CELL.md).
@@ -312,7 +312,7 @@ argument predicted, because the job is 23.2s and the wake lands ~7s after it exi
 
 ## Cell 3 — `trace-root`, measured 2026-09-28
 
-Six sessions on the fixed extension (bench `d948560`), same fixture sha `605aba38baf5c6ad`. Full
+Six sessions on the fixed extension (bench `8750f0e`), same fixture sha `605aba38baf5c6ad`. Full
 record: [runs/trace-root/CELL.md](runs/trace-root/CELL.md).
 
 | metric (median) | bgrun | vanilla |
