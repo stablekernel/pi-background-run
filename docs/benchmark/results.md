@@ -115,10 +115,10 @@ as a result — the numbers above are from a re-run with the variables set expli
 the earlier four runs remain valid as run-to-run stability evidence within one
 environment.
 
-**Provenance**: `bun scripts/pty-shape.ts`, run in
-`~/sk/pi-bgrun.ptyshape` at the since-removed `pi-bgrun.ptyshape` checkout - reproducible instead from `scripts/pty-shape.ts`, which generates its own fixture, then re-run in both
-environments to confirm; `bun test scripts/pty-shape.test.ts` — 4 tests pass;
-`tsc --noEmit` clean.
+**Provenance**: `bun scripts/pty-shape.ts`, run in a separate `pi-bgrun.ptyshape` checkout that no
+longer exists, and re-run in a second environment to confirm. The check itself is reproducible here —
+the script generates its own fixture — so that is the citation to use rather than the dead path:
+`bun test scripts/pty-shape.test.ts` — 4 tests pass; `tsc --noEmit` clean.
 
 **Consequences**: `pty-agent` is dropped as void; the manifest records the environment;
 no line count is quoted without one; the fixture's own line counts are re-measured per
