@@ -1,0 +1,55 @@
+label                 arm    execs fg handoff wall_s blocked_s idle_s sleep_s ctx_chars diag    locate    cause  calls
+bgrun-1               bgrun  1    0  1      39.2   0.0      39.2   0.0    13,559   up+down pattern   reached 3
+bgrun-2               bgrun  1    0  1      43.9   0.0      43.9   0.0    16,243   up+down pattern   reached 3
+bgrun-3               bgrun  1    0  1      40.7   0.0      40.7   0.0    14,009   up+down pattern   reached 3
+vanilla-1             vanilla 1    1  0      33.2   22.8     10.4   0.0    29,610   up+down full-read reached 1
+vanilla-2             vanilla 1    1  0      34.5   23.3     11.2   0.0    29,731   up+down full-read reached 1
+vanilla-3             vanilla 1    1  0      34.6   22.8     11.9   0.0    29,721   up+down full-read reached 1
+
+bgrun-1  /private/tmp/cells/trace-root-framewake/bgrun-1/2026-09-28T17-28-31-652Z_01a0e90f-a4a3-7684-aab5-f1a97d67b1ca.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bgrun     0.0     320     635       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+  2  bggrep    0.0     8187    9,600     pattern   bun-tests-1790616516-40311
+  3  bgtail    0.0     3075    12,675    position  bun-tests-1790616516-40311
+
+bgrun-2  /private/tmp/cells/trace-root-framewake/bgrun-2/2026-09-28T17-31-24-800Z_01a0e912-4900-76bf-a1a2-419ec12a7c1c.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bgrun     0.0     320     633       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+  2  bggrep    0.0     8160    9,580     pattern   bun-tests-1790616689-52704
+  3  bggrep    0.0     5437    15,199    pattern   bun-tests-1790616689-52704
+
+bgrun-3  /private/tmp/cells/trace-root-framewake/bgrun-3/2026-09-28T17-34-37-950Z_01a0e915-3b7d-71a9-9603-bd475416f49f.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bgrun     0.0     320     666       -         cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+  2  bggrep    0.0     8201    9,673     pattern   bun-tests-1790616882-65603
+  3  bgtail    0.0     3075    12,748    position  bun-tests-1790616882-65603
+
+vanilla-1  /private/tmp/cells/trace-root-framewake/vanilla-1/2026-09-28T17-29-23-712Z_01a0e910-6fff-7139-8560-ac1fe34727b6.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bash      22.8    28386   28,615    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+
+vanilla-2  /private/tmp/cells/trace-root-framewake/vanilla-2/2026-09-28T17-33-54-494Z_01a0e914-91be-7464-8302-2efb5bd35350.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bash      23.3    28386   28,592    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+
+vanilla-3  /private/tmp/cells/trace-root-framewake/vanilla-3/2026-09-28T17-35-48-285Z_01a0e916-4e3c-72af-bbfa-b702719b05b4.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bash      22.8    28377   28,604    full-read cd /Users/lloyd.engebretsen/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/trace-root-fixture 2>&1
+
+summary (median [min–max]; arms with a single session have no median)
+  vanilla (3 sessions)
+    execs      1.0 [1.0–1.0]
+    wall_s     34.5 [33.2–34.6]
+    blocked_s  22.8 [22.8–23.3]
+    idle_s     11.2 [10.4–11.9]
+    sleep_s    0.0 [0.0–0.0]
+    ctx_chars  29,721 [29,610–29,731]
+    diag_reach 3/3
+  bgrun (3 sessions)
+    execs      1.0 [1.0–1.0]
+    wall_s     40.7 [39.2–43.9]
+    blocked_s  0.0 [0.0–0.0]
+    idle_s     40.7 [39.2–43.9]
+    sleep_s    0.0 [0.0–0.0]
+    ctx_chars  14,009 [13,559–16,243]
+    diag_reach 3/3

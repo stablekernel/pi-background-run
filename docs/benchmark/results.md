@@ -342,6 +342,34 @@ question is whether that file appears at all, and it appeared 0/3 against 3/3. T
 would test `H11`, and a weak rung on the vanilla arm would still see `harness.ts` — a confound the
 ladder will have to control for.
 
+### Cell 3a — `trace-root` with the framing fix only (2026-09-28)
+
+The same cell again, after the wake's closing line changed from "the exit code, stats and last output
+above **are the result**" to "a summary, not the diagnosis — the log holds the detail, including the
+context around any failure. For a failing job, read a window around the failure before concluding a
+cause." Nothing else changed: the project's digest stayed a hand-rolled pass/fail count, so no preset
+and no pointer were in play. Full record:
+[runs/trace-root-framewake/CELL.md](runs/trace-root-framewake/CELL.md).
+
+| metric | Cell 3 | Cell 3a |
+|---|---|---|
+| `harness.ts` in the bgrun arm's context | **0, 0, 0** | **3, 3, 5** |
+| `cause_file` (deepest frame seen) | `part-02.test.ts` | **`harness.ts`** |
+| tool calls | 2 | 3 |
+| ctx_chars (median) | 9,758 | 14,009 |
+| polls / wake claims | 0 / 0 | 0 / 0 |
+
+**Two sentences of language-neutral framing fixed the cell** — "read a window around the failure"
+knows nothing about how any runner spells a stack frame. The sequences show it: Cell 3's sessions ran
+`bgrun` → `bggrep` and stopped at the symptom; Cell 3a's ran `bgrun` → `bggrep` → `bgtail`, reading
+the window where the frames are. The extra call costs ~4k characters and buys the cause, still at
+**half vanilla's context** (14,009 against 29,721); the wall floor stands (40.7s against 34.5s).
+
+This also retroactively justifies deleting the built-in locator: the JS-tuned regex was never the fix.
+The presets and the `on: "failure"` gate are precision layers — they put a pointer in the wake — not
+the thing that made a session follow the trace. Variant B (`--variant tracepreset`) now measures an
+increment on top of this rather than a fix.
+
 ## Blocked on
 
 - Phase 1 instrument work is closed: `locating`, the shape and evidence-path instruments,
