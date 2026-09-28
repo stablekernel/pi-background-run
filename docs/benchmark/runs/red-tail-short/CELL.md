@@ -92,6 +92,21 @@ notification"). The failure is not a wrong plan: it is a loop with three gaps.
 - **No clock.** No tool result carries a timestamp or elapsed time, so "has the wake arrived?" is
   unfalsifiable from inside the loop: three seconds and thirty look identical.
 
+**Quantified after the fact by `scripts/wake-claims.ts`**, which reads the job's own records and
+the assistant's own words rather than the phrase alone:
+
+| session | job | calls while running | calls after exit | first wake claim |
+|---|---|---|---|---|
+| bgrun-1 | 22.9s | 11 | 1 | +3.2s |
+| bgrun-2 | 22.7s | 10 | 1 | +3.6s |
+| bgrun-3 | 22.6s | 6 | 3 | +3.9s |
+
+27 of the three sessions' 30 tool calls were made while the job was still running, and each
+session's first wake claim lands 3-4 seconds into a ~23-second job. Those two numbers —
+`calls_before_exit` and `claims_before_exit` — are what a fix has to drive to zero, and this cell
+can be re-run against a changed extension to check exactly that (`./run-cell.sh red-tail-short
+--variant <name>`, which writes fresh session dirs so the runs above are never shadowed).
+
 Nothing corrected it: `bgtail` on a *running* job answers "+62 new lines since last read — log at
 73 lines" with no state line, so the invented premise stayed consistent with every result. Each
 delta read also paid off — which is what delta tailing is for — so the loop was self-rewarding:
