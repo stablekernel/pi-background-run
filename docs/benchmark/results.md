@@ -286,6 +286,30 @@ file is the failing test that every session names. The column is informative onl
 `DUMMY_CAUSE_MODULE=1`, i.e. the `trace-root` cell. n=3 per arm: spreads are reported, and no
 significance is claimed.
 
+### Cell 1b — the same cell after the no-poll change (2026-09-28)
+
+Cell 1's mechanism was fixed in the extension and the cell re-run, with the fixture, model, prompt
+and command held fixed — the only difference is the tool code (bench `d948560`, extension sha
+`18f022248c9f4552`; product branch `fix/no-poll-before-wake`, commit `5e43fba`, against Cell 1's
+`b6539e3fab30bb99`). Full record and artifacts:
+[runs/red-tail-short-fixed/CELL.md](runs/red-tail-short-fixed/CELL.md).
+
+| metric | Cell 1 | Cell 1b | vanilla (control) |
+|---|---|---|---|
+| wake claims before exit | 1, 2, 1 | **0, 0, 0** | — |
+| polls before exit | 10, 9, 5 | **0, 0, 0** | — |
+| tool calls per session | 12, 11, 9 | **2, 2, 2** | 1 |
+| ctx_chars (median) | 31,170 | **9,892** | 27,817 → 28,021 |
+| wall_s (median [min–max]) | 45.4 [42.9–51.1] | 40.9 [38.1–42.7] | 33.0 → 33.5 |
+| blocked_s / diag_reach | 0.0, 3/3 | 0.0, 3/3 | 22.5, 3/3 |
+
+**`H12` supported and fixed:** no session claims a wake it has not received, and the polls it
+licensed went to zero. The interaction is now `bgrun` → yield → wake → one search → answer. Context
+inverted — bgrun costs *less* than vanilla here — because with the log unavailable before the wake
+the session searched it (`bggrep`, `locate` flipping from `position` to `pattern`) instead of
+reading it in pieces. Wall time did **not** invert: the cell stays negative, exactly as the floor
+argument predicted, because the job is 23.2s and the wake lands ~7s after it exits.
+
 ## Blocked on
 
 - Phase 1 instrument work is closed: `locating`, the shape and evidence-path instruments,

@@ -1,9 +1,22 @@
-# Where the benchmark stands (2026-09-26)
+# Where the benchmark stands (2026-09-28)
 
-**No cell has been run.** All three H7 cells are staged and waiting on attended sessions —
-`H6` is negative (a detached job's session exits before its job finishes), so the sessions
-are yours. Everything that could be built and verified without a session is built, verified
-and committed.
+- **Cell 1 `red-tail-short`: measured.** Six sessions, artifacts committed behind
+  [red-tail-short/CELL.md](red-tail-short/CELL.md) and recorded in [../results.md](../results.md).
+- **The extension was then fixed.** Cell 1 showed every bgrun session polling a job it had just
+  handed off, each asserting a wake it had not received; the tool now answers a still-running job
+  with its state instead of its log, and `bgrun`'s handoff says the task is done at launch. The same
+  cell was re-run: [red-tail-short-fixed/CELL.md](red-tail-short-fixed/CELL.md). Polls before the
+  wake went 10/9/5 → 0/0/0, calls per session 12/11/9 → 2/2/2, context 31.2k → 9.9k — now *below*
+  vanilla's 28k. Wall time stayed slower (40.9s vs 33.5s), exactly as the floor argument predicted.
+  The product change is on branch `fix/no-poll-before-wake` (`5e43fba`) in the product repo.
+- **Next: `trace-root`, then `long-buried`.** Both staged. The bench worktree already carries the
+  fixed extension, so new cells run it with no flag; `--variant` exists only to re-run a cell that
+  already has transcripts. `long-buried` is the one where mid-run waiting is a real strategy rather
+  than a formality, so it is where the new gate costs the most; `trace-root` tests `H11` and makes
+  `cause_reached` informative.
+
+The cells still need attended sessions — `H6` is negative (a detached job's session exits before its
+job finishes).
 
 ## Your part — one command
 
@@ -60,8 +73,10 @@ One row per session. The profile then goes beside the transcripts under `.bench-
 cell's outcome is recorded in `results.md` against its prediction, and that is also when the
 write-up item can move.
 
-Committed: `a60cd7b` (metric, fixture knob, tests, the `trace-root` sheet) and `6f7d6d1` (the
-three sheets, the corrected rows, the dated instrument entry).
+Committed since this page was written: the metric and the fixture knob (`a60cd7b`), the three run
+sheets (`6f7d6d1`), Cell 1's record (`6c71e15`), the mechanism findings and `H12` (`fbdba4b`), the
+wake-claim instrument and cell variants (`3bf08bc`), the synced fix (`d948560`), and Cell 1b's
+record with its before/after artifacts.
 
 ## One decision waiting for you
 
