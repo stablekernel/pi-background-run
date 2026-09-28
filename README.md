@@ -726,6 +726,19 @@ by hand:
 | `.bgrun-used-<hash>` | Per-project evidence that bgrun has run here (digest nudge). |
 | `.digest-nudge-<hash>` | Per-project: the one-shot digest nudge was already shown. |
 
+## Benchmark
+
+Measured against a foreground session, on the same prompt and fixture, at one model,
+n=3 per arm: [`BENCHMARK.md`](BENCHMARK.md). The short version — for a cheap job
+(23–34s) the wake's round trip costs more than it saves and the background arm is
+slower; for an expensive one (~204s, 570 tests, 1,281 lines) it pays the job once
+(225.9s against vanilla's 696.2s) at a quarter of the context (18,760 against
+79,901), because the synchronous session re-runs the suite. Diagnosis is a tie there.
+The load-bearing change behind the wake's failure pointer was two sentences of
+language-neutral framing, not ecosystem-specific parsing, and a pointer that can be
+wrong costs more than no pointer. Limits — n=3, one model, one synthetic fixture
+family — and what the runs do *not* establish are in the document.
+
 ## Releasing
 
 Version numbers and the changelog are derived from commit messages via

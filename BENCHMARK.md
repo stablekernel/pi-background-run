@@ -1,0 +1,201 @@
+# Benchmark: does backgrounding a long command pay the agent back?
+
+`bgrun` exists so an agent session stays unblocked while a long shell command runs, and
+so the command's output never enters the conversation. The question this benchmark was
+built to answer is narrower than that promise: **does handing a long command to the
+background cost the agent more than it saves?**
+
+The answer depends on the job, and that split is the headline. This document states what
+the measurements support and what they do not. It is a summary of a week of measurement;
+every number comes from a named cell, and the record behind each one — the procedure,
+the predictions written before the runs, the per-cell transcripts — is listed under
+[Provenance](#provenance).
+
+## How a cell is run
+
+A cell is a **fixture × arm × context** at one model. The `bgrun` arm runs this repo's
+extension; the `vanilla` arm runs the same session without it. Both arms get the same
+neutral prompt — run this and report the failure details — so that reaching for the tool
+is a finding rather than an instruction. Sessions are live (a wake needs a session that
+still exists when the job ends), the model is `anthropic/claude-sonnet-4-6`, and each arm
+is run three times (n=3). Reported figures are medians, with the run range in brackets.
+
+Mechanism columns (`blocked_s` — seconds the session spent waiting on a *foreground* run,
+`execs`, `handoff`) are properties of the tool. Agent columns (`wall_s`, `ctx_chars`,
+`calls`) are properties of an agent driving it and vary run to run by design. `ctx_chars`
+counts characters of transcript text, not billed tokens. Source: `method.md`.
+
+**Limits, stated here rather than in a footnote.** n=3 per arm; one model; one fixture
+family; one machine. The fixture is synthetic — it has no flaky tests, retries, parallel
+workers or enormous stack traces. Three runs demonstrate an effect; they do not
+generalise, and no significance is claimed anywhere in this document. The one number
+quoted with a caveat is the pointer variant in Cell 4, and the caveat is stated with it.
+
+## The regime split
+
+The cost of the background arm is the wake's round trip: the job runs detached, but the
+session must still wait for the wake before it can act. Whether that is cheaper than
+running synchronously depends on how long the job takes.
+
+| | Cell 1b (Cell 3, same shape) — cheap job | Cell 4 — expensive job |
+|---|---|---|
+| job | 23.2s (Cell 3's is shorter) | ~204s (570 tests, 1,281 lines) |
+| `wall_s` | 40.9 [38.1–42.7] vs 33.5 [32.3–33.9] | **225.9** [223.1–228.4] vs 696.2 [283.8–732.4] |
+| `blocked_s` | 0.0 vs 22.4 | **0.0** vs 660.2 |
+| `ctx_chars` | 9,892 vs 28,021 | **18,760** [16,365–21,056] vs 79,901 [66,792–86,836] |
+| `calls` | 2, 2, 2 vs 1, 1, 1 | 3, 4, 4 vs 12, 2, 6 |
+
+**For a cheap job (23–34s) the round trip dominates and the background arm is slower.**
+Cell 1b's job is 23.2s and the wake lands about 7s after it exits, so the arm's best case
+is vanilla's blocking minus the turn it saves — 40.9s against 33.5s. Cell 3's fixture is
+smaller still: 37.5s against 34.5s. The arm still delivers what it owns — `blocked_s` 0.0
+against 22.4s/22.6s — but the unblocking is paid for in session wall time. Sources:
+`runs/red-tail-short-fixed/CELL.md`, `runs/trace-root/CELL.md`.
+
+**For an expensive job the background arm pays it once and the synchronous arm pays it
+repeatedly.** Cell 4's job takes ~204s. The `bgrun` arm's 225.9s is that job plus about
+22s of agent work, with `blocked_s` 0.0; the vanilla arm's 696.2s is the session choosing
+to run the suite again (4 foreground runs median, `blocked_s` 660.2, and the
+283.8–732.4 spread is that choice). That is 3.1× faster and 4.3× lighter — and the
+diagnosis is a tie: both arms reach `part-05.test.ts`, which is the best form of the
+result, the same answer at a quarter of the context because vanilla bought it by reading
+everything. Source: `runs/long-buried/CELL.md`.
+
+## The load-bearing change was two sentences of framing, not ecosystem parsing
+
+The `trace-root` fixture puts the failure's *cause* in a file of its own (`harness.ts`),
+reachable through a stack frame that the failure's own wording does not mention.
+
+- **Cell 3** (`runs/trace-root/CELL.md`) closed every wake with *"the exit code, stats
+  and last output above **are the result**"*. The `bgrun` arm's pattern search therefore
+  looked for failure words, which match the assertion but not the frame line
+  (`at loadStep (.../harness.ts:28:9)` contains no failure word). `harness.ts` appeared
+  in the `bgrun` arm's context **0 of 3** runs, against **2, 2, 2** for vanilla. Vanilla's
+  single synchronous read carries the whole log. This is the correction the record
+  carries: the mechanism was the wake's *framing*, not a digest — **no digest was
+  configured for that project**, so the wake carried no digest block at all. The
+  `H9 <digest-starves>` hypothesis therefore gains nothing from this cell; its only
+  recorded entry remains the narrow one in `results.md`, where a digest built from a
+  counts-only command carried `299 pass`, `1 fail` and nothing else.
+- **Cell 3a** (`runs/trace-root-framewake/CELL.md`) re-ran the same cell, same fixture
+  hash, same model, same prompt, with **only the closing line changed** to *"a summary,
+  not the diagnosis — the log holds the detail… read a window around the failure before
+  concluding a cause."* Nothing else changed: no digest, no preset, no pointer. The
+  frame file now appeared **3, 3, 5** times, the deepest frame seen became `harness.ts`,
+  and the call sequence gained one step (`bgrun` → `bggrep` → `bgtail`) — the extra call
+  cost ~4k characters and bought the cause, still at **half vanilla's context** (14,009
+  against 29,721). The wall floor stands (40.7s against 34.5s).
+
+The instruction knows nothing about how any runner spells a stack frame, which is the
+point: the fix is language-neutral instruction, not ecosystem-specific parsing. The
+JS/TS-tuned built-in locator was deleted in favour of this framing plus optional presets,
+and a nine-entry multi-runner corpus re-run showed nothing regressed (commit `e7c1934`).
+
+## A pointer that can be wrong costs more than no pointer
+
+The presets and the `on: "failure"` gate put a *pointer* — a named failure and its source
+frame — in the wake. Cell 4's variant (`runs/long-buried-tracepreset/profile.csv`,
+summarised in `runs/long-buried/CELL.md`) was that layer's first behavioural exercise, and
+it went wrong in an instructive way:
+
+| Cell 4 | no pointer | pointer |
+|---|---|---|
+| `calls` | 3, 4, 4 | 5, 5, 6 |
+| `ctx_chars` | 18,760 | 28,633 [21,867–31,481] |
+| `wall_s` | 225.9 | 233.1 |
+
+The `js-trace` preset fired and named
+`Failure: (pass) preset js-trace corpus (captured): …` — **a passing test's name**. The
+cause is self-reference: the suite under test contains the preset's own corpus tests,
+which print captured failure text, so the log holds failure-shaped strings from passing
+tests, and a text scanner cannot tell them from a real one. The sessions did not trust the
+pointer — calls rose and context rose ~50% — and reached the same `part-05.test.ts`
+anyway. The scan itself costs ~20ms against a 204s job; the price is that a claim which
+may be wrong must be verified.
+
+**The design rule this buys: a pointer that can be wrong must be conservative — a wrong
+pointer costs more than no pointer.** The fix, accordingly, is conservative *emission*
+(say nothing rather than guess), not better guessing. The attribution caveat: this
+workload is the extension's own test suite, which is a pathological digest input, so the
+*rule* generalises further than the *number* does.
+
+## The layer boundary
+
+The through-line of this work is a boundary between what the framework owns and what the
+project owns. The framework owns facts it can prove: the exit code, the job's state,
+whether the job is still running. The project owns everything that depends on how *its*
+tooling spells failure — what a stack frame looks like, what a failing test prints,
+whether a log is red. Three decisions in this work are instances of holding that line:
+
+1. **The ecosystem-specific locator was deleted.** A default tuned to the product's own
+   runner (measured over the nine-entry corpus, it worked on 2, both JS/TS) is gone;
+   Cell 3a shows a language-neutral instruction did better than the JS-tuned regex.
+2. **No "did this digest produce a failure signal?" heuristic was added.** That judgement
+   would require per-ecosystem knowledge of what a failure looks like, so the framework
+   does not attempt it; the only thing it enforces is the fact it can prove — a digest
+   block gated on `"on": "failure"` is appended only for a non-zero exit, because the
+   digest command itself never sees the exit code.
+3. **The tool never writes a project's config files.** When a project has run a bgrun job
+   and has no digest configured, the nudge points at the `digest-config` skill rather
+   than writing `.pi/pi-bgrun.json` itself: sampling a project's real logs and choosing a
+   scorecard is project-owned work.
+
+## Robustness: no polling, no false wakes
+
+In every measured cell, the `bgrun` sessions made **zero polls before the wake** and
+**zero wake claims they had not received** (`0/0` in all three Cell 4 baseline sessions,
+all three Cell 4 pointer-variant sessions, and all Cell 3a sessions). Cell 1 was the
+counter-example that produced the fix — 3 of 3 sessions claimed a wake before receiving
+it and made 10, 9 and 5 polls — and Cell 1b re-ran the same cell on the fixed extension
+and measured 0, 0, 0 in both columns (`runs/red-tail-short-fixed/CELL.md`). This holds in
+Cell 4, a 1,281-line log and a ~204s job, which is the cell where polling is most
+tempting. It is a mechanism result about the tool, not a claim about agents in general.
+
+## What the results do not establish
+
+- **`H11 <trace-depth>`** — that reaching a root cause is a capability boundary — is
+  **not tested**. Cell 3's `cause_reached` flag reads 1 in both arms for definitional
+  reasons (it is session-relative: the deepest frame *that session saw*), so it must be
+  read together with `cause_file`. Testing `H11` needs the capability ladder
+  (haiku → sonnet → opus), and only the mid rung has run.
+- **`H9 <digest-starves>`** gains nothing from Cell 3 or 3a: no digest was configured
+  there. Its only recorded entry is the counts-only digest in `results.md`; the only
+  later cell with a digest configured is Cell 4's pointer variant, which is about the
+  pointer rather than about a session trusting a count-only digest.
+- **The capability ladder (`H7`, `H8`) and the dialogue cells** (`overlap-task`,
+  `parallel-jobs`, `resume-midrun`, `peek-midrun`, `fast-verbose`, `fail-fast`,
+  `green-short`) are **not run** — see the status table in `results.md`. Nothing in this
+  document speaks to them.
+- **Whether the pointer *adds* anything on top of the framing** is not established: the
+  Cell 4 variant measured the pointer against the framing-only baseline and the pointer
+  cost more, on a pathological input. A clean measurement on a project where the suite
+  does not contain the preset's own corpus is not in the record.
+- **Unattended cells are impossible on this setup** (`H6 <unattended>`: negative), so
+  every cell above was driven with a human in the session. That bounds what may be claimed
+  for them, and it is a method difference between cells, not a footnote.
+- **One engine of the observed cause-loss is unexplained.** In Cell 3 the `bgrun`
+  answers cited line numbers that belong to `harness.ts` while `harness.ts` appeared in no
+  session's context. The records leave how those numbers arrived as an open question
+  rather than a story.
+
+## Provenance
+
+The full record lives in the adjacent benchmark checkout, `pi-bgrun.bench-doc`, under
+`docs/benchmark/`:
+
+| file | what it holds |
+|---|---|
+| `method.md` | how a cell is run and what its numbers mean (arms, contexts, metrics, controls) |
+| `predictions.md` | every hypothesis and cell prediction, written before the runs |
+| `results.md` | the running record the cells cite |
+| `runs/<cell>/CELL.md` | one cell's numbers, mechanism and limits |
+| `runs/<cell>/profile.csv` | the per-session rows, generated by `scripts/measure-sessions.ts` |
+
+Cell → record path: `red-tail-short` (Cell 1) `runs/red-tail-short/CELL.md`;
+`red-tail-short` after the no-poll change (Cell 1b) `runs/red-tail-short-fixed/CELL.md`;
+`trace-root` (Cell 3) `runs/trace-root/CELL.md`; `trace-root` with the framing fix
+(Cell 3a) `runs/trace-root-framewake/CELL.md`; `long-buried` and its pointer variant
+(Cell 4) `runs/long-buried/CELL.md` and `runs/long-buried-tracepreset/profile.csv`;
+the attended-method pilot `runs/pilot/MANIFEST.md`. The instrument checks that decided
+whether these cells' numbers mean anything are in `results.md` (the pty/pipe shape check,
+which falsified its own hypothesis, and the trace-path check).
