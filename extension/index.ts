@@ -766,100 +766,6 @@ function readLastLineFromContent(content: string, maxLen = 200): string | null {
   return last.length > maxLen ? last.slice(0, maxLen) + "…" : last;
 }
 
-// ── Failure locator (wake) ──────────────────────────────────────────────────
-//
-// A failed job's wake should name the failure and the source frame nearest it,
-// so a session is not left guessing a bggrep pattern that misses the file the
-// failure was *thrown from* — a runner's `at <fn> (<file>:<line>:<col>)` line
-// carries no failure word, so the obvious pattern never surfaces it. One
-// signature list, one JS/TS frame shape, scanned in the SAME bounded pass that
-// counts the log's lines. Silent when nothing matches (and never consulted for
-// a passing job, whose wake must stay byte-identical).
-//
-// "First in the log" is deliberately arbitrary, not a priority: runners execute
-// files concurrently, so the first failure found is *a* real failure with a
-// real frame — which is all this pointer claims. The wake stays a pointer, not
-// a report: the log holds the rest, and a count would be a back-door lie (a
-// test whose name contains "fail" inflates it).
-interface FailurePointer {
-  /** The trimmed failure-signature line (truncated for the wake). */
-  failure: string;
-  /** The first source frame within 5 lines after it. */
-  frame?: string;
-}
-
-// Failure signatures common to test runners / build tools. `^Error:` is
-// line-anchored: an "Error:" mid-line is usually prose, not a failure header.
-const FAILURE_SIGNATURE_RE =
-  /\(fail\)|✗|✘|×|--- FAIL|\bFAIL\b|AssertionError|^Error:/;
-
-// A source frame whose path ends in a JS/TS extension — `at fn (path.ts:28:9)`
-// or bare `at path.ts:28:9`. The name may contain spaces (a `describe`-scoped
-// frame, `at load part 02 (part-02.test.ts:41:25)`, which our own fixture
-// prints), so it is `.+?` up to the ` (` rather than a no-space run.
-// Runtime-internal frames (`node:async_hooks:206:9`) deliberately do not match:
-// they name the runtime, not the caller's code.
-const SOURCE_FRAME_RE =
-  /^\s*at\s+(?:(.+?)\s+\()?([^\s()]+\.(?:tsx?|jsx?|mjs|cjs|mts|cts)):(\d+):(\d+)\)?\s*$/;
-
-const FAILURE_LINE_MAX = 160;
-// How far past a failure line to look for its first frame. A runner's terse
-// shape puts the frame on the very next line, but a *block* failure (an
-// assertion header, the printed payload — a diff, an object dump — then the
-// stack) separates them by more: the benchmark's trace-root fixture has its
-// `AssertionError` header 10 lines above `at loadStep (harness.ts:28:9)`.
-// Sized to span that payload while staying bounded and still stopping at the
-// first frame.
-const FRAME_LOOKAHEAD = 20;
-
-/**
- * One-pass failure scan over decoded log text. Stops the moment it has a frame,
- * or after FRAME_LOOKAHEAD lines past a failure with none found (the failure
- * line alone is still worth reporting). `enabled` is false for a passing job:
- * then it never matches, so no `Failure:` can appear on a green wake.
- */
-function makeFailureScanner(enabled: boolean): {
-  feed: (line: string) => void;
-  result: () => FailurePointer | null;
-  readonly done: boolean;
-} {
-  let failure: string | null = null;
-  let frame: string | null = null;
-  let afterFailure = 0;
-  let done = !enabled;
-  return {
-    feed(rawLine: string) {
-      if (done) return;
-      const line = rawLine.trim();
-      if (failure === null) {
-        if (FAILURE_SIGNATURE_RE.test(line))
-          failure =
-            line.length > FAILURE_LINE_MAX
-              ? line.slice(0, FAILURE_LINE_MAX) + "…"
-              : line;
-        return;
-      }
-      const m = SOURCE_FRAME_RE.exec(line);
-      if (m) {
-        const [, fn, path, lineNo, col] = m;
-        frame = fn
-          ? `at ${fn} (${path}:${lineNo}:${col})`
-          : `at ${path}:${lineNo}:${col}`;
-        done = true;
-      } else if (++afterFailure >= FRAME_LOOKAHEAD) {
-        done = true;
-      }
-    },
-    result() {
-      if (failure === null) return null;
-      return frame ? { failure, frame } : { failure };
-    },
-    get done() {
-      return done;
-    },
-  };
-}
-
 function validateJobId(id: string, tool: string): void {
   // The single gate in front of every id. It rejects:
   //   * a path shape — an id can never address a file outside the jobs dir;
@@ -1650,6 +1556,7 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
     label?: unknown;
     preset?: unknown;
     command?: unknown;
+    on?: unknown;
   };
 
   // `type` and `match` compose (AND): both are kept and both must match at
@@ -1723,6 +1630,19 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   // Neither preset nor command → nothing this entry can score. Drop it.
   if (!preset && !command) return undefined;
 
+  // `on: "failure"` is the only accepted gate: the FRAMEWORK (not the command)
+  // appends this entry's output only for a non-zero exit. Anything else is a
+  // config error and drops the entry, like a bad `match`/`type`.
+  let on: "failure" | undefined;
+  if (entry.on !== undefined) {
+    if (entry.on === "failure") {
+      on = "failure";
+    } else {
+      warnDigestInvalid("on", entry.on);
+      return undefined;
+    }
+  }
+
   const out: DigestEntry = {};
   if (type) out.type = type;
   if (match) out.match = match;
@@ -1731,6 +1651,7 @@ function normalizeDigestEntry(raw: unknown): DigestEntry | undefined {
   }
   if (preset) out.preset = preset;
   if (command) out.command = command;
+  if (on) out.on = on;
   return out;
 }
 
@@ -2124,34 +2045,24 @@ export default function (pi: ExtensionAPI) {
   // Count the log's total lines with a bounded-memory streaming scan (one
   // fixed-size buffer, no full-file read). Missing/unreadable file → null:
   // the Stats line then just omits the line count — best-effort, never
-  // breaks a wake. With `findFailure` (a non-zero exit), the SAME streaming
-  // pass also runs the failure locator, so the wake can name the failure
-  // without a second read of the log.
-  function scanLog(
-    logPath: string,
-    findFailure: boolean,
-  ): { lines: number | null; failure: FailurePointer | null } {
-    const scanner = makeFailureScanner(findFailure);
+  // breaks a wake.
+  function scanLog(logPath: string): number | null {
     let fd: number;
     try {
       fd = openSync(logPath, "r");
     } catch {
-      return { lines: null, failure: null };
+      return null;
     }
     try {
       // fstat, not the scan's own progress: the tail pread below is positioned
       // by the REAL file size, so bounding the scan can never misplace it.
       const size = fstatSync(fd).size;
-      if (size === 0) return { lines: 0, failure: null };
+      if (size === 0) return 0;
       // readWindowMax, not the cap: a capped log is cap + notice + marker, so a
       // bound EQUAL to the cap would omit the line count for every capped job —
       // exactly where magnitude matters most.
-      if (size > readWindowMax()) return { lines: null, failure: null };
+      if (size > readWindowMax()) return null;
       const buf = Buffer.alloc(64 * 1024);
-      // TextDecoder's stream mode carries a multi-byte sequence split across two
-      // read() chunks, so a decoded line is never mojibake at a chunk boundary.
-      const decoder = new TextDecoder();
-      let carry = "";
       let newlines = 0;
       let seen = 0;
       let bytesRead = 0;
@@ -2162,26 +2073,10 @@ export default function (pi: ExtensionAPI) {
         for (let i = 0; i < bytesRead; i++) {
           if (buf[i] === 0x0a) newlines++;
         }
-        // Decode only while the locator is still looking: once it has its
-        // answer, the rest of the file is byte-counted, not re-parsed.
-        if (!scanner.done) {
-          const text =
-            carry + decoder.decode(buf.subarray(0, bytesRead), { stream: true });
-          const parts = text.split("\n");
-          carry = parts.pop() ?? "";
-          for (const part of parts) {
-            scanner.feed(part);
-            if (scanner.done) break;
-          }
-        }
       } while (bytesRead === buf.length);
       // A log that changed size mid-scan (rotated, or appended by a resumed
       // job) would produce a count that matches neither state.
-      if (seen !== size) return { lines: null, failure: null };
-      if (!scanner.done) {
-        const flushed = carry + decoder.decode();
-        if (flushed) scanner.feed(flushed);
-      }
+      if (seen !== size) return null;
       // One bounded pread of the tail for the final-byte + exit-marker check.
       const tailLen = Math.min(size, 512);
       const tail = Buffer.alloc(tailLen);
@@ -2199,7 +2094,7 @@ export default function (pi: ExtensionAPI) {
       const markerAt = tailText.lastIndexOf("\n" + EXIT_MARKER);
       if (markerAt === 0) {
         // The file is only the wrapper's "\n<marker>\n" — no command output.
-        return { lines: 0, failure: scanner.result() };
+        return 0;
       }
       if (markerAt !== -1) {
         const afterMarker = tailText.slice(markerAt + 1);
@@ -2224,9 +2119,9 @@ export default function (pi: ExtensionAPI) {
           extra++;
         count = Math.max(0, count - extra);
       }
-      return { lines: count, failure: scanner.result() };
+      return count;
     } catch {
-      return { lines: null, failure: null };
+      return null;
     } finally {
       closeSync(fd);
     }
@@ -2974,7 +2869,7 @@ export default function (pi: ExtensionAPI) {
     "Use bgrun (not bash) for any command expected to run >30s or emit >100 lines — tests, builds, linters.",
     "Give every bgrun job a short name (e.g. name: 'unit-tests') so it's recognizable in status output, the status widget, and wake messages.",
     "When the project's digest config defines `type` entries, pass the matching `type` (e.g. type: 'test') so the wake selects the right scorecard — bgrun's `started:` line names them when you omit it.",
-    "Launching the job is the whole task: end your turn after a bgrun handoff — there is nothing to wait for. The wake arrives as a new turn carrying the outcome (exit code, stats, the log's last line, and the digest when the project configures one), and it is your cue to read the log and continue. Do not call bgstatus/bgtail/bggrep before it.",
+    "Launching the job is the whole task: end your turn after a bgrun handoff — there is nothing to wait for. The wake arrives as a new turn carrying the outcome (exit code, stats, the log's last line, and the digest when the project configures one), but it is a summary, never the full record — on a failing job the context around the failure exists only in the log, so read a window around it before concluding a cause. Do not call bgstatus/bgtail/bggrep before it.",
     "Never cat or Read a full bgrun log — bgtail returns a condensed peek (ANSI stripped, repeats collapsed, ~8KB cap); use bggrep for pattern search, or read the log's path directly for whole-log analysis.",
   ];
 
@@ -3207,11 +3102,8 @@ export default function (pi: ExtensionAPI) {
 
           // Universal stats — duration + log line count. Non-heuristic, always
           // present, never pattern-based. A missing log contributes no line
-          // count (duration is always known). The same single pass locates the
-          // failure, but only for a non-zero exit: a green run's wake stays
-          // byte-identical (a passing log may still contain "Error:" prose).
-          const logScan = scanLog(logPath, exitCode !== 0);
-          const logLines = logScan.lines;
+          // count (duration is always known).
+          const logLines = scanLog(logPath);
           const statsParts = [formatDuration(rec.exitedAt - rec.started)];
           if (logLines !== null)
             statsParts.push(`${logLines.toLocaleString("en-US")} lines`);
@@ -3270,7 +3162,14 @@ export default function (pi: ExtensionAPI) {
               command: rec.cmd,
             };
             const selected = selectDigestEntry(digestEntries, digestTarget);
-            if (selected) {
+            // A failure-only entry is the FRAMEWORK's call, not the command's:
+            // a digest command receives only the log path, never the exit code,
+            // so `on: "failure"` is enforced here. A green job contributes
+            // nothing from such an entry — even when its log happens to contain
+            // an `Error:` line a command would match.
+            const failureGatedOff =
+              selected?.on === "failure" && exitCode === 0;
+            if (selected && !failureGatedOff) {
               if (truncatedAt !== null) {
                 // A scorecard reads the log's END (summary lines, failure
                 // lists) — exactly what a head cap drops. Its numbers would be
@@ -3286,7 +3185,7 @@ export default function (pi: ExtensionAPI) {
                 const text = raw === undefined ? undefined : capDigestOutput(raw);
                 if (text) digestBlock = { label: selected.label, text };
               }
-            } else if (digestEntries?.length) {
+            } else if (!selected && digestEntries?.length) {
               // Configured but nothing selected — otherwise silent. Surface the
               // job's type/name plus the configured types, once per distinct
               // diagnostic (capped), so a type mismatch or dead glob is visible.
@@ -3322,24 +3221,22 @@ export default function (pi: ExtensionAPI) {
           let wake = `${exitEmoji} Background job ${namePrefix}\`${id}\` finished (exit ${exitStr}).\n`;
           wake += `Command: ${command}\n`;
           wake += `Stats: ${statsParts.join(", ")}\n`;
-          // One line, named cause: the failure signature and the first source
-          // frame after it. Silent when the log carries no signature (or the
-          // job passed), leaving the wake exactly as it reads today.
-          if (logScan.failure)
-            wake += `Failure: ${logScan.failure.failure}${logScan.failure.frame ? ` — ${logScan.failure.frame}` : ""}\n`;
           if (lastLine) wake += `Last output: ${lastLine}\n`;
           if (digestBlock) {
             wake += `digest (${digestBlock.label}): ${digestBlock.text}\n`;
           } else if (digestNoMatchNote) {
             wake += `${digestNoMatchNote}\n`;
           }
-          // A failure is what needs the log; on success the wake already IS the
-          // result. An unconditional "call bgtail" here would undo the point of the
-          // wake, because it is the last instruction the agent reads.
+          // The wake is a summary, never the diagnosis: it must not license a
+          // conclusion about a cause. Both closing lines say so — an
+          // unconditional "call bgtail" on success would undo the point of the
+          // wake, since it is the last instruction the agent reads. The failure
+          // wording is true whatever the ecosystem: the log holds the context,
+          // and a failure named by a trace digest is one failure, not the story.
           wake +=
             exitCode === 0
-              ? "The exit code, stats and last output above are the result — report it, and continue the task that depended on this. Read the log only for detail they do not carry."
-              : "Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it — then continue the task that depended on this.";
+              ? "The exit code, stats and last output above are a summary, not the diagnosis — the log holds the detail, including the context around any failure. For a failing job, read a window around the failure before concluding a cause."
+              : "Analyze the failure: `bgtail` for a peek at the end of the log, or `bggrep` to search it. This wake is a summary, not the diagnosis — the log holds the context around the failure, and any failure named here (by a trace digest) is one failure, not the whole story. Then continue the task that depended on this.";
           try {
             if (rec.ctx.isIdle()) {
               pi.sendUserMessage(wake);

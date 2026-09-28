@@ -99,9 +99,11 @@ Which to use:
    result names the configured types. Note the returned job-id. Launching was
    the task: end your turn there — there is nothing to wait for, and the wake
    arrives as a new turn carrying the outcome.
-2. **On wake:** the wake *is* the result — exit code, duration, log line count, the
-   log's last line, and the digest scorecard when the project configures one. On a
-   failed run it also names the failure line and its first source frame.
+2. **On wake:** the wake carries the result summary — exit code, duration, log line count, the
+   log's last line, and the digest scorecard when the project configures one (a
+   trace digest there can name the failure and its source frame). It is a
+   summary, never the full record: on a failed run the context around the failure
+   exists only in the log, so read a window around it before concluding a cause.
    - `exit: 0` → success. Report it. Do not open the log to confirm: the wake's own
      counters are the confirmation, and a read spends context you do not need to spend.
    - `exit: <non-zero>` → failure. Analyze the log (see below).

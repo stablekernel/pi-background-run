@@ -4245,187 +4245,328 @@ test("wake message: Stats line also present on a red (non-zero exit) run", async
   });
 });
 
-// ── failure locator (wake) ─────────────────────────────────────────────────
+// ── trace presets: real multi-runner corpus ───────────────────────────────
+//
+// The built-in wake locator was deleted in favour of these opt-in presets (see
+// digestPresets.ts) — the framework no longer guesses a failure pointer, so the
+// wake's default shape is unchanged from the pre-locator era. This corpus is the
+// SAME evidence the built-in was measured against, moved over rather than
+// duplicated: each entry is either CAPTURED verbatim from a real runner on a
+// development machine (temp-root rewritten to /proj; nothing else touched) or
+// DOCUMENTARY (written from the runner's documented shape; toolchain absent).
+// Each was compared case-by-case against the deleted locator: every entry
+// reproduces or beats it. A preset prints NOTHING when no signature is found
+// (silent, exactly as the old locator was on a green log).
+const TRACE_CORPUS: Array<{
+  name: string;
+  provenance: "captured" | "documentary";
+  preset: string;
+  log: string;
+  /** Exact stdout without its trailing newline; null = no output at all. */
+  expect: string | null;
+}> = [
+  {
+    name: "bun test — stack above the `(fail)` summary (backward + earliest-of-run)",
+    provenance: "captured",
+    preset: "js-trace",
+    expect:
+      "Failure: (fail) load part 02 > step 04 [0.46ms] — at loadStep (/proj/buntest/harness.ts:2:41)",
+    log: `bun test v1.3.6 (d530ed99)
 
-test("wake failure locator: names the failure line and its source frame (one wake)", async () => {
-  await withJobsDir(async (_dir, h) => {
-    const { wakes, tools, ctx } = h;
+part-02.test.ts:
+1 | export function loadStep(): void {
+2 |   throw new Error("boom: step 04 failed");
+                                            ^
+error: boom: step 04 failed
+      at loadStep (/proj/buntest/harness.ts:2:41)
+      at <anonymous> (/proj/buntest/part-02.test.ts:4:3)
+(fail) load part 02 > step 04 [0.46ms]
+
+ 0 pass
+ 1 fail
+Ran 1 test across 1 file. [14.00ms]
+`,
+  },
+  {
+    name: "node --test — AssertionError header, payload, then stack",
+    provenance: "captured",
+    preset: "js-trace",
+    expect:
+      "Failure: ✖ load part 02 > step 04 (1.857ms) — at loadStep (file:///proj/nodetest/harness.mjs:3:10)",
+    log: `✖ load part 02 > step 04 (1.857ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 67.162917
+
+✖ failing tests:
+
+test at part-02.test.mjs:4:1
+✖ load part 02 > step 04 (1.857ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    {
+  +   actual: 1,
+  +   got: 1
+  -   expected: 2,
+  -   got: 2
+    }
+  
+      at loadStep (file:///proj/nodetest/harness.mjs:3:10)
+      at TestContext.<anonymous> (file:///proj/nodetest/part-02.test.mjs:5:3)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.start (node:internal/test_runner/test:1096:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:385:17) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { actual: 1, got: 1 },
+    expected: { expected: 2, got: 2 },
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+`,
+  },
+  {
+    name: "go test — panic; runtime frames skipped, user frame + offset stripped",
+    provenance: "captured",
+    preset: "js-trace",
+    expect:
+      "Failure: --- FAIL: TestLoadPart02 (0.00s) — /proj/gotest/main_test.go:6",
+    log: `--- FAIL: TestLoadPart02 (0.00s)
+panic: boom: step 04 failed [recovered, repanicked]
+
+goroutine 35 [running]:
+testing.tRunner.func1.2({0x100de5a60, 0x100e18a30})
+	/usr/local/go/src/testing/testing.go:1974 +0x1a0
+testing.tRunner.func1()
+	/usr/local/go/src/testing/testing.go:1977 +0x318
+panic({0x100de5a60?, 0x100e18a30?})
+	/usr/local/go/src/runtime/panic.go:860 +0x12c
+gotest.loadStep(...)
+	/proj/gotest/main_test.go:6
+gotest.TestLoadPart02(0x4926f1b68248?)
+	/proj/gotest/main_test.go:10 +0x30
+created by testing.(*T).Run in goroutine 1
+	/usr/local/go/src/testing/testing.go:2101 +0x3a8
+FAIL	gotest	0.227s
+FAIL
+`,
+  },
+  {
+    name: "cargo test — FAILED header; rust std frames skipped, user frame wins",
+    provenance: "captured",
+    preset: "js-trace",
+    expect:
+      "Failure: test tests::load_part_02 ... FAILED — at ./src/lib.rs:2:5",
+    log: `    Finished test [unoptimized + debuginfo] target(s) in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/cargotest-0ec6bd605ee75128)
+
+running 1 test
+test tests::load_part_02 ... FAILED
+
+failures:
+
+---- tests::load_part_02 stdout ----
+thread 'tests::load_part_02' panicked at src/lib.rs:2:5:
+boom: step 04 failed
+stack backtrace:
+   0: rust_begin_unwind
+             at /rustc/79e9716c980570bfd1f666e3b16ac583f0168962/library/std/src/panicking.rs:597:5
+   1: core::panicking::panic_fmt
+             at /rustc/79e9716c980570bfd1f666e3b16ac583f0168962/library/core/src/panicking.rs:72:14
+   2: cargotest::load_step
+             at ./src/lib.rs:2:5
+   3: cargotest::tests::load_part_02
+             at ./src/lib.rs:10:9
+`,
+  },
+  {
+    name: "minitest (ruby) — `1) Error:` header + the raise site",
+    provenance: "captured",
+    preset: "rb-trace",
+    expect: "Failure: 1) Error: — test_part_02.rb:4:in `load_step'",
+    log: `Run options: --seed 25974
+
+# Running:
+
+E
+
+Finished in 0.000198s, 5050.5052 runs/s, 0.0000 assertions/s.
+
+  1) Error:
+TestPart02#test_load_part_02:
+RuntimeError: boom: step 04 failed
+    test_part_02.rb:4:in \`load_step'
+    test_part_02.rb:9:in \`test_load_part_02'
+
+1 runs, 0 assertions, 0 failures, 1 errors, 0 skips
+`,
+  },
+  {
+    name: "java (JVM) — `Exception in thread` header + the throw frame",
+    provenance: "captured",
+    preset: "js-trace",
+    expect:
+      'Failure: Exception in thread "main" java.lang.RuntimeException: boom: step 04 failed — at Foo.loadStep(Foo.java:3)',
+    log: `Exception in thread "main" java.lang.RuntimeException: boom: step 04 failed
+	at Foo.loadStep(Foo.java:3)
+	at Foo.main(Foo.java:2)
+`,
+  },
+  {
+    name: "unittest (python) — outermost-first traceback, deepest `File` frame",
+    provenance: "captured",
+    preset: "py-trace",
+    expect:
+      'Failure: FAIL: test_load_part_02 (test_part_02.TestPart02) — File "/proj/unittest/test_part_02.py", line 4, in load_step',
+    log: `F
+======================================================================
+FAIL: test_load_part_02 (test_part_02.TestPart02)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/proj/unittest/test_part_02.py", line 8, in test_load_part_02
+    load_step()
+  File "/proj/unittest/test_part_02.py", line 4, in load_step
+    assert {"actual": 1, "got": 1} == {"expected": 2, "got": 2}
+AssertionError
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (failures=1)
+`,
+  },
+  {
+    name: "pytest — documented default traceback: failure named, no `File` frame (MISS)",
+    provenance: "documentary",
+    preset: "py-trace",
+    expect:
+      "Failure: E       AssertionError: assert {'actual': 1, 'got': 1} == {'expected': 2, 'got': 2}",
+    log: `============================= test session starts ==============================
+platform darwin -- Python 3.10.14, pytest-7.4.0, pluggy-1.0.0
+rootdir: /proj/pytest
+collected 1 item
+
+test_part_02.py F                                                        [100%]
+
+=================================== FAILURES ===================================
+________________________________ test_load_part_02 ______________________________
+
+    def test_load_part_02():
+>       load_step()
+
+test_part_02.py:9:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def load_step():
+>       assert {"actual": 1, "got": 1} == {"expected": 2, "got": 2}
+E       AssertionError: assert {'actual': 1, 'got': 1} == {'expected': 2, 'got': 2}
+
+=========================== short test summary info ============================
+FAILED test_part_02.py::test_load_part_02 - AssertionError: assert {'actual': 1, 'got': 1} == {'expected': 2, 'got': 2}
+============================== 1 failed in 0.02s ===============================
+`,
+  },
+  {
+    name: "bun test green — no signature, no output",
+    provenance: "captured",
+    preset: "js-trace",
+    expect: null,
+    log: `bun test v1.3.6 (d530ed99)
+
+ 1 pass
+ 0 fail
+ 1 expect() calls
+Ran 1 test across 1 file. [4.00ms]
+`,
+  },
+];
+
+for (const c of TRACE_CORPUS) {
+  test(`preset ${c.preset} corpus (${c.provenance}): ${c.name}`, () => {
+    const out = runPreset(c.preset, c.log);
+    assert.equal(out, c.expect === null ? "" : c.expect + "\n");
+  });
+}
+
+// ── failure-only digest (`on: "failure"`), enforced by the framework ───────
+//
+// A digest command receives only the log path — never the exit code — so the
+// gate cannot live in the command. These pin both branches with a REAL job: the
+// same log content is emitted once with exit 1 and once with exit 0.
+const TRACE_PRINTF =
+  "printf 'error: boom\\n      at loadStep (/proj/buntest/harness.ts:2:41)\\n(fail) load part 02 > step 04 [0.46ms]\\n'";
+const TRACE_DIGEST_LINE =
+  "Failure: (fail) load part 02 > step 04 [0.46ms] — at loadStep (/proj/buntest/harness.ts:2:41)";
+
+test("wake digest: on:failure appends the trace block for a failing job", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "js-trace", on: "failure" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
     const bgrun = tools.get("bgrun")!;
 
     await bgrun.execute(
-      "call-fail1",
-      {
-        command:
-          "printf '(fail) load part 02 > step 04 [1.29ms]\\n    at loadStep (/private/tmp/trace-root-fixture/harness.ts:28:9)\\n    at Test.runInAsyncScope (node:async_hooks:206:9)\\n'; exit 1",
-      },
+      "call-gate1",
+      { command: `${TRACE_PRINTF}; exit 1` },
       undefined,
       undefined,
       ctx,
     );
     await waitForWakes(wakes, 1);
-    // One wake, carrying exit code + stats + the named failure together.
-    assert.equal(wakes.length, 1, "the failure rides the wake, not a second message");
     const wake = wakes[0].text;
-    assert.match(wake, /exit 1/);
-    assert.match(wake, /^Stats: /m);
-    assert.match(
-      wake,
-      /^Failure: \(fail\) load part 02 > step 04 \[1\.29ms\] — at loadStep \(\/private\/tmp\/trace-root-fixture\/harness\.ts:28:9\)$/m,
-      "failure line and its frame, frame's path:line:col kept whole",
-    );
-  });
-});
-
-test("wake failure locator: a block failure's frame across a payload is still found (trace-root shape)", async () => {
-  await withJobsDir(async (_dir, h) => {
-    const { wakes, tools, ctx } = h;
-    const bgrun = tools.get("bgrun")!;
-
-    // The benchmark fixture's real shape: an AssertionError header, a printed
-    // diff payload, THEN the stack — the header and its frame 10 lines apart.
-    await bgrun.execute(
-      "call-failblock",
-      {
-        command:
-          "printf 'AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\\n+ actual - expected\\n\\n  {\\n+   actual: 1\\n+   got: 1\\n-   expected: 2\\n-   got: 2\\n  }\\n\\n    at loadStep (/private/tmp/trace-root-fixture/harness.ts:28:9)\\n    at load part 02 (/private/tmp/trace-root-fixture/part-02.test.ts:41:25)\\n'; exit 1",
-      },
-      undefined,
-      undefined,
-      ctx,
-    );
-    await waitForWakes(wakes, 1);
-    assert.match(
-      wakes[0].text,
-      /^Failure: AssertionError \[ERR_ASSERTION\]: Expected values to be strictly deep-equal: — at loadStep \(\/private\/tmp\/trace-root-fixture\/harness\.ts:28:9\)$/m,
-    );
-  });
-});
-
-test("wake failure locator: a spaced function name in the frame still matches", async () => {
-  await withJobsDir(async (_dir, h) => {
-    const { wakes, tools, ctx } = h;
-    const bgrun = tools.get("bgrun")!;
-
-    // `load part 02` is a real frame name our own fixture prints; a no-space
-    // name pattern would silently drop it and leave the wake frame-less.
-    await bgrun.execute(
-      "call-failspaced",
-      {
-        command:
-          "printf '(fail) load part 02 > step 04 [1.29ms]\\n    at load part 02 (/private/tmp/trace-root-fixture/part-02.test.ts:41:25)\\n'; exit 1",
-      },
-      undefined,
-      undefined,
-      ctx,
-    );
-    await waitForWakes(wakes, 1);
-    assert.match(
-      wakes[0].text,
-      /^Failure: \(fail\) load part 02 > step 04 \[1\.29ms\] — at load part 02 \(\/private\/tmp\/trace-root-fixture\/part-02\.test\.ts:41:25\)$/m,
-    );
-  });
-});
-
-test("wake failure locator: a failure line with no frame still prints, without an at-fragment", async () => {
-  await withJobsDir(async (_dir, h) => {
-    const { wakes, tools, ctx } = h;
-    const bgrun = tools.get("bgrun")!;
-
-    await bgrun.execute(
-      "call-fail2",
-      { command: "printf 'AssertionError: nope\\nplain one\\nplain two\\n'; exit 1" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    await waitForWakes(wakes, 1);
-    const failureLine = wakes[0].text
-      .split("\n")
-      .find((l) => l.startsWith("Failure: "));
-    assert.equal(failureLine, "Failure: AssertionError: nope");
-    assert.ok(!failureLine!.includes(" at "), "no frame → no at-fragment");
-  });
-});
-
-test("wake failure locator: a failure buried mid-log is still found (whole-log scan, not tail)", async () => {
-  await withJobsDir(async (_dir, h) => {
-    const { wakes, tools, ctx } = h;
-    const bgrun = tools.get("bgrun")!;
-
-    await bgrun.execute(
-      "call-fail3",
-      {
-        command:
-          "printf '(fail) buried\\n    at deep (/tmp/x/harness.ts:77:3)\\n'; for i in $(seq 1 200); do echo \"filler-$i\"; done; exit 1",
-      },
-      undefined,
-      undefined,
-      ctx,
-    );
-    await waitForWakes(wakes, 1);
-    const wake = wakes[0].text;
-    assert.match(
-      wake,
-      /^Failure: \(fail\) buried — at deep \(\/tmp\/x\/harness\.ts:77:3\)$/m,
-    );
-    // The last line is filler, so the locator found something the tail did not.
-    assert.match(wake, /^Last output: filler-200$/m);
-  });
-});
-
-test("wake failure locator: a passing job's log with Error: and a frame stays clean", async () => {
-  await withJobsDir(async (_dir, h) => {
-    const { wakes, tools, ctx } = h;
-    const bgrun = tools.get("bgrun")!;
-
-    await bgrun.execute(
-      "call-fail4",
-      {
-        command:
-          "printf 'Error: harmless prose\\n    at frame (/tmp/a/harness.ts:5:1)\\n'",
-      },
-      undefined,
-      undefined,
-      ctx,
-    );
-    await waitForWakes(wakes, 1);
-    const wake = wakes[0].text;
-    assert.match(wake, /exit 0/);
-    assert.ok(!wake.includes("Failure:"), "a green run never announces a failure");
-  });
-});
-
-test("wake failure locator: two failure blocks — the first is named once, nothing throws", async () => {
-  await withJobsDir(async (_dir, h) => {
-    const { wakes, tools, ctx } = h;
-    const bgrun = tools.get("bgrun")!;
-
-    await bgrun.execute(
-      "call-fail5",
-      {
-        command:
-          "printf '(fail) first test\\n    at firstFn (/tmp/a/first.ts:10:5)\\n(fail) second test\\n    at secondFn (/tmp/a/second.ts:20:6)\\n'; exit 1",
-      },
-      undefined,
-      undefined,
-      ctx,
-    );
-    await waitForWakes(wakes, 1);
-    const wake = wakes[0].text;
-    assert.match(
-      wake,
-      /^Failure: \(fail\) first test — at firstFn \(\/tmp\/a\/first\.ts:10:5\)$/m,
-    );
+    assert.match(wake, /❌/);
     assert.equal(
-      wake.split("Failure:").length - 1,
-      1,
-      "one failure line, no total and no second block",
+      digestBlockOf(wake),
+      TRACE_DIGEST_LINE,
+      "failing job carries the trace digest block",
     );
-    assert.ok(
-      !wake.split("\n").some((l) => l.startsWith("Failure: ") && l.includes("second")),
-      "the second block is not named",
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
+});
+
+test("wake digest: on:failure is silent for a passing job with the SAME log", async () => {
+  const { dir, proj, home } = setupDigestEnv();
+  try {
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "js-trace", on: "failure" },
+    });
+    const { pi, wakes, tools, ctx } = makeFakePi();
+    trustCtx(ctx, proj, true);
+    await loadExtension(pi);
+    const bgrun = tools.get("bgrun")!;
+
+    // Identical log (an `Error:` and a `(fail)` line are present), exit 0.
+    await bgrun.execute(
+      "call-gate2",
+      { command: TRACE_PRINTF },
+      undefined,
+      undefined,
+      ctx,
     );
-  });
+    await waitForWakes(wakes, 1);
+    const wake = wakes[0].text;
+    assert.match(wake, /✅/);
+    assert.equal(
+      digestBlockOf(wake),
+      null,
+      "framework gate: a green run contributes nothing from a failure-only entry",
+    );
+    assert.ok(!wake.includes("digest ("), "no digest block at all");
+  } finally {
+    teardownDigestEnv(dir, proj, home);
+  }
 });
 
 test("wake message: missing log file — Stats shows duration only, wake still sent", async () => {
@@ -4583,6 +4724,18 @@ test("resolveConfig: invalid digest values dropped, valid ones kept (best-effort
     });
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
     assert.equal(cfg.digest, undefined);
+    // `on: "failure"` is kept; any other value is a config error and drops the
+    // entry, exactly like a bad `match`/`type`.
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "js-trace", on: "failure" },
+    });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.deepEqual(cfg.digest, [{ preset: "js-trace", on: "failure" }]);
+    writeJson(join(proj, ".pi", "pi-bgrun.json"), {
+      digest: { preset: "js-trace", on: "always" },
+    });
+    cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
+    assert.equal(cfg.digest, undefined, "invalid `on` drops the entry");
     // An array of non-entry scalars has no usable entries → undefined.
     writeJson(join(proj, ".pi", "pi-bgrun.json"), { digest: ["go-test"] });
     cfg = mod.resolveConfig({ cwd: proj, isProjectTrusted: () => true });
@@ -5227,6 +5380,74 @@ test("preset junit-xml: green and red scorecards (real single-line pytest output
     "pretty-printed XML also names the failure",
   );
   assert.ok(!pretty.includes("pytest"), "no testsuite name leak");
+
+  // ── location: emitted only when the emitter carries file/line ────────────
+  // Captured `bun test --reporter=junit`: file+line live on the <testcase>.
+  const bunXml =
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<testsuites name="bun test" tests="1" assertions="0" failures="1" skipped="0" time="0.006518">\n' +
+    '  <testsuite name="part-02.test.ts" file="part-02.test.ts" tests="1" assertions="0" failures="1" skipped="0" time="0" hostname="host">\n' +
+    '    <testcase name="load part 02 &gt; step 04" classname="" time="0.000305" file="part-02.test.ts" line="3" assertions="0">\n' +
+    '      <failure type="AssertionError" />\n' +
+    "    </testcase>\n" +
+    "  </testsuite>\n" +
+    "</testsuites>\n";
+  const bunRed = runPreset("junit-xml", bunXml);
+  assert.match(bunRed, /failures: 1 {2}errors: 0/);
+  assert.match(
+    bunRed,
+    /^load part 02 &gt; step 04 \(part-02\.test\.ts:3\)$/m,
+    "bun's file+line is folded into the location",
+  );
+
+  // Captured `node --test --test-reporter=junit`: `<testcase>` carries `file`
+  // but no `line` (and the failure element carries neither), so the location is
+  // the file alone. Attributes verbatim; the failure body is elided.
+  const nodeXml = [
+    '<?xml version="1.0" encoding="utf-8"?>',
+    "<testsuites>",
+    '\t<testcase name="load part 02 > step 04" time="0.001844" classname="test" file="/private/tmp/nodetest/part-02.test.mjs" failure="Expected values to be strictly deep-equal:&#10;+ actual - expected&#10;">',
+    '\t\t<failure type="testCodeFailure" message="Expected values to be strictly deep-equal:">',
+    "[body elided]",
+    "\t\t</failure>",
+    "\t</testcase>",
+    "</testsuites>",
+  ].join("\n");
+  const nodeRed = runPreset("junit-xml", nodeXml);
+  assert.match(
+    nodeRed,
+    /^load part 02 > step 04 \(\/private\/tmp\/nodetest\/part-02\.test\.mjs\)$/m,
+    "node:test emits file without line — no phantom column",
+  );
+
+  // Documentary (no pytest/PHPUnit here): the documented shape puts
+  // `file`/`line` on the <testcase>; a failure element carrying them must work
+  // too, since emitters disagree on where the location sits.
+  const testcaseLoc = runPreset(
+    "junit-xml",
+    '<testsuites><testsuite name="pytest" tests="1" failures="1" errors="0"><testcase file="tests/test_a.py" line="42" classname="tests.test_a" name="test_boom" time="0.001"><failure message="assert False">E   assert False</failure></testcase></testsuite></testsuites>',
+  );
+  assert.match(
+    testcaseLoc,
+    /^test_boom \(tests\/test_a\.py:42\)$/m,
+    "testcase-level file/line (pytest/PHPUnit shape)",
+  );
+  const failureLoc = runPreset(
+    "junit-xml",
+    '<testsuites><testsuite name="s" tests="1" failures="1"><testcase classname="c" name="test_x"><failure file="/a/b/Foo.java" line="17" message="boom">trace</failure></testcase></testsuite></testsuites>',
+  );
+  assert.match(
+    failureLoc,
+    /^test_x \(\/a\/b\/Foo\.java:17\)$/m,
+    "failure-level file/line also honoured",
+  );
+  // A testcase that is failing but carries only `file` (no `line`) must not
+  // gain a fake line number.
+  const fileOnly = runPreset(
+    "junit-xml",
+    '<testsuites><testsuite name="s" tests="1" failures="1"><testcase file="a/b.py" classname="c" name="test_y"><failure message="boom">x</failure></testcase></testsuite></testsuites>',
+  );
+  assert.match(fileOnly, /^test_y \(a\/b\.py\)$/m, "file without line");
 });
 
 test("shipped presets: ids are stable and every command ends in head (bounded output)", () => {
@@ -5235,6 +5456,9 @@ test("shipped presets: ids are stable and every command ends in head (bounded ou
     "jest",
     "pytest",
     "junit-xml",
+    "js-trace",
+    "py-trace",
+    "rb-trace",
   ]);
   for (const preset of DIGEST_PRESETS) {
     assert.match(
@@ -5580,7 +5804,7 @@ test("wake digest: no digest configured → wake shape unchanged (regression gua
     assert.equal(lines[3], "Last output: hello world");
     assert.equal(
       lines[4],
-      "The exit code, stats and last output above are the result — report it, and continue the task that depended on this. Read the log only for detail they do not carry.",
+      "The exit code, stats and last output above are a summary, not the diagnosis — the log holds the detail, including the context around any failure. For a failing job, read a window around the failure before concluding a cause.",
     );
     assert.ok(!wake.includes("digest ("));
   } finally {
