@@ -157,3 +157,7 @@ file*, not the arm that receives the output inline.
   `0bfe00ed1d9866b9`. The files' mtimes (2026-09-26 00:51) and the transcripts both confirm the
   content is the original, so this is a method mismatch in the earlier session's record, not a
   changed fixture. The sheet now carries the reproducible value.
+  **Classified later, under the behavioural standard** (`method.md`, "Pin the fixture's
+  behaviour"): both values describe a fixture with identical behaviour — the same failing test,
+  the same counts, the same trace shape — so this was a *cosmetic* difference, recorded here at
+  the time as if it were a substantive one. The sha is a digest, not the contract.

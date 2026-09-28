@@ -31,7 +31,7 @@ The controls below exist to make each of those impossible, or at least visible.
 | **Serialize.** One cell at a time, in one battery job. Nothing else heavy on the machine. | contention inflating every timing column |
 | **Record the machine.** Note load and any concurrent work in the run manifest. | a slow run explained away later as noise |
 | **Declare the environment, not just the terminal.** Every session records `AGENT`, `CLAUDECODE`, `CI`, `NO_COLOR`, `TERM`, and whether commands ran on a pty or through a pipe. | comparing two different *output shapes* as if they were one — which is precisely what happened here: the shapes turn out to differ by environment, not by terminal |
-| **Pin the fixture.** Hash the generated fixture's files; record the hash per cell. | silently measuring a different fixture than the one described |
+| **Pin the fixture's behaviour.** Record the knobs that generate it, and assert its observable shape: file and test counts, the failing test's name, the trace shape, the duration class. The sha is a digest recorded for reference, not the contract. | silently measuring a different fixture than the one described — or chasing a cosmetic byte difference as if it were one |
 | **Manifest per session.** One file beside each transcript recording every parameter below. | unstated method differences between cells |
 | **Generate the tables.** The profiler emits the rows; nobody retypes a number into prose. | transcription drift and untraceable figures |
 | **No edits during a battery.** Not even documentation. | a battery contaminated by its own author |
@@ -183,7 +183,8 @@ agent driving bgrun, and a single run of one is an anecdote. Report n≥3 with m
 
 1. Freeze; confirm nothing else is running.
 2. Probe the rungs for availability (one throwaway prompt each).
-3. Generate the fixture, hash it, write the manifest.
+3. Generate the fixture from its recorded knobs, confirm its behavioural shape, write the
+   manifest (knobs first; the sha is a digest beside them).
 4. Run the cell. Nothing else touches the machine until it finishes.
 5. Profile the session directory with `measure-sessions.ts`.
 6. Append the row to the cell's table, generated — never retyped.
@@ -192,7 +193,7 @@ agent driving bgrun, and a single run of one is an anecdote. Report n≥3 with m
 
 **Run manifest** (beside each transcript): cell id · arm · context (including
 pty/pipe) · **model, rung and reasoning effort** · the exact prompt · fixture id and
-file hash · fixture knobs · session directory · start/end timestamps · machine load ·
+file hash as a digest · fixture knobs · session directory · start/end timestamps · machine load ·
 anything else that ran concurrently.
 
 ## Case: the pty/pipe question — answered
@@ -251,7 +252,7 @@ be assumed equivalent to the manual one. So, before any battery:
 
 | | |
 |---|---|
-| runs | same cell, same fixture hash, same prompt: **n=2 manual + n=2 harness-held** |
+| runs | same cell, same fixture knobs, same prompt: **n=2 manual + n=2 harness-held** |
 | must match (mechanism) | job started as a job; blocked 0.0s; exactly one handoff; the session alive at job end; the wake delivered **as a wake**, not fetched as a tool result |
 | may differ (agent) | wall, context, calls, locating strategy — these differ between two manual runs as well |
 | criterion | the automated runs fall **inside the manual spread** on every mechanism column, and the wake arrives in both |
@@ -266,7 +267,7 @@ human sitting, and the method says which cells were measured that way.
 bun scripts/measure-sessions.ts /path/to/session-dirs… [--csv]
 ```
 
-Rows cite the session directory, fixture hash and context from the manifest, so any
+Rows cite the session directory, fixture knobs (with the sha as a digest) and context from the manifest, so any
 number here can be re-checked from the transcripts it came from.
 
 ## Limits, stated up front

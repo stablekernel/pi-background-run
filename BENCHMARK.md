@@ -78,7 +78,7 @@ reachable through a stack frame that the failure's own wording does not mention.
   recorded entry remains the narrow one in `results.md`, where a digest built from a
   counts-only command carried `299 pass`, `1 fail` and nothing else.
 - **Cell 3a** (`runs/trace-root-framewake/CELL.md`) re-ran the same cell, same fixture
-  hash, same model, same prompt, with **only the closing line changed** to *"a summary,
+  (bytes and all), same model, same prompt, with **only the closing line changed** to *"a summary,
   not the diagnosis — the log holds the detail… read a window around the failure before
   concluding a cause."* Nothing else changed: no digest, no preset, no pointer. The
   frame file now appeared **3, 3, 5** times, the deepest frame seen became `harness.ts`,
