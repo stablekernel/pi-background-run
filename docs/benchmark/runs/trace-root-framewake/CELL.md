@@ -5,9 +5,10 @@ run after the wake's closing line changed from "the exit code, stats and last ou
 result**" to "a summary, not the diagnosis — the log holds the detail, including the context around
 any failure. For a failing job, read a window around the failure before concluding a cause."
 
-**Nothing else changed.** The project's digest was left as it was — a hand-rolled pass/fail count —
-so no preset, no pointer, and no ecosystem-specific code was in play. Extension: bench `7949ea0`
-(trace presets and the failure gate present but *unused* here).
+**Nothing else changed.** No digest was configured for this project at all — the transcripts confirm
+it, since no wake carries a digest block — so no preset, no pointer, and no ecosystem-specific code
+were in play. Extension: bench `7949ea0` (trace presets and the failure gate present but *unused*
+here).
 
 | field | value |
 |---|---|

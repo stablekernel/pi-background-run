@@ -73,10 +73,16 @@ not the fix.
 
 The digest entry is the experimental condition, so it is set by hand, in the project's own config —
 the tool does not write config files (see the nudge's contract), and a tool that configured its own
-experiment would be measuring itself. Replace the `command` entry in `.pi/pi-bgrun.json` with:
+experiment would be measuring itself. **Create** `.pi/pi-bgrun.json` (the bench project has no digest
+configured at all — every baseline cell ran with none, which the transcripts confirm: no wake carries
+a digest block, so this is a pure addition rather than a replacement):
 
 ```json
-{ "type": "test", "preset": "js-trace", "on": "failure" }
+{
+  "digest": [
+    { "type": "test", "match": { "command": "*bun test*" }, "preset": "js-trace", "on": "failure" }
+  ]
+}
 ```
 
 (Only one digest block is appended per wake, which is why the counts entry is replaced rather than
@@ -92,7 +98,8 @@ pointer replaces the `bgtail` read), `cause_file` (must stay `harness.ts`), and 
 A null result here is a finding too: a 96-line log is cheap to read, and the pointer's value should
 show on logs where that read is not.
 
-Restore the config afterwards — a changed digest silently changes every later cell.
+Restore afterwards by **deleting** `.pi/pi-bgrun.json`: the baseline cells ran with no digest at all,
+and a digest left in place silently changes every later cell.
 
 **Secondary — a digest that names the failure.** Answers the narrower question, *was the missing
 pointer the whole defect?*, without any product change. If the primary fix lands, this matters less,

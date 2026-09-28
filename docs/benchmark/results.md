@@ -347,8 +347,8 @@ ladder will have to control for.
 The same cell again, after the wake's closing line changed from "the exit code, stats and last output
 above **are the result**" to "a summary, not the diagnosis — the log holds the detail, including the
 context around any failure. For a failing job, read a window around the failure before concluding a
-cause." Nothing else changed: the project's digest stayed a hand-rolled pass/fail count, so no preset
-and no pointer were in play. Full record:
+cause." Nothing else changed: no digest was configured for the project at all, so no preset and no
+pointer were in play. Full record:
 [runs/trace-root-framewake/CELL.md](runs/trace-root-framewake/CELL.md).
 
 | metric | Cell 3 | Cell 3a |
