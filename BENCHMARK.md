@@ -42,20 +42,27 @@ The cost of the background arm is the wake's round trip: the job runs detached, 
 session must still wait for the wake before it can act. Whether that is cheaper than
 running synchronously depends on how long the job takes.
 
-| | Cell 1b (Cell 3, same shape) — cheap job | Cell 4 — expensive job |
+| | Cell 3a — cheap job (current) | Cell 4 — expensive job |
 |---|---|---|
-| job | 23.2s (Cell 3's is shorter) | ~204s (570 tests, 1,281 lines) |
-| `wall_s` | 40.9 [38.1–42.7] vs 33.5 [32.3–33.9] | **225.9** [223.1–228.4] vs 696.2 [283.8–732.4] |
-| `blocked_s` | 0.0 vs 22.4 | **0.0** vs 660.2 |
-| `ctx_chars` | 9,892 vs 28,021 | **18,760** [16,365–21,056] vs 79,901 [66,792–86,836] |
-| `calls` | 2, 2, 2 vs 1, 1, 1 | 3, 4, 4 vs 12, 2, 6 |
+| job | 22.8s | ~204s (570 tests, 1,281 lines) |
+| `wall_s` | 40.7 [39.2–43.9] vs 34.5 [33.2–34.6] | **225.9** [223.1–228.4] vs 696.2 [283.8–732.4] |
+| `blocked_s` | 0.0 vs 22.8 | **0.0** vs 660.2 |
+| `ctx_chars` | 14,009 vs 29,721 | **18,760** [16,365–21,056] vs 79,901 [66,792–86,836] |
+| `calls` | 3, 3, 3 vs 1, 1, 1 | 3, 4, 4 vs 12, 2, 6 |
 
 **For a cheap job (23–34s) the round trip dominates and the background arm is slower.**
-Cell 1b's job is 23.2s and the wake lands about 7s after it exits, so the arm's best case
-is vanilla's blocking minus the turn it saves — 40.9s against 33.5s. Cell 3's fixture is
-smaller still: 37.5s against 34.5s. The arm still delivers what it owns — `blocked_s` 0.0
-against 22.4s/22.6s — but the unblocking is paid for in session wall time. Sources:
-`runs/red-tail-short-fixed/CELL.md`, `runs/trace-root/CELL.md`.
+Cell 3a's job is 22.8s and the wake lands about 7s after it exits, so the arm's best case
+is vanilla's blocking minus the turn it saves — 40.7s against 34.5s. The arm still delivers
+what it owns — `blocked_s` 0.0 against 22.8s — but the unblocking is paid for in session
+wall time. Source: `runs/trace-root-framewake/CELL.md`.
+
+**Before the wake's closing line changed** (labelled history). Two earlier runs measured the
+same shape on builds that predate the wake's closing-line change: `red-tail-short`'s newest
+run (Cell 1b) at 40.9 [38.1–42.7] vs 33.5 [32.3–33.9] with context 9,892 against 28,021
+(`runs/red-tail-short-fixed/CELL.md` — itself awaiting a re-run, since its newest run
+predates the same change), and `trace-root`'s Cell 3 at 37.5s against 34.5s
+(`runs/trace-root/CELL.md`). Each is kept as labelled history inside its own cell section,
+never as a competing headline.
 
 **For an expensive job the background arm pays it once and the synchronous arm pays it
 repeatedly.** Cell 4's job takes ~204s. The `bgrun` arm's 225.9s is that job plus about
@@ -94,7 +101,7 @@ reachable through a stack frame that the failure's own wording does not mention.
 The instruction knows nothing about how any runner spells a stack frame, which is the
 point: the fix is language-neutral instruction, not ecosystem-specific parsing. The
 JS/TS-tuned built-in locator was deleted in favour of this framing plus optional presets,
-and a nine-entry multi-runner corpus re-run showed nothing regressed (commit `e7c1934`).
+and a nine-entry multi-runner corpus re-run showed nothing regressed (merged as `6b04d24`).
 
 ## A pointer is a lead the session still has to verify — and that costs
 
@@ -102,23 +109,17 @@ The presets and the `on: "failure"` gate put a *pointer* — a named failure and
 frame — in the wake. Cell 4 ran that layer three ways, each run changing one thing
 (`runs/long-buried/CELL.md`, profiles beside it):
 
-| Cell 4, bgrun arm | no pointer | pointer, wrong | pointer, correct |
+| Cell 4, bgrun arm | pointer, correct (current) | no pointer (baseline) | pointer, wrong (before the fix) |
 |---|---|---|---|
-| `calls` | 3, 4, 4 | 5, 5, 6 | 5, 5, 8 |
-| `ctx_chars` | 18,760 [16,365–21,056] | 28,633 [21,867–31,481] | 33,799 [29,180–36,355] |
-| `wall_s` | 225.9 | 233.1 | 234.0 |
+| `calls` | 5, 5, 8 | 3, 4, 4 | 5, 5, 6 |
+| `ctx_chars` | 33,799 [29,180–36,355] | 18,760 [16,365–21,056] | 28,633 [21,867–31,481] |
+| `wall_s` | 234.0 | 225.9 | 233.1 |
 
 Ranges do not overlap on calls (baseline max 4, both variants min 5) or context (baseline
 max 21,056, correct variant min 29,180). Both variants reached the same
 `part-05.test.ts`.
 
-**First run — the pointer was wrong.** The `js-trace` preset named
-`Failure: (pass) preset js-trace corpus (captured): …`, **a passing test's name**. The
-cause is self-reference: the suite under test contains the preset's own corpus tests,
-which print captured failure text, so the log holds failure-shaped strings from passing
-tests, and an unanchored scanner cannot tell them from a real one.
-
-**Second run — the pointer was fixed and still cost more.** After the preset required
+**Current run — the pointer was fixed and still cost more.** After the preset required
 anchored evidence, all three wakes named the true failure
 (`AssertionError … at TestContext.<anonymous> (/private/tmp/long-buried-fixture/part-05.test.ts:59:9)`),
 and the cost rose again, not fell. The sequences say why: `bgrun bggrep bggrep bgtail bggrep`
@@ -127,6 +128,15 @@ which had nothing to verify. `calls_after_exit` is 4, 4, 6 against the baseline'
 The wake's own honest hedge — *"any failure named here (by a trace digest) is one failure,
 not the whole story"* — makes a pointer a lead rather than an answer, and dropping that hedge
 to make the pointer land would be tuning the instrument to the result.
+
+**Before the fix — the pointer was wrong** (labelled history, the superseded `js-trace`
+preset). The layer's first behavioural exercise named
+`Failure: (pass) preset js-trace corpus (captured): …`, **a passing test's name**. The
+cause is self-reference: the suite under test contains the preset's own corpus tests,
+which print captured failure text, so the log holds failure-shaped strings from passing
+tests, and an unanchored scanner cannot tell them from a real one. Sessions did not trust
+it, and that wrong-pointer run is the most expensive after the fixed one: 5, 5, 6 calls
+and 28,633 characters.
 
 **The rule: a pointer is a hypothesis the session must still verify, and where it can search
 cheaply that costs more than it saves.** Its value should be conditional on the session
@@ -164,7 +174,8 @@ In every measured cell, the `bgrun` sessions made **zero polls before the wake**
 all three Cell 4 pointer-variant sessions, and all Cell 3a sessions). Cell 1 was the
 counter-example that produced the fix — 3 of 3 sessions claimed a wake before receiving
 it and made 10, 9 and 5 polls — and Cell 1b re-ran the same cell on the fixed extension
-and measured 0, 0, 0 in both columns (`runs/red-tail-short-fixed/CELL.md`). This holds in
+and measured 0, 0, 0 in both columns (`runs/red-tail-short-fixed/CELL.md`; that run is
+itself awaiting a re-run, since it predates the wake's closing-line change). This holds in
 Cell 4, a 1,281-line log and a ~204s job, which is the cell where polling is most
 tempting. It is a mechanism result about the tool, not a claim about agents in general.
 

@@ -29,8 +29,9 @@ procedure that produces these rows is in [method.md](./method.md).
 | cell | prediction | status |
 |---|---|---|
 | `green-short` | vanilla by median, bimodal | not run |
-| `red-tail-short` | vanilla by median | not run |
-| `long-buried` | bgrun on executions and blocked; context undecided | not run |
+| `red-tail-short` | vanilla by median | **run** — [Cell 1b](#cell-1b--red-tail-short-measured-2026-09-28) (newest run, awaiting a re-run) with Cell 1 as its before-half |
+| `long-buried` | bgrun on executions and blocked; context undecided | **run** — [Cell 4](#cell-4--long-buried-and-its-pointer-variant-2026-09-28), plus its pointer variants |
+| `trace-root` | bgrun on cost; the cause may not survive the wake | **run** — [Cell 3a](#cell-3a--trace-root-measured-2026-09-28) with Cell 3 as its before-half |
 | `fast-verbose` | struggle for bgrun | not run |
 | `fail-fast` | struggle for bgrun | not run |
 | `pty-fixture` | pty = pipe + a per-test line | **falsified** — see Instrument checks |
@@ -254,11 +255,42 @@ haiku→sonnet→opus, which is the axis `H7`/`H11` need.
 | rung | model | `red-tail-short` | `long-buried` | `trace-root` |
 |---|---|---|---|---|
 | weak | `anthropic/claude-haiku-4-5` | not run | not run | not run |
-| mid | `anthropic/claude-sonnet-4-6` | **done** — [Cell 1](#cell-1--red-tail-short-measured-2026-09-28) | not run | not run |
+| mid | `anthropic/claude-sonnet-4-6` | **done** — [Cell 1b](#cell-1b--red-tail-short-measured-2026-09-28) | **done** — [Cell 4](#cell-4--long-buried-and-its-pointer-variant-2026-09-28) | **done** — [Cell 3a](#cell-3a--trace-root-measured-2026-09-28) |
 | strong | `anthropic/claude-opus-5` | not run | not run | not run |
 | floor probe (not a rung) | `fireworks/gpt-oss-120b` | not run | not run | not run |
 
-## Cell 1 — `red-tail-short`, measured 2026-09-28
+## Cell 1b — `red-tail-short`, measured 2026-09-28
+
+**Awaiting a re-run.** The newest run of this cell is Cell 1b: the same fixture, model and prompt
+re-run after the poll fix, which made a running job answer a reader with its *state* rather than its
+log (`runs/red-tail-short-fixed/`). It postdates that fix but predates the wake's closing-line
+change — the same change `trace-root` below shows flipping a short cell's call sequence — so these
+are the newest numbers this cell has, not the current tool's, and the cell needs a re-run before
+they can stand as current.
+
+Cell 1's mechanism was fixed in the extension and the cell re-run, with the fixture, model, prompt
+and command held fixed — the only difference is the tool code (the bench commit that synced the
+fixed extension; extension sha `18f022248c9f4552`, against Cell 1's `b6539e3fab30bb99`; the
+product's poll fix and the changes with it merged as `6b04d24`). Full record and artifacts:
+[runs/red-tail-short-fixed/CELL.md](runs/red-tail-short-fixed/CELL.md).
+
+| metric | Cell 1 | Cell 1b | vanilla (control) |
+|---|---|---|---|
+| wake claims before exit | 1, 2, 1 | **0, 0, 0** | — |
+| polls before exit | 10, 9, 5 | **0, 0, 0** | — |
+| tool calls per session | 12, 11, 9 | **2, 2, 2** | 1 |
+| ctx_chars (median) | 31,170 | **9,892** | 27,817 → 28,021 |
+| wall_s (median [min–max]) | 45.4 [42.9–51.1] | 40.9 [38.1–42.7] | 33.0 → 33.5 |
+| blocked_s / diag_reach | 0.0, 3/3 | 0.0, 3/3 | 22.5, 3/3 |
+
+**`H12` supported and fixed:** no session claims a wake it has not received, and the polls it
+licensed went to zero. The interaction is now `bgrun` → yield → wake → one search → answer. Context
+inverted — bgrun costs *less* than vanilla here — because with the log unavailable before the wake
+the session searched it (`bggrep`, `locate` flipping from `position` to `pattern`) instead of
+reading it in pieces. Wall time did **not** invert: the cell stays negative, exactly as the floor
+argument predicted, because the job is 23.2s and the wake lands ~7s after it exits.
+
+### Before the poll fix — Cell 1, the fabricated-wake finding (`H12`)
 
 The first real cell: six sessions (3 bgrun / 3 vanilla) at `anthropic/claude-sonnet-4-6`, the
 neutral prompt, one session directory each, interleaved. Full record, provenance and instrument
@@ -286,34 +318,38 @@ file is the failing test that every session names. The column is informative onl
 `DUMMY_CAUSE_MODULE=1`, i.e. the `trace-root` cell. n=3 per arm: spreads are reported, and no
 significance is claimed.
 
-### Cell 1b — the same cell after the no-poll change (2026-09-28)
+## Cell 3a — `trace-root`, measured 2026-09-28
 
-Cell 1's mechanism was fixed in the extension and the cell re-run, with the fixture, model, prompt
-and command held fixed — the only difference is the tool code (bench `8750f0e`, extension sha
-`18f022248c9f4552`; product branch `fix/no-poll-before-wake`, commit `5e43fba`, against Cell 1's
-`b6539e3fab30bb99`). Full record and artifacts:
-[runs/red-tail-short-fixed/CELL.md](runs/red-tail-short-fixed/CELL.md).
+**Current run — the wake's closing line fixed.** The same cell again, after the wake's closing line
+changed from "the exit code, stats and last output above **are the result**" to "a summary, not the
+diagnosis — the log holds the detail, including the context around any failure. For a failing job,
+read a window around the failure before concluding a cause." Nothing else changed: no digest was
+configured for the project at all, so no preset and no pointer were in play. Full record:
+[runs/trace-root-framewake/CELL.md](runs/trace-root-framewake/CELL.md).
 
-| metric | Cell 1 | Cell 1b | vanilla (control) |
-|---|---|---|---|
-| wake claims before exit | 1, 2, 1 | **0, 0, 0** | — |
-| polls before exit | 10, 9, 5 | **0, 0, 0** | — |
-| tool calls per session | 12, 11, 9 | **2, 2, 2** | 1 |
-| ctx_chars (median) | 31,170 | **9,892** | 27,817 → 28,021 |
-| wall_s (median [min–max]) | 45.4 [42.9–51.1] | 40.9 [38.1–42.7] | 33.0 → 33.5 |
-| blocked_s / diag_reach | 0.0, 3/3 | 0.0, 3/3 | 22.5, 3/3 |
+| metric | Cell 3 | Cell 3a |
+|---|---|---|
+| `harness.ts` in the bgrun arm's context | **0, 0, 0** | **3, 3, 5** |
+| `cause_file` (deepest frame seen) | `part-02.test.ts` | **`harness.ts`** |
+| tool calls | 2 | 3 |
+| ctx_chars (median) | 9,758 | 14,009 |
+| polls / wake claims | 0 / 0 | 0 / 0 |
 
-**`H12` supported and fixed:** no session claims a wake it has not received, and the polls it
-licensed went to zero. The interaction is now `bgrun` → yield → wake → one search → answer. Context
-inverted — bgrun costs *less* than vanilla here — because with the log unavailable before the wake
-the session searched it (`bggrep`, `locate` flipping from `position` to `pattern`) instead of
-reading it in pieces. Wall time did **not** invert: the cell stays negative, exactly as the floor
-argument predicted, because the job is 23.2s and the wake lands ~7s after it exits.
+**Two sentences of language-neutral framing fixed the cell** — "read a window around the failure"
+knows nothing about how any runner spells a stack frame. The sequences show it: Cell 3's sessions ran
+`bgrun` → `bggrep` and stopped at the symptom; Cell 3a's ran `bgrun` → `bggrep` → `bgtail`, reading
+the window where the frames are. The extra call costs ~4k characters and buys the cause, still at
+**half vanilla's context** (14,009 against 29,721); the wall floor stands (40.7s against 34.5s).
 
-## Cell 3 — `trace-root`, measured 2026-09-28
+This also retroactively justifies deleting the built-in locator: the JS-tuned regex was never the fix.
+The presets and the `on: "failure"` gate are precision layers — they put a pointer in the wake — not
+the thing that made a session follow the trace. Variant B (`--variant tracepreset`) now measures an
+increment on top of this rather than a fix.
 
-Six sessions on the fixed extension (bench `8750f0e`), same fixture sha `605aba38baf5c6ad`. Full
-record: [runs/trace-root/CELL.md](runs/trace-root/CELL.md).
+### Before the wake's closing line changed — Cell 3, the cause-loss finding
+
+Six sessions on the fixed extension (post-poll-fix; extension sha `18f022248c9f4552`), same fixture
+sha `605aba38baf5c6ad`. Full record: [runs/trace-root/CELL.md](runs/trace-root/CELL.md).
 
 | metric (median) | bgrun | vanilla |
 |---|---|---|
@@ -345,46 +381,18 @@ question is whether that file appears at all, and it appeared 0/3 against 3/3. T
 would test `H11`, and a weak rung on the vanilla arm would still see `harness.ts` — a confound the
 ladder will have to control for.
 
-### Cell 3a — `trace-root` with the framing fix only (2026-09-28)
-
-The same cell again, after the wake's closing line changed from "the exit code, stats and last output
-above **are the result**" to "a summary, not the diagnosis — the log holds the detail, including the
-context around any failure. For a failing job, read a window around the failure before concluding a
-cause." Nothing else changed: no digest was configured for the project at all, so no preset and no
-pointer were in play. Full record:
-[runs/trace-root-framewake/CELL.md](runs/trace-root-framewake/CELL.md).
-
-| metric | Cell 3 | Cell 3a |
-|---|---|---|
-| `harness.ts` in the bgrun arm's context | **0, 0, 0** | **3, 3, 5** |
-| `cause_file` (deepest frame seen) | `part-02.test.ts` | **`harness.ts`** |
-| tool calls | 2 | 3 |
-| ctx_chars (median) | 9,758 | 14,009 |
-| polls / wake claims | 0 / 0 | 0 / 0 |
-
-**Two sentences of language-neutral framing fixed the cell** — "read a window around the failure"
-knows nothing about how any runner spells a stack frame. The sequences show it: Cell 3's sessions ran
-`bgrun` → `bggrep` and stopped at the symptom; Cell 3a's ran `bgrun` → `bggrep` → `bgtail`, reading
-the window where the frames are. The extra call costs ~4k characters and buys the cause, still at
-**half vanilla's context** (14,009 against 29,721); the wall floor stands (40.7s against 34.5s).
-
-This also retroactively justifies deleting the built-in locator: the JS-tuned regex was never the fix.
-The presets and the `on: "failure"` gate are precision layers — they put a pointer in the wake — not
-the thing that made a session follow the trace. Variant B (`--variant tracepreset`) now measures an
-increment on top of this rather than a fix.
-
 ## Cell 4 — `long-buried`, and its pointer variant (2026-09-28)
 
 The expensive-workload cell: the failure is buried in `part-05` of ten, so a tail read has nothing to
 find. Workload from the job's own command line: **570 tests, 1,281 lines, ~204s per run**. Full
 record: [runs/long-buried/CELL.md](runs/long-buried/CELL.md).
 
-| metric (median) | bgrun (framing only) | vanilla | bgrun (with pointer) |
+| metric (median) | bgrun (framing only) | vanilla | bgrun (pointer, current) |
 |---|---|---|---|
-| wall_s | **225.9** [223.1–228.4] | 696.2 [283.8–732.4] | 233.1 [231.2–233.1] |
+| wall_s | **225.9** [223.1–228.4] | 696.2 [283.8–732.4] | 234.0 [232.8–256.3] |
 | blocked_s | **0.0** | 660.2 | 0.0 |
-| ctx_chars | **18,760** | 79,901 | 28,633 |
-| calls | 3, 4, 4 | 12, 2, 6 | 5, 5, 6 |
+| ctx_chars | **18,760** | 79,901 | 33,799 [29,180–36,355] |
+| calls | 3, 4, 4 | 12, 2, 6 | 5, 5, 8 |
 | deepest frame seen | `part-05.test.ts` | `part-05.test.ts` | `part-05.test.ts` |
 | polls / wake claims | 0 / 0 | — | 0 / 0 |
 
@@ -396,8 +404,18 @@ counterweight to Cells 1/1b/3, where a 23–34s job made the wake's round trip t
 Diagnosis is a *tie* — both arms reached `part-05.test.ts` — which is the best form of the result:
 the same answer at a quarter of the context, because vanilla bought it by reading everything.
 
-**The pointer variant is a negative result, and a product defect.** Its first behavioural exercise:
-the `js-trace` preset fired on the failing job and named
+**The pointer variant is a negative result, and a product defect.** The current preset
+(`tracepreset-fixed`, three bgrun sessions, vanilla omitted by design) requires real evidence before
+naming anything, and named the true failure
+(`AssertionError … at /private/tmp/long-buried-fixture/part-05.test.ts:59:9`) — and cost the *most*:
+calls 5, 5, 8 and context 33,799 [29,180–36,355], against 3, 4, 4 and 18,760 for no pointer at all.
+Calls and context are non-overlapping between the baseline and both pointer variants. The sessions
+verified the pointer and searched anyway (`bgrun bggrep bggrep bgtail bggrep`), because the wake's
+honest hedge — "any failure named here is one failure, not the whole story" — makes it a lead rather
+than an answer.
+
+**Before the fix — the pointer was wrong** (labelled history, the superseded `js-trace` preset). Its
+first behavioural exercise fired on the failing job and named
 `Failure: (pass) preset js-trace corpus (captured): …` — a **passing** test's name, not the failing
 one. The cause is self-reference: the suite under test contains the preset's own corpus tests, which
 print captured failure text, so the log holds failure-shaped strings from passing tests. Sessions did
@@ -406,28 +424,20 @@ scan cost is irrelevant (~20ms against 204s); the price is that a claim which ma
 verified.
 
 **Design rule, now measured twice: a pointer is a hypothesis the session must still verify, and where
-it can search cheaply that costs more than it saves.** A third run — the preset *fixed* to require real
-evidence, after which every wake named the true failure
-(`AssertionError … at /private/tmp/long-buried-fixture/part-05.test.ts:59:9`) — cost the *most*: calls
-5, 5, 8 and context 33,799 [29,180–36,355], against 3, 4, 4 and 18,760 for no pointer at all. Calls
-and context are non-overlapping between the baseline and both pointer variants. The sessions verified
-the pointer and searched anyway (`bgrun bggrep bggrep bgtail bggrep`), because the wake's honest hedge
-— "any failure named here is one failure, not the whole story" — makes it a lead rather than an answer.
-The pointer's value should therefore be conditional on the session lacking a cheap search: a log too
-large or hostile to grep, a tool-less agent, or a weaker model (what `H7`/`H8` would test). The
-wrong-pointer run's number for comparison: 4 calls / 18.8k with none, 5.3 / 28.6k with a wrong one,
-5.7 / 33.8k with a correct one. The preset defect itself is fixed from the kept log; the design rule is
-what the three-way shows. Attribution caveat: the workload is the
-extension's own suite, which is a pathological digest input, so the *rule* generalises further than
-the *number* does.
+it can search cheaply that costs more than it saves.** The pointer's value should therefore be
+conditional on the session lacking a cheap search: a log too large or hostile to grep, a tool-less
+agent, or a weaker model (what `H7`/`H8` would test). The wrong-pointer run's number for comparison: 4
+calls / 18.8k with none, 5.3 / 28.6k with a wrong one, 5.7 / 33.8k with a correct one. The preset
+defect itself is fixed from the kept log; the design rule is what the three-way shows. Attribution
+caveat: the workload is the extension's own suite, which is a pathological digest input, so the *rule*
+generalises further than the *number* does.
 
 ## Blocked on
 
 - Phase 1 instrument work is closed: `locating`, the shape and evidence-path instruments,
   and the unattended question (`H6`, negative — see above) are all answered. The first cell
-  has since been measured ([Cell 1](#cell-1--red-tail-short-measured-2026-09-28)); what
-  remains is `long-buried`, `trace-root`, and the ladder rungs above the mid rung — each
-  needs its own attended sessions.
+  has since been measured ([Cell 1b](#cell-1b--red-tail-short-measured-2026-09-28)); what
+  remains is the ladder rungs above the mid rung — each needs its own attended sessions.
 - The fixture's crutch is now a knob, not a blocker: `DUMMY_ANNOUNCE_FAILURE=0` removes
   the line that names the planted failure, and every diagnosis or discovery cell must run
   with it off. The default stays `1` so the measurements already taken against this
