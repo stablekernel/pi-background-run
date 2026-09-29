@@ -36,10 +36,13 @@ checks are in `results.md`; the method, the controls and the metric definitions 
 and transcripts are in `runs/`. Only the findings are here. § [Provenance](#provenance) maps
 every cell to its record file.
 
-**Terms.** *cell*, *generation*, *arm*, *wake*, *digest*, *trace preset*, `blocked_s`,
-`ctx_chars` and `cause_reached` are defined in plain terms in the
-[glossary in `AT-A-GLANCE.md`](docs/benchmark/AT-A-GLANCE.md#glossary). They are defined
-once, there, so that this document can use them without re-explaining them.
+**Terms.** The vocabulary this document uses — *cell*, *arm*, *wake*, *digest*, *trace preset*,
+`blocked_s`, `ctx_chars`, `cause_reached` — is defined once, in plain terms, in the
+[glossary in `AT-A-GLANCE.md`](docs/benchmark/AT-A-GLANCE.md#glossary), so that this document
+can use them without re-explaining them. One term is local to the documents that carry history:
+a **generation** is which build a run was measured against — the release version where there is
+one, otherwise a short sha plus the date. Where a cell has been re-run on a newer build, the
+newer generation leads and the earlier one is kept as labelled history.
 
 ## How these results were produced
 
