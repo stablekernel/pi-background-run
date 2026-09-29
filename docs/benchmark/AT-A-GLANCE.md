@@ -221,7 +221,7 @@ Plain definitions of the terms used above, each in the sense the documents under
   every current cell.
 
 → [`BENCHMARK.md`](../../BENCHMARK.md) (full findings and history) · [`method.md`](method.md) (how
-it was measured) · [`results.md`](results.md) (every cell, outcome and earlier generation) ·
+it was measured) · [`results.md`](results.md) (every cell, outcome and superseded run) ·
 [`predictions.md`](predictions.md) (the register) · [`runs/`](runs/) (the raw records)
 
 The rules these records follow — how a number is shown, and how history is kept out of the current
