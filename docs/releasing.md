@@ -1,5 +1,30 @@
 # Releasing pi-background-run
 
+## Landing changes: code is proposed, not committed
+
+**Code changes wait for the owner's review before they land anywhere.** A commit or push that
+changes behaviour — `extension/`, `scripts/`, `skills/`, the workflows, `package.json`, tests —
+is a *proposal* until the owner has read it. This is a rule, not a preference.
+
+- **Propose, don't push.** Show the diff, or open the PR and stop. CI passing is not a substitute
+  for the owner reading it: `pr-title.yml` and `ci.yml` check that a change is well-formed, never
+  that it is right.
+- **Never `main` on your own account.** Nothing reaches `main` without the owner asking for it in
+  that conversation. A green check is not an instruction.
+- **Documentation and records are different.** Bench documents, per-cell records and the
+  presentation rules may be committed autonomously on `bench/dogfooding` — they record work that
+  has already been reviewed, and they answer to `docs/benchmark/method.md` § Recording and
+  presentation rules instead. That freedom does not extend to anything a user installs.
+- **An agent brief that touches code must say "propose, do not commit."** The rule only holds if
+  the instruction pattern does; a brief ending "commit and push" overrides it by accident.
+- **Records are never rewritten.** A correction to a per-cell record is a dated annotation, not an
+  edit (`method.md` rule 8).
+
+Why the two need different treatment: the record can be checked mechanically against its own
+evidence — profiles, transcripts, the sources of each number — so a reviewer can verify it after
+the fact. Code cannot. Whether a change is right is a judgement about behaviour, and the owner is
+the one who can make it.
+
 Version numbers, `CHANGELOG.md`, and the GitHub Release notes are all derived from
 Conventional Commits, via [release-please](https://github.com/googleapis/release-please).
 Nobody edits a version by hand.
