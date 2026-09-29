@@ -41,12 +41,22 @@ Cells: [`red-tail-short`](#red-tail-short--failure-near-the-end-of-a-short-run) 
 short run whose diagnostic is one tail-window away. Does the handoff buy anything when the failure
 is cheap to reach?
 
-| metric (median [min–max]) | bgrun | vanilla |
+**Bold marks the favourable value in each row** — the smaller median for time, context, calls and
+blocking, the larger for appearances of the cause; a tie is not bolded. In the
+[pointer table](#the-three-way-pointer-result), whose rows are pointer variants rather than arms,
+bold instead flags the pointer's correctness.
+
+| | bgrun (median [min–max]) | vanilla (median [min–max]) |
 |---|---|---|
-| `wall_s` | 46.7 [40.3–50.7] | **35.0** [34.4–38.6] |
-| `ctx_chars` | **13,941** [12,876–16,534] | 30,056 [29,962–30,183] |
-| `calls` | 4, 3, 3 | 1 [1–1] |
-| `blocked_s` (mechanism) | 0.0 | 24.3 |
+| Time blocked waiting (s) — blocked_s | **0.0 [0.0–0.0]** | 24.3 [23.9–24.4] |
+| Wall time (s) — wall_s | 46.7 [40.3–50.7] | **35.0 [34.4–38.6]** |
+| Context used (characters) — ctx_chars | **13,941 [12,876–16,534]** | 30,056 [29,962–30,183] |
+| Tool calls — calls | 3 [3–4] | **1 [1–1]** |
+| Reached the cause — cause_reached | 3/3 | 3/3 |
+| Deepest frame seen — cause_file | `part-02.test.ts` | `part-02.test.ts` |
+
+Brackets give the range across the three runs; an outcome row reports the runs that showed the
+result, not a median.
 
 Source: [`runs/red-tail-short-v080/profile.csv`](runs/red-tail-short-v080/profile.csv) (summary
 rows); cell record [`runs/red-tail-short-v080/CELL.md`](runs/red-tail-short-v080/CELL.md). The
@@ -65,13 +75,14 @@ assertion cluster), so a tail read has nothing to find: 570 tests, 1,281 lines, 
 This is the regime the async handoff is *for*. Run with no digest configured, so the pointer layer
 is not exercised.
 
-| metric (median [min–max]) | bgrun | vanilla |
+| | bgrun (median [min–max]) | vanilla (median [min–max]) |
 |---|---|---|
-| `wall_s` | **225.9** [223.1–228.4] | 696.2 [283.8–732.4] |
-| `blocked_s` (mechanism) | **0.0** | 660.2 |
-| `ctx_chars` | **18,760** [16,365–21,056] | 79,901 [66,792–86,836] |
-| `calls` | 3, 4, 4 | 12, 2, 6 |
-| cause reached (`part-05.test.ts`) | 3/3 | 3/3 |
+| Time blocked waiting (s) — blocked_s | **0.0 [0.0–0.0]** | 660.2 [263.6–707.3] |
+| Wall time (s) — wall_s | **225.9 [223.1–228.4]** | 696.2 [283.8–732.4] |
+| Context used (characters) — ctx_chars | **18,760 [16,365–21,056]** | 79,901 [66,792–86,836] |
+| Tool calls — calls | **4 [3–4]** | 6 [2–12] |
+| Reached the cause — cause_reached | 3/3 | 3/3 |
+| Deepest frame seen — cause_file | `part-05.test.ts` | `part-05.test.ts` |
 
 Source: [`runs/long-buried/profile.csv`](runs/long-buried/profile.csv) (summary rows); cell record
 [`runs/long-buried/CELL.md`](runs/long-buried/CELL.md). The first cell where bgrun wins on both
@@ -90,13 +101,15 @@ frame down. The wake's closing line is language-neutral — *"a summary, not the
 holds the detail… read a window around the failure before concluding a cause."* — so nothing in
 the wake promises the summary is the answer.
 
-| metric (median [min–max]) | bgrun | vanilla |
+| | bgrun (median [min–max]) | vanilla (median [min–max]) |
 |---|---|---|
-| `wall_s` | 40.7 [39.2–43.9] | **34.5** [33.2–34.6] |
-| `ctx_chars` | **14,009** [13,559–16,243] | 29,721 [29,610–29,731] |
-| `calls` | 3 | 1 |
-| `harness.ts` in context | **3, 3, 5** | — |
-| deepest frame seen | **`harness.ts`** | `harness.ts` |
+| Time blocked waiting (s) — blocked_s | **0.0 [0.0–0.0]** | 22.8 [22.8–23.3] |
+| Wall time (s) — wall_s | 40.7 [39.2–43.9] | **34.5 [33.2–34.6]** |
+| Context used (characters) — ctx_chars | **14,009 [13,559–16,243]** | 29,721 [29,610–29,731] |
+| Tool calls — calls | 3 [3–3] | **1 [1–1]** |
+| Reached the cause — cause_reached | 3/3 | 3/3 |
+| Deepest frame seen — cause_file | `harness.ts` | `harness.ts` |
+| Times `harness.ts` appeared in context | **3 [3–5]** | — |
 
 Source: [`runs/trace-root-framewake/profile.csv`](runs/trace-root-framewake/profile.csv) (summary
 rows) and the cell record
@@ -116,11 +129,13 @@ frame — into the wake. Cell 4 (`long-buried`) ran that layer three ways, each 
 the current preset leads, and the wrong-pointer leg is kept beside it because it is what establishes
 the rule:
 
-| `long-buried` bgrun arm | pointer | `calls` | `ctx_chars` | `wall_s` |
+| `long-buried` bgrun arm | pointer | Wall time (s) — wall_s | Context used (characters) — ctx_chars | Tool calls — calls |
 |---|---|---|---|---|
-| `tracepreset-fixed` — current preset | **correct** | 5, 5, 8 | **33,799** [29,180–36,355] | 234.0 |
-| baseline | none | 3, 4, 4 | 18,760 [16,365–21,056] | 225.9 |
-| `tracepreset` | **wrong** | 5, 5, 6 | 28,633 [21,867–31,481] | 233.1 |
+| `tracepreset-fixed` — current preset | **correct** | 234.0 [232.8–256.3] | 33,799 [29,180–36,355] | 5 [5–8] |
+| baseline | none | 225.9 [223.1–228.4] | 18,760 [16,365–21,056] | 4 [3–4] |
+| `tracepreset` | **wrong** | 233.1 [231.2–233.1] | 28,633 [21,867–31,481] | 5 [5–6] |
+
+*A different table: one cell's pointer variants, not arms across cells.*
 
 Sources: [`runs/long-buried/profile.csv`](runs/long-buried/profile.csv),
 [`runs/long-buried-tracepreset/profile.csv`](runs/long-buried-tracepreset/profile.csv),
@@ -160,7 +175,7 @@ timestamp in `runs/red-tail-short-v080/sessions/bgrun-*` and
 `runs/trace-root-framewake/sessions/bgrun-*`) — so the penalty is the session's own turns around
 the wake: 46.7s against a ~24.4s job leaves ~22s of the arm's own turns. A failure
 one window from the end means the wake buys back the search and little else: context is 13,941
-[12,876–16,534] against vanilla's 30,056 and calls are 4, 3, 3. bgrun's genuinely owned win here is
+[12,876–16,534] against vanilla's 30,056 and calls are 3 [3–4]. bgrun's genuinely owned win here is
 `blocked_s` 0.0 — it never blocks the session — paid for in wall time.
 
 **The pointer is a cost, not a benefit, when the session can search.** Wrong and correct pointers

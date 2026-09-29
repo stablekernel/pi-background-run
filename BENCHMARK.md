@@ -31,9 +31,10 @@ as soon as you have what you need.
    was written *before* its cell ran, so you can see what was expected against what was found.
 
 **What this document deliberately does not contain.** The per-cell record and the instrument
-checks are in `results.md`; the method, the controls and the metric definitions are in
-`method.md`; the hypotheses as written *before* the runs are in `predictions.md`; the raw runs
-and transcripts are in `runs/`. Only the findings are here. § [Provenance](#provenance) maps
+checks are in [`results.md`](docs/benchmark/results.md); the method, the controls and the metric
+definitions are in [`method.md`](docs/benchmark/method.md); the hypotheses as written *before* the
+runs are in [`predictions.md`](docs/benchmark/predictions.md); the raw runs
+and transcripts are in [`runs/`](docs/benchmark/runs/). Only the findings are here. § [Provenance](#provenance) maps
 every cell to its record file.
 
 **Terms.** The vocabulary this document uses — *cell*, *arm*, *wake*, *digest*, *trace preset*,
@@ -81,14 +82,14 @@ cost, not the wake's arrival.** Cell 3a's job is 22.8s and the wake lands within
 of it exiting (4ms, per `runs/trace-root-framewake/sessions/bgrun-*`) — the same millisecond
 delivery every post-fix cell shows. The **~7–8s** the earlier framing charged to the wake belongs
 to Cell 1, the pre-poll-fix run, where the session held its turn open polling and the wake waited
-for the turn boundary (`runs/red-tail-short/CELL.md`:117,119); it is an extra cost of the polling
+for the turn boundary ([`runs/red-tail-short/CELL.md`](docs/benchmark/runs/red-tail-short/CELL.md):117,119); it is an extra cost of the polling
 bug, not of the wake. So the arm's wall is the job plus its own turns around the wake — 40.7s
 against vanilla's 34.5s, the same job blocked once in a single call. The arm still delivers
 what it owns — `blocked_s` 0.0 against 22.8s — but the unblocking is paid for in session
-wall time. Source: `runs/trace-root-framewake/CELL.md`.
+wall time. Source: [`runs/trace-root-framewake/CELL.md`](docs/benchmark/runs/trace-root-framewake/CELL.md).
 
 **`red-tail-short` — the same cheap job on the current tool.** The second short cell measures
-the same shape: on 0.8.0 (Cell 1c, `runs/red-tail-short-v080/CELL.md`) the arm is 46.7
+the same shape: on 0.8.0 (Cell 1c, [`runs/red-tail-short-v080/CELL.md`](docs/benchmark/runs/red-tail-short-v080/CELL.md)) the arm is 46.7
 [40.3–50.7] against vanilla's 35.0 [34.4–38.6], with context 13,941 [12,876–16,534] against
 30,056 and calls 4, 3, 3 against 1, 1, 1; no session polls a running job
 (`blocked_s` 0.0 against 24.3, wake claims 0, 0, 0). It is negative on wall for the same
@@ -104,8 +105,8 @@ and, as in every short cell, the unblocking is paid for in session wall time.
 **Before the wake's closing line changed** (labelled history). Two earlier runs measured the
 same shape on builds that predate the change: `red-tail-short`'s Cell 1b (the poll fix,
 pre-framing) at 40.9 [38.1–42.7] vs 33.5 [32.3–33.9] with context 9,892 against 28,021
-(`runs/red-tail-short-fixed/CELL.md`), and `trace-root`'s Cell 3 at 37.5s against 34.5s
-(`runs/trace-root/CELL.md`). Each is kept as labelled history inside its own cell section,
+([`runs/red-tail-short-fixed/CELL.md`](docs/benchmark/runs/red-tail-short-fixed/CELL.md)), and `trace-root`'s Cell 3 at 37.5s against 34.5s
+([`runs/trace-root/CELL.md`](docs/benchmark/runs/trace-root/CELL.md)). Each is kept as labelled history inside its own cell section,
 never as a competing headline. Cell 1b is also the poll fix's own success — it drove the
 fabricated wake and the polls it licensed to zero — but the current red-tail measurement is
 Cell 1c above.
@@ -117,14 +118,14 @@ to run the suite again (4 foreground runs median, `blocked_s` 660.2, and the
 283.8–732.4 spread is that choice). That is 3.1× faster and 4.3× lighter — and the
 diagnosis is a tie: both arms reach `part-05.test.ts`, which is the best form of the
 result, the same answer at a quarter of the context because vanilla bought it by reading
-everything. Source: `runs/long-buried/CELL.md`.
+everything. Source: [`runs/long-buried/CELL.md`](docs/benchmark/runs/long-buried/CELL.md).
 
 ## The load-bearing change was two sentences of framing, not ecosystem parsing
 
 The `trace-root` fixture puts the failure's *cause* in a file of its own (`harness.ts`),
 reachable through a stack frame that the failure's own wording does not mention.
 
-- **Cell 3** (`runs/trace-root/CELL.md`) closed every wake with *"the exit code, stats
+- **Cell 3** ([`runs/trace-root/CELL.md`](docs/benchmark/runs/trace-root/CELL.md)) closed every wake with *"the exit code, stats
   and last output above **are the result**"*. The `bgrun` arm's pattern search therefore
   looked for failure words, which match the assertion but not the frame line
   (`at loadStep (.../harness.ts:28:9)` contains no failure word). `harness.ts` appeared
@@ -133,9 +134,9 @@ reachable through a stack frame that the failure's own wording does not mention.
   carries: the mechanism was the wake's *framing*, not a digest — **no digest was
   configured for that project**, so the wake carried no digest block at all. The
   `H9 <digest-starves>` hypothesis therefore gains nothing from this cell; its only
-  recorded entry remains the narrow one in `results.md`, where a digest built from a
+  recorded entry remains the narrow one in [`results.md`](docs/benchmark/results.md), where a digest built from a
   counts-only command carried `299 pass`, `1 fail` and nothing else.
-- **Cell 3a** (`runs/trace-root-framewake/CELL.md`) re-ran the same cell, same fixture
+- **Cell 3a** ([`runs/trace-root-framewake/CELL.md`](docs/benchmark/runs/trace-root-framewake/CELL.md)) re-ran the same cell, same fixture
   (bytes and all), same model, same prompt, with **only the closing line changed** to *"a summary,
   not the diagnosis — the log holds the detail… read a window around the failure before
   concluding a cause."* Nothing else changed: no digest, no preset, no pointer. The
@@ -153,7 +154,7 @@ and a nine-entry multi-runner corpus re-run showed nothing regressed (merged as 
 
 The presets and the `on: "failure"` gate put a *pointer* — a named failure and its source
 frame — in the wake. Cell 4 ran that layer three ways, each run changing one thing
-(`runs/long-buried/CELL.md`, profiles beside it):
+([`runs/long-buried/CELL.md`](docs/benchmark/runs/long-buried/CELL.md), profiles beside it):
 
 | Cell 4, bgrun arm | pointer, correct (current) | no pointer (baseline) | pointer, wrong (before the fix) |
 |---|---|---|---|
@@ -221,8 +222,8 @@ all three Cell 4 pointer-variant sessions, all Cell 3a sessions, and all three C
 sessions). Cell 1 was the counter-example that produced the fix — 3 of 3 sessions claimed a
 wake before receiving it and made 10, 9 and 5 polls — and Cell 1b re-ran the same cell on the
 fixed extension and measured 0, 0, 0 in both columns
-(`runs/red-tail-short-fixed/CELL.md`); Cell 1c re-ran it again on 0.8.0 and measured the same
-0, 0, 0 (`runs/red-tail-short-v080/wake-claims.csv`), so the fix holds on the current tool.
+([`runs/red-tail-short-fixed/CELL.md`](docs/benchmark/runs/red-tail-short-fixed/CELL.md)); Cell 1c re-ran it again on 0.8.0 and measured the same
+0, 0, 0 ([`runs/red-tail-short-v080/wake-claims.csv`](docs/benchmark/runs/red-tail-short-v080/wake-claims.csv)), so the fix holds on the current tool.
 This holds in Cell 4, a 1,281-line log and a ~204s job, which is the cell where polling is
 most tempting. It is a mechanism result about the tool, not a claim about agents in general.
 
@@ -234,12 +235,12 @@ most tempting. It is a mechanism result about the tool, not a claim about agents
   read together with `cause_file`. Testing `H11` needs the capability ladder
   (haiku → sonnet → opus), and only the mid rung has run.
 - **`H9 <digest-starves>`** gains nothing from Cell 3 or 3a: no digest was configured
-  there. Its only recorded entry is the counts-only digest in `results.md`; the only
+  there. Its only recorded entry is the counts-only digest in [`results.md`](docs/benchmark/results.md); the only
   later cell with a digest configured is Cell 4's pointer variant, which is about the
   pointer rather than about a session trusting a count-only digest.
 - **The capability ladder (`H7`, `H8`) and the dialogue cells** (`overlap-task`,
   `parallel-jobs`, `resume-midrun`, `peek-midrun`, `fast-verbose`, `fail-fast`,
-  `green-short`) are **not run** — see the status table in `results.md`. Nothing in this
+  `green-short`) are **not run** — see the status table in [`results.md`](docs/benchmark/results.md). Nothing in this
   document speaks to them.
 - **Whether the pointer *adds* diagnostic value on top of the framing** is answered in the
   negative *for this regime*: with the preset corrected, the pointer cost more than no
@@ -258,23 +259,23 @@ most tempting. It is a mechanism result about the tool, not a claim about agents
 ## Provenance
 
 The full record lives in the adjacent benchmark checkout, `pi-bgrun.bench-doc`, under
-`docs/benchmark/`:
+[`docs/benchmark/`](docs/benchmark/):
 
 | file | what it holds |
 |---|---|
-| `method.md` | how a cell is run and what its numbers mean (arms, contexts, metrics, controls) |
-| `predictions.md` | every hypothesis prediction written before the runs — tested outcome, or untested registration |
-| `results.md` | the running record the cells cite |
+| [`method.md`](docs/benchmark/method.md) | how a cell is run and what its numbers mean (arms, contexts, metrics, controls) |
+| [`predictions.md`](docs/benchmark/predictions.md) | every hypothesis prediction written before the runs — tested outcome, or untested registration |
+| [`results.md`](docs/benchmark/results.md) | the running record the cells cite |
 | `runs/<cell>/CELL.md` | one cell's numbers, mechanism and limits |
-| `runs/<cell>/profile.csv` | the per-session rows, generated by `scripts/measure-sessions.ts` |
+| `runs/<cell>/profile.csv` | the per-session rows, generated by [`scripts/measure-sessions.ts`](scripts/measure-sessions.ts) |
 
-Cell → record path: `red-tail-short` (Cell 1) `runs/red-tail-short/CELL.md`;
-`red-tail-short` after the no-poll change (Cell 1b) `runs/red-tail-short-fixed/CELL.md`;
-`red-tail-short` on 0.8.0 (Cell 1c, the current tool) `runs/red-tail-short-v080/CELL.md`;
-`trace-root` (Cell 3) `runs/trace-root/CELL.md`; `trace-root` with the framing fix
-(Cell 3a) `runs/trace-root-framewake/CELL.md`; `long-buried` and its pointer variants
-(Cell 4) `runs/long-buried/CELL.md`, `runs/long-buried-tracepreset/CELL.md` and
-`runs/long-buried-tracepreset-fixed/CELL.md`;
-the attended-method pilot `runs/pilot/MANIFEST.md`. The instrument checks that decided
-whether these cells' numbers mean anything are in `results.md` (the pty/pipe shape check,
+Cell → record path: `red-tail-short` (Cell 1) [`runs/red-tail-short/CELL.md`](docs/benchmark/runs/red-tail-short/CELL.md);
+`red-tail-short` after the no-poll change (Cell 1b) [`runs/red-tail-short-fixed/CELL.md`](docs/benchmark/runs/red-tail-short-fixed/CELL.md);
+`red-tail-short` on 0.8.0 (Cell 1c, the current tool) [`runs/red-tail-short-v080/CELL.md`](docs/benchmark/runs/red-tail-short-v080/CELL.md);
+`trace-root` (Cell 3) [`runs/trace-root/CELL.md`](docs/benchmark/runs/trace-root/CELL.md); `trace-root` with the framing fix
+(Cell 3a) [`runs/trace-root-framewake/CELL.md`](docs/benchmark/runs/trace-root-framewake/CELL.md); `long-buried` and its pointer variants
+(Cell 4) [`runs/long-buried/CELL.md`](docs/benchmark/runs/long-buried/CELL.md), [`runs/long-buried-tracepreset/CELL.md`](docs/benchmark/runs/long-buried-tracepreset/CELL.md) and
+[`runs/long-buried-tracepreset-fixed/CELL.md`](docs/benchmark/runs/long-buried-tracepreset-fixed/CELL.md);
+the attended-method pilot [`runs/pilot/MANIFEST.md`](docs/benchmark/runs/pilot/MANIFEST.md). The instrument checks that decided
+whether these cells' numbers mean anything are in [`results.md`](docs/benchmark/results.md) (the pty/pipe shape check,
 which falsified its own hypothesis, and the trace-path check).
