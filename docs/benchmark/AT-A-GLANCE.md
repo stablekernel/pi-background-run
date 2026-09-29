@@ -27,10 +27,9 @@ the work.
    generations), [`predictions.md`](predictions.md) (the hypotheses `H1`–`H12`), [`runs/`](runs/)
    (transcripts, profiles, per-cell sheets). Re-check a figure with
    `bun scripts/measure-sessions.ts <session dirs> --csv` (`method.md` § *Re-deriving a table*).
-
-Running a cell is operator work, not reading: that run-book — the quickstart for
-`./run-cell.sh <cell>` — is in [`method.md`](method.md#procedure) § Procedure
-(issue [#39](https://github.com/stablekernel/pi-background-run/issues/39)).
+   Running a cell is operator work, not reading: the quickstart for `./run-cell.sh <cell>` is in
+   the same file's § Procedure (issue
+   [#39](https://github.com/stablekernel/pi-background-run/issues/39)).
 
 Cells: [`red-tail-short`](#red-tail-short--failure-near-the-end-of-a-short-run) ·
 [`long-buried`](#long-buried--a-failure-buried-in-a-long-noisy-run) ·
