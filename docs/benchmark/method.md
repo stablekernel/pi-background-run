@@ -110,6 +110,33 @@ removes the guess. That is a claim about the agent, so a single model cannot tes
   model, so cross-model wall comparisons are meaningless. Compare each rung's own
   vanilla-versus-bgrun *delta*, and its locating-strategy mix.
 
+## Naming runs
+
+Prose needs one unambiguous way to name a run. Canonical identity is the `runs/` folder
+path — `runs/red-tail-short-v080`, never `Cell 1c`. A `Cell N` label is a section heading
+in `results.md`, not an identifier a reader can resolve, and the numbers under a heading
+move as the cell is re-run; the folder path does not.
+
+- **Short label** — `<fixture> @ <generation>`, for prose and tables. The generation is
+  the release version when there is one (`0.8.0`), otherwise a short sha plus its date.
+- **Arms** are exactly `vanilla`, `bgrun`, `vanilla-hinted` — the three rows in **Arms**
+  above, nothing else.
+- **Sessions** are `<arm>-<n>`: session *n* of an arm. So `bgrun-1` is the first session
+  of the `bgrun` arm — never an arm, a cell or a run in its own right.
+
+The runs recorded here, by folder and by short label:
+
+| run folder | short label | what it is |
+|---|---|---|
+| `runs/red-tail-short` | `red-tail-short @ pre-poll-fix` | the cell before the no-poll fix |
+| `runs/red-tail-short-fixed` | `red-tail-short @ poll-fix` | the same cell re-run after the fix |
+| `runs/red-tail-short-v080` | `red-tail-short @ 0.8.0` | the current tool |
+| `runs/trace-root` | `trace-root @ poll-fix` | the poll-fix generation |
+| `runs/trace-root-framewake` | `trace-root @ framewake` | the framing change alone |
+| `runs/long-buried` | `long-buried @ 0.8.0 baseline` | no digest configured — the baseline arm |
+| `runs/long-buried-tracepreset` | `long-buried @ wrong pointer` | the superseded `js-trace` preset, naming a passing test |
+| `runs/long-buried-tracepreset-fixed` | `long-buried @ correct pointer` | the fixed preset |
+
 ## The fixture, and why it is shaped that way
 
 The generated suite (`bun run bench:make-suite`, `scripts/make-dummy-suite.ts`) is
@@ -162,7 +189,7 @@ only instrument. Its columns:
 | `calls` | tool calls made |
 | `diag` | whether the failure markers reached the final assistant text |
 | `locating` | **the classification H7 needs**: the agent's first locating command, as `pattern` (`grep`, `sed -n '/…/…'`), `position` (`head`, `tail`, line-addressed `sed`), `full-read`, or `none` |
-| `cause_reached` | **planned, not yet implemented** — what `trace-root` needs: whether the session opened or named the location the trace points at, and whether its answer carried the cause rather than the symptom. A presence-only metric cannot express this: a session can grep its way to a symptom perfectly, report it, and stop, and every existing column would look healthy |
+| `cause_reached` / `cause_file` / `frames_opened` | **implemented** in Phase 1 (`scripts/measure-sessions.ts`), and what `trace-root` and `H11` need: frames are read from the session's **tool results** — what it could follow — not from its final answer; `cause_file` is the deepest frame's file; `cause_reached` is whether some call addressed that file or the final text named it; `frames_opened` counts the frames a session actually opened. **Read `cause_reached` with `cause_file`**: it is session-relative (the deepest frame *that session saw*), so on a fixture whose real cause is a separate file it reads 1 for a session that never saw the cause. A presence-only metric could not express this — a session can grep its way to a symptom perfectly, report it, and stop, and every existing column would look healthy |
 
 `locating` is a small addition to the profiler, made in Phase 1 from the commands the
 tool already records. Without it H7 could only be judged by reading transcripts, which
@@ -170,8 +197,9 @@ is how a hypothesis turns into an impression.
 
 The split between column kinds matters, and the write-up must respect it:
 
-- **Mechanism columns** — `fg`, `handoff`, `blocked_s` — are properties of the tool.
-  A session cannot block on a job that runs detached; that is structural.
+- **Mechanism columns** — `execs` (and its split, `fg` / `handoff`), `blocked_s` — are
+  properties of the tool. A session cannot block on a job that runs detached; that is
+  structural.
 - **Agent columns** — `ctx_chars`, `wall_s`, `calls`, `locating` — are properties of
   the agent's *use* of the tool. They vary between runs of the same cell by design.
 
@@ -197,6 +225,30 @@ existing cells' transcripts: for those, the recorded `CELL.md` / `RUNSHEET.md` s
 cell id · arm · context (including pty/pipe) · **model, rung and reasoning effort** ·
 the exact prompt · fixture id and file hash as a digest · fixture knobs · session
 directory · start/end timestamps · machine load · anything else that ran concurrently.
+
+**Running a cell** — operator work, driven by the helper in `docs/benchmark/runs`:
+
+```sh
+cd docs/benchmark/runs
+./run-cell.sh <cell>              # the cell's sessions, one at a time
+./run-cell.sh <cell> --dry-run    # print the commands, launch nothing
+```
+
+Each run hands the terminal to `pi`; the operator drives the session and quits it with
+`/quit` once the failure has been reported. The script supplies the banner and the exact
+command, a per-run **transcript check** (it stops rather than let a half-written session
+pass), a refusal to start a run whose session dir already holds a transcript (the
+profiler reads the first `*.jsonl`, so a stale one would shadow the new run), and the
+cell's profile at the end — `.bench-runs/<cell>/profile.{txt,csv}`. Runs are
+**interleaved** (`bgrun-1, vanilla-1, bgrun-2, …`) so any drift in host load or thermals
+lands on both arms rather than on whichever ran last. Each cell's fixture, prompt and
+cost are in its `RUNSHEET.md`.
+
+**Transcripts are kept, not left in `/tmp`.** The profiles (`--csv`) and the per-run
+manifests are committed beside each cell's run sheet, and the transcripts are the
+evidence those numbers refer to — text, and cheap to keep. An earlier round was
+withdrawn precisely because its figures could not be traced back to transcripts.
+`.bench-runs/` stays the scratch for working output; it is not the record.
 
 ## Case: the pty/pipe question — answered
 

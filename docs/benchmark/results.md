@@ -7,22 +7,9 @@ procedure that produces these rows is in [method.md](./method.md).
 
 ## How a result is recorded
 
-1. **Generated, not transcribed.** Rows come from
-   `bun scripts/measure-sessions.ts` output. Nobody retypes a number into prose.
-2. **Provenanced.** Every row cites its session directory, fixture hash and context
-   (pty or pipe) from the run manifest, so any figure can be re-checked against the
-   transcript it came from.
-3. **Spreads, not points.** n≥3 with median *and* range, per arm. A single run is
-   labelled as one, and never enters a comparison.
-4. **Two kinds of column, kept apart.** Mechanism columns (`execs`, `fg`, `handoff`,
-   `blocked_s`) are evidence about the tool; agent columns (`ctx_chars`, `wall_s`,
-   `calls`, `locating`) are evidence about an agent driving it, and vary by design.
-5. **Verdict against the prediction.** Each cell ends **confirmed**, **falsified**, or
-   **inconclusive** — and a falsified cell keeps its row and gains a note. Predictions
-   are never edited to match results.
-6. **No cross-rung wall comparisons.** Ladder cells report each rung's own
-   vanilla-versus-bgrun delta and its `locating` mix; wall-clock across rungs is
-   meaningless because per-call latency differs.
+The presentation contract — generated rows, provenance, spreads not points, mechanism
+versus agent columns, verdict against the prediction, and no cross-rung wall comparisons —
+is owned by [method.md § Recording and presentation rules](./method.md#recording-and-presentation-rules).
 
 ## Status
 
