@@ -237,14 +237,21 @@ product issue [#33](https://github.com/stablekernel/pi-background-run/issues/33)
 34.5s) and `red-tail-short` (current run, 46.7 [40.3–50.7] vs 35.0 [34.4–38.6]) both put the
 background arm behind, and before the poll fix `red-tail-short` was worse still (45.4s vs
 33.0s). The reason is structural: those jobs run 23–34s, so the arm pays the job plus the turns
-it makes around the wake, while vanilla pays the same waiting inside a single call — the round
-trip dominates. A failure close to the end of the output is one window away, so the wake adds a
-round trip and buys nothing. The poll fix removed the self-inflicted cost (the polling loop
-above): on `red-tail-short`'s current run context is 13,941 [12,876–16,534] against vanilla's
-30,056 and calls are 4, 3, 3, and the pre-framing Cell 1b was lighter still at 9,892 [9,841–10,031].
-Wall stayed negative in every generation because that part is the job plus the wake, not the
-agent. bgrun's genuinely owned win in these cells is `blocked_s` 0.0 — it never blocks the
-session — paid for in session wall time.
+it makes around the wake, while vanilla pays the same waiting inside a single call. The wake
+itself is not slow — in `red-tail-short`'s current run it is delivered 4ms after the job exits in
+all three sessions, and `trace-root`'s current run shows the same millisecond delivery
+(`exitedAt` and the wake-message timestamp in `runs/red-tail-short-v080/sessions/bgrun-*` and
+`runs/trace-root-framewake/sessions/bgrun-*`) — so the wall penalty is the session's own work
+around the wake plus a round trip it cannot avoid, not a late notification: 46.7s against a
+~24.4s job leaves ~22s of the arm's own turns. The ~7–8s the earlier framing charged the wake
+belongs to the pre-fix Cell 1, where the session held the turn open polling and the wake waited
+for the turn boundary, not to the notification. A failure close to the end of the output is one
+window away, so the wake buys back the search and little else. The poll fix removed the
+self-inflicted cost (the polling loop above): on `red-tail-short`'s current run context is 13,941
+[12,876–16,534] against vanilla's 30,056 and calls are 4, 3, 3, and the pre-framing Cell 1b was
+lighter still at 9,892 [9,841–10,031]. Wall stayed negative in every generation because the arm
+pays the job once and then its own turns on top of it. bgrun's genuinely owned win in these cells
+is `blocked_s` 0.0 — it never blocks the session — paid for in session wall time.
 
 **The pointer is a cost, not a benefit, when the session can search.** The three-way above:
 wrong and correct pointers both cost more calls and context than no pointer at all.
