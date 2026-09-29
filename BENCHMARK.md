@@ -5,30 +5,51 @@ so the command's output never enters the conversation. The question this benchma
 built to answer is narrower than that promise: **does handing a long command to the
 background cost the agent more than it saves?**
 
-The answer depends on the job, and that split is the headline. This document states what
-the measurements support and what they do not. It is a summary of a week of measurement;
-every number comes from a named cell, and the record behind each one — the procedure,
-the predictions written before the runs, the per-cell transcripts — is listed under
-[Provenance](#provenance).
+The answer depends on the job, and that split is the headline. This is the **findings
+document**: what the measurements support, what they do not, and why each result came out
+the way it did — every number traced to a named cell.
 
-**In a hurry?** [`docs/benchmark/AT-A-GLANCE.md`](docs/benchmark/AT-A-GLANCE.md) is the
-same case in a few minutes: one section per measured cell (what it tested, the bgrun-versus-
-vanilla numbers, and what each arm's agent actually did), where bgrun does not help, and the
-three-way pointer result. This document is the full treatment behind it.
+## Where to start
 
-## How a cell is run
+Five documents plus a run directory make up this benchmark. Read them in this order, and stop
+as soon as you have what you need.
 
-A cell is a **fixture × arm × context** at one model. The `bgrun` arm runs this repo's
-extension; the `vanilla` arm runs the same session without it. Both arms get the same
-neutral prompt — run this and report the failure details — so that reaching for the tool
-is a finding rather than an instruction. Sessions are live (a wake needs a session that
-still exists when the job ends), the model is `anthropic/claude-sonnet-4-6`, and each arm
-is run three times (n=3). Reported figures are medians, with the run range in brackets.
+1. **[`AT-A-GLANCE.md`](docs/benchmark/AT-A-GLANCE.md) — start here.** The whole case in a few
+   minutes: one section per measured cell (what it tested, the bgrun-versus-vanilla numbers,
+   and what each arm's agent actually did), where bgrun does not help, and the three-way
+   pointer result. If you read one thing, read this.
+2. **This document — the findings.** The reasoning behind that summary: the regime split, the
+   change that turned out to be load-bearing, the pointer result, the layer boundary, and what
+   the measurements do *not* establish.
+3. **[`method.md`](docs/benchmark/method.md) — how it was measured.** Cells, arms, contexts,
+   controls, the metric columns and the rules for showing numbers. Open it when you want to
+   check a figure or repeat a cell.
+4. **[`results.md`](docs/benchmark/results.md)** and **[`runs/`](docs/benchmark/runs/)** — the
+   record. The cell status table, the executed cells with their verdicts, the instrument
+   checks, and the raw per-session transcripts behind every figure.
+5. **[`predictions.md`](docs/benchmark/predictions.md) — the register.** Every hypothesis as it
+   was written *before* its cell ran, so you can see what was expected against what was found.
 
-Mechanism columns (`blocked_s` — seconds the session spent waiting on a *foreground* run,
-`execs`, `handoff`) are properties of the tool. Agent columns (`wall_s`, `ctx_chars`,
-`calls`) are properties of an agent driving it and vary run to run by design. `ctx_chars`
-counts characters of transcript text, not billed tokens. Source: `method.md`.
+**What this document deliberately does not contain.** The per-cell record and the instrument
+checks are in `results.md`; the method, the controls and the metric definitions are in
+`method.md`; the hypotheses as written *before* the runs are in `predictions.md`; the raw runs
+and transcripts are in `runs/`. Only the findings are here. § [Provenance](#provenance) maps
+every cell to its record file.
+
+**Terms.** *cell*, *generation*, *arm*, *wake*, *digest*, *trace preset*, `blocked_s`,
+`ctx_chars` and `cause_reached` are defined in plain terms in the
+[glossary in `AT-A-GLANCE.md`](docs/benchmark/AT-A-GLANCE.md#glossary). They are defined
+once, there, so that this document can use them without re-explaining them.
+
+## How these results were produced
+
+The method is stated once, in [`docs/benchmark/method.md`](docs/benchmark/method.md): what a
+cell is (**fixture × arm × context** at one model), the arms, the contexts, the controls, and
+which columns are properties of the tool rather than of the agent driving it. To read the
+tables here you need only this much: the `bgrun` arm runs this repo's extension and the
+`vanilla` arm runs the same session without it, both on the same neutral prompt; the model is
+`anthropic/claude-sonnet-4-6`; each arm runs three times (n=3), and the figures shown are
+medians with the run range in brackets.
 
 **Limits, stated here rather than in a footnote.** n=3 per arm; one model; one fixture
 family; one machine. The fixture is synthetic — it has no flaky tests, retries, parallel
@@ -38,9 +59,11 @@ quoted with a caveat are Cell 4's two pointer runs, and the caveat is stated wit
 
 ## The regime split
 
-The cost of the background arm is the wake's round trip: the job runs detached, but the
-session must still wait for the wake before it can act. Whether that is cheaper than
-running synchronously depends on how long the job takes.
+The cost of the background arm is the job plus the turns the session makes around the wake:
+the job runs detached, but the session still has to act on the result once the wake lands —
+and the wake's own arrival is not where the time goes, since it lands within milliseconds of
+the job exiting. Whether that is cheaper than running synchronously depends on how long the
+job takes.
 
 | | Cell 3a — cheap job (current) | Cell 4 — expensive job |
 |---|---|---|
