@@ -8,23 +8,23 @@ decided by **how long the job runs**: for a ~23–34s job the wake's round trip 
 than it saves, while for a ~204s job the background arm pays the job once and the
 synchronous arm pays it over and over by re-running the suite. The tool's one structural
 win in every cell is that it never blocks the session (`blocked_s` 0.0, against 22.5–660.2s
-of foreground waiting). Below: one section per measured cell, then where it does not help,
-then the three-way pointer result. Every figure cites the cell's `profile.csv`; the full
+of foreground waiting). Below: one section per measured cell, then the three-way pointer
+result, then where it does not help. Every figure cites the cell's `profile.csv`; the full
 case and limits are in [`BENCHMARK.md`](../../BENCHMARK.md).
 
 Cells: [`red-tail-short`](#red-tail-short--failure-near-the-end-of-a-short-run) ·
 [`long-buried`](#long-buried--a-failure-buried-in-a-long-noisy-run) ·
 [`trace-root`](#trace-root--symptom-at-the-end-cause-three-frames-down-another-file) ·
-[`trace-root-framewake`](#trace-root-framewake--the-same-cell-one-closing-line-changed) ·
 [pointer variants](#the-three-way-pointer-result)
 
-**Run generation.** Every cell below was measured *after* the poll fix (`5e43fba` — a running
-job reports its state, not its log) **except `red-tail-short`, which is kept as that fix's
-*before* measurement.** Its post-fix counterpart is `red-tail-short-fixed`, and the gap
-between them — calls 11 → 2, context 31,170 → 9,892 — is itself the finding: the polling was
-licensed by a fabricated wake, not by impatience. Read the pair, not the cell alone. You can
-tell the generations apart by call count: a polling session makes 9–12 calls, a post-fix one
-2–4.
+**The rule.** The figures shown are the **current tool's**. A superseded run appears only as
+*labelled* history inside the section whose finding it supports ("before the poll fix"), never
+as a competing headline; where a cell has both a current and an earlier run, the current one
+leads and the earlier one follows, marked as history. A cell whose newest run predates a change
+to the tool it exercises is marked **awaiting a re-run** rather than presented as current.
+(Where a run generation is named below, the tool changes it covers — the poll fix, the wake's
+closing line, the trace presets and failure gate, the js-trace evidence rule — all landed
+together, merged as `6b04d24`.)
 
 ## `red-tail-short` — failure near the end of a short run
 
@@ -32,30 +32,65 @@ tell the generations apart by call count: a polling session makes 9–12 calls, 
 output: a short run whose diagnostic is one tail-window away. Does the background handoff
 buy anything when the failure is cheap to reach?
 
+**Awaiting a re-run — newest run is Cell 1b, with the poll fix in place.** The current-tool
+run of this cell is the one below (`runs/red-tail-short-fixed/`): the same fixture, model and
+prompt re-run after the poll fix, which made a running job answer a reader with its *state*
+rather than its log. It postdates that fix but predates the wake's closing-line change — the
+same change `trace-root` below shows flipping a short cell's call sequence — so these are the
+newest numbers this cell has, not the current tool's, and the cell needs a re-run before they
+can stand as current.
+
 | metric (median [min–max]) | bgrun | vanilla |
+|---|---|---|
+| `wall_s` | 40.9 [38.1–42.7] | 33.5 [32.3–33.9] |
+| `ctx_chars` | **9,892** [9,841–10,031] | 28,021 [28,000–28,236] |
+| `calls` | 2 [2–2] | 1 [1–1] |
+| `blocked_s` (mechanism) | 0.0 | 22.4 |
+
+Source: `runs/red-tail-short-fixed/profile.csv` (summary rows). The whole interaction is
+`bgrun` → yield → wake → one search → answer: with the log gated behind the wake the arm
+searched it rather than reading it in pieces (`locate` flipped `position` → `pattern`), so
+context came in *below* vanilla's — the 12% penalty of the pre-fix run inverted. Wall time
+stayed negative, exactly as the floor argument predicted: the job is 23.2s and the wake lands
+~7s after it exits, so the arm's best case is vanilla's blocking less a turn.
+
+### Before the poll fix — the fabricated-wake finding (`H12`)
+
+The run above exists because of this one. Cell 1 (`runs/red-tail-short/`), on the extension
+before the fix, made every bgrun session poll a job it had just handed off, each claiming a
+wake it had never received:
+
+| metric (median [min–max]) | bgrun (pre-fix) | vanilla |
 |---|---|---|
 | `wall_s` | **45.4** [42.9–51.1] | 33.0 [32.5–38.2] |
 | `ctx_chars` | 31,170 [29,403–31,782] | 27,817 [27,798–27,870] |
 | `calls` | 11 [9–12] | 1 [1–1] |
-| cause reached (`diag_reach`) | 3/3 | 3/3 |
 | `blocked_s` (mechanism) | 0.0 | 22.5 |
 
-Source: `runs/red-tail-short/profile.csv` (summary rows). The bgrun arm is *slower* and
-costs 12% more context, and neither wall nor context range overlaps; the only win is
-`blocked_s`.
+Source: `runs/red-tail-short/profile.csv` (summary rows). The bgrun arm was *slower* and cost
+12% more context, and neither wall nor context range overlapped; the only win was `blocked_s`.
 
-**What each arm actually did.** Vanilla ran the suite once in the foreground, blocked
-22.5s, and read the whole ~26.6k-character result in a single call. Each bgrun session
-instead handed off, then read the log in pieces while it ran: bgrun-1 made 12 calls
-(1 `bgrun`, 10 `bgtail`, 1 `bgstatus`), bgrun-3 made 9, six of them `bggrep` (the cell's
-prose says five; the profile count is six). The polling was licensed by a fabricated wake —
-bgrun-1's own text reads *"I'll wait for the results — you'll be woken automatically when
-the tests finish. --- **Wake received.** Let me check the failure details."*, then later
-*"Still running — waiting for it to finish."* The real wake arrived ~8s after the job
-exited, so the arm front-ran it: the three sessions made 11, 10 and 6 calls while the job
-was still running (against 1, 1 and 3 after it exited), and each first claimed a wake
-3–4s into a ~23s job. The fix (below, in "where bgrun does not help") removed the
-polling but not the wall penalty.
+Vanilla ran the suite once in the foreground, blocked 22.5s, and read the whole
+~26.6k-character result in a single call. Each bgrun session instead handed off, then read the
+log in pieces while it ran: bgrun-1 made 12 calls (1 `bgrun`, 10 `bgtail`, 1 `bgstatus`),
+bgrun-3 made 9, six of them `bggrep` (the cell's prose says five; the profile count is six).
+The polling was licensed by a fabricated wake — bgrun-1's own text reads *"I'll wait for the
+results — you'll be woken automatically when the tests finish. --- **Wake received.** Let me
+check the failure details."*, then later *"Still running — waiting for it to finish."* The
+real wake arrived ~8s after the job exited, so the arm front-ran it: the three sessions made
+11, 10 and 6 calls while the job was still running (against 1, 1 and 3 after it exited), and
+each first claimed a wake 3–4s into a ~23s job. 27 of the three sessions' 30 tool calls were
+made while the job was still running, and the fix drove that — and the claims — to zero:
+
+| metric | pre-fix (Cell 1) | post-fix (Cell 1b) |
+|---|---|---|
+| wake claims before exit | 1, 2, 1 | **0, 0, 0** |
+| polls before exit | 10, 9, 5 | **0, 0, 0** |
+| tool calls per session | 12, 11, 9 | **2, 2, 2** |
+| `ctx_chars` (median) | 31,170 | **9,892** |
+| `wall_s` (median [min–max]) | 45.4 [42.9–51.1] | 40.9 [38.1–42.7] |
+
+Sources: `runs/red-tail-short/profile.csv` and `runs/red-tail-short-fixed/profile.csv`.
 
 ## `long-buried` — a failure buried in a long noisy run
 
@@ -71,8 +106,10 @@ per run. This is the regime the async handoff is *for*.
 | `calls` | 3, 4, 4 | 12, 2, 6 |
 | cause reached (`part-05.test.ts`) | 3/3 | 3/3 |
 
-Source: `runs/long-buried/profile.csv` (summary rows). The first cell where bgrun wins on
-both axes — 3.1× faster and 4.3× lighter — with the diagnosis a tie.
+Source: `runs/long-buried/profile.csv` (summary rows). This is the current tool with no
+digest configured — the later preset change is never exercised without one — so it leads as
+current. The first cell where bgrun wins on both axes — 3.1× faster and 4.3× lighter — with
+the diagnosis a tie.
 
 **What each arm actually did.** bgrun paid the ~204s job once: bgrun-1 made two `bggrep`
 calls and stopped, bgrun-3 added a `bgtail` for context, and the median session is 225.9s
@@ -88,34 +125,11 @@ the same answer at a quarter of the context because vanilla bought it by reading
 reachable through a stack frame the failure's own wording never mentions. Symptom cheap to
 find; cause one frame down.
 
-| metric (median [min–max]) | bgrun | vanilla |
-|---|---|---|
-| `wall_s` | 37.5 [37.1–39.5] | **34.5** [34.4–36.2] |
-| `ctx_chars` | **9,758** [9,757–10,061] | 28,271 [28,248–28,379] |
-| `calls` | 2 | 1 |
-| `harness.ts` in context | **0, 0, 0** | **2, 2, 2** |
-| deepest frame seen | `part-02.test.ts` | `harness.ts` |
-
-Source: `runs/trace-root/profile.csv` (summary rows) and `runs/trace-root/CELL.md`.
-
-**What each arm actually did.** Vanilla ran the suite synchronously; the single ~27k-char
-result carried the whole log, so the cause frame came with it — one session names it
-outright: *"Assertion error in `harness.ts:28`"*. Every bgrun session ran `bgrun` → one
-`bggrep` → answer, searching for failure words (`(?i)(fail|✗|×|error|expect)`), which match
-the assertion and the runner's `(fail)` line but not the frame line
-`at loadStep (.../harness.ts:28:9)` — it contains no failure word. The wake's closing line
-(*"the exit code, stats and last output above **are the result**"*) gave no reason to open
-the window around the failure, so the grep filtered the cause out. The arm's answer cited
-`part-02.test.ts` with line numbers (28, 41) that actually belong to `harness.ts`: numbers
-without their file. This is the tool's saving and its blind spot in the same mechanism —
-65% less context, but the saving was bought with the diagnosis.
-
-## `trace-root-framewake` — the same cell, one closing line changed
-
-**What it tested.** Nothing about the tool changed but the wake's closing line, from *"the
-exit code, stats and last output above **are the result**"* to *"a summary, not the
-diagnosis — the log holds the detail… read a window around the failure before concluding a
-cause."* No digest, no preset, no pointer. Same fixture, model and prompt.
+**Current run — the wake's closing line fixed.** Two sentences of language-neutral framing
+(*"a summary, not the diagnosis — the log holds the detail… read a window around the failure
+before concluding a cause."*) replaced *"the exit code, stats and last output above **are the
+result**"*, and that alone moved the cell. Same fixture, model and prompt; no digest, no
+preset, no pointer.
 
 | metric (median [min–max]) | bgrun | vanilla |
 |---|---|---|
@@ -128,41 +142,71 @@ cause."* No digest, no preset, no pointer. Same fixture, model and prompt.
 Source: `runs/trace-root-framewake/profile.csv` (summary rows) and
 `runs/trace-root-framewake/CELL.md`. Vanilla's own run is unmoved (single full read).
 
-**What each arm actually did.** The sequences gained exactly one step: Cell 3's sessions ran
-`bgrun` → `bggrep` and stopped at the symptom; Cell 3a's added a third call — `bgtail` in two
-of the three sessions (bgrun-1, bgrun-3), a second `bggrep` in the other — to reach the window
-where the frames sit. bgrun-1's thinking reads *"Let me look at the test
-failures in the log"*, and its answer now names the harness: *"**Harness:** …/harness.ts:28"*.
-The extra call cost ~4k characters and bought the cause — still at half vanilla's context.
-Two sentences of language-neutral instruction, which know nothing about how any runner
-spells a stack frame, fixed what the JS/TS-tuned built-in locator never did.
+**What each arm actually did.** The sequences gained exactly one step: the before-run's
+sessions ran `bgrun` → `bggrep` and stopped at the symptom; the current run's added a third
+call — `bgtail` in two of the three sessions (bgrun-1, bgrun-3), a second `bggrep` in the
+other — to reach the window where the frames sit. bgrun-1's thinking reads *"Let me look at
+the test failures in the log"*, and its answer now names the harness: *"**Harness:**
+…/harness.ts:28"*. The extra call cost ~4k characters and bought the cause — still at half
+vanilla's context. Two sentences of language-neutral instruction, which know nothing about how
+any runner spells a stack frame, fixed what the JS/TS-tuned built-in locator never did.
+
+### Before the wake's closing line changed — the cause-loss finding
+
+The current run exists because this one lost the cause. Cell 3 (`runs/trace-root/`), on the
+extension whose wake closed with *"the exit code, stats and last output above **are the
+result**"*, never reached `harness.ts`:
+
+| metric (median [min–max]) | bgrun | vanilla |
+|---|---|---|
+| `wall_s` | 37.5 [37.1–39.5] | **34.5** [34.4–36.2] |
+| `ctx_chars` | **9,758** [9,757–10,061] | 28,271 [28,248–28,379] |
+| `calls` | 2 | 1 |
+| `harness.ts` in context | **0, 0, 0** | **2, 2, 2** |
+| deepest frame seen | `part-02.test.ts` | `harness.ts` |
+
+Source: `runs/trace-root/profile.csv` (summary rows) and `runs/trace-root/CELL.md`.
+
+Vanilla ran the suite synchronously; the single ~27k-char result carried the whole log, so
+the cause frame came with it — one session names it outright: *"Assertion error in
+`harness.ts:28`"*. Every bgrun session ran `bgrun` → one `bggrep` → answer, searching for
+failure words (`(?i)(fail|✗|×|error|expect)`), which match the assertion and the runner's
+`(fail)` line but not the frame line `at loadStep (.../harness.ts:28:9)` — it contains no
+failure word. The barrier was the wake's framing, not a missing capability (no digest was
+configured here, so the wake carried no digest block): the closing line gave no reason to open
+the window around the failure, so the grep filtered the cause out. The arm's answer cited
+`part-02.test.ts` with line numbers (28, 41) that actually belong to `harness.ts`: numbers
+without their file. This was the tool's saving and its blind spot in the same mechanism — 65%
+less context, but the saving was bought with the diagnosis.
 
 ## The three-way pointer result
 
 The `on: "failure"` gate and the trace presets put a *pointer* — a named failing test and
 its source frame — into the wake. Cell 4 (`long-buried`) ran that layer three ways, each
-changing one thing:
+changing one thing. The current preset leads; the wrong-pointer run it superseded is kept
+below it as the marked comparison:
 
 | `long-buried` bgrun arm | pointer | `calls` | `ctx_chars` | `wall_s` |
 |---|---|---|---|---|
+| `tracepreset-fixed` — **current** | **correct** | 5, 5, 8 | **33,799** [29,180–36,355] | 234.0 |
 | baseline | none | 3, 4, 4 | 18,760 [16,365–21,056] | 225.9 |
-| `tracepreset` | **wrong** | 5, 5, 6 | 28,633 [21,867–31,481] | 233.1 |
-| `tracepreset-fixed` | **correct** | 5, 5, 8 | **33,799** [29,180–36,355] | 234.0 |
+| `tracepreset` — *before the pointer fix* | **wrong** | 5, 5, 6 | 28,633 [21,867–31,481] | 233.1 |
 
 Sources: `runs/long-buried/profile.csv`, `runs/long-buried-tracepreset/profile.csv`,
 `runs/long-buried-tracepreset-fixed/profile.csv`, and `runs/long-buried/CELL.md`. Ranges do
 not overlap on calls (baseline max 4, both variants min 5) or context (baseline max 21,056,
 correct variant min 29,180). Both variants reached the same `part-05.test.ts`.
 
-- **The wrong-pointer run** (`runs/long-buried-tracepreset/`) configured
-  `{ "preset": "js-trace", "on": "failure" }`; the digest named
-  `Failure: (pass) preset js-trace corpus (captured): …` — **a passing test's name**, because
-  the suite under test contains the preset's own corpus tests and prints captured failure
-  text. Sessions did not trust it and searched anyway.
-- **The fixed-pointer run** (`runs/long-buried-tracepreset-fixed/`, three bgrun sessions,
-  vanilla omitted by design) named the *true* failure
+- **The current preset** (`runs/long-buried-tracepreset-fixed/`, three bgrun sessions,
+  vanilla omitted by design) requires real evidence before naming anything, and named the
+  *true* failure
   (`AssertionError … at TestContext.<anonymous> (/private/tmp/long-buried-fixture/part-05.test.ts:59:9)`)
   — and cost the most, not the least.
+- **The superseded wrong-pointer run** (`runs/long-buried-tracepreset/`), kept as the
+  before-half of the fix, configured `{ "preset": "js-trace", "on": "failure" }`; the digest
+  named `Failure: (pass) preset js-trace corpus (captured): …` — **a passing test's name**,
+  because the suite under test contains the preset's own corpus tests and prints captured
+  failure text. Sessions did not trust it and searched anyway.
 
 **Reading: a pointer is a lead to verify, not an answer.** Even a correct pointer made the
 sessions work harder (sequence `bgrun bggrep bggrep bgtail bggrep`), because the wake's own
@@ -172,17 +216,18 @@ product issue [#33](https://github.com/stablekernel/pi-background-run/issues/33)
 
 ## Where bgrun does not help
 
-**Every short-job cell is a loss or a tie on wall time.** `red-tail-short` (45.4s vs 33.0s),
-its post-fix re-run `red-tail-short-fixed` (40.9 [38.1–42.7] vs 33.5 [32.3–33.9]),
-`trace-root` (37.5s vs 34.5s) and `trace-root-framewake` (40.7s vs 34.5s) all put the
-background arm behind. The reason is structural: those jobs run 23–34s and the wake lands
+**Every short-job cell is a loss or a tie on wall time.** `trace-root` (current, 40.7s vs
+34.5s) and `red-tail-short` (newest run, 40.9 [38.1–42.7] vs 33.5 [32.3–33.9]; awaiting a
+re-run) both put the background arm behind, and before the poll fix `red-tail-short` was worse
+still (45.4s vs 33.0s). The reason is structural: those jobs run 23–34s and the wake lands
 about 7–8s after the job exits, so the arm's best case is vanilla's blocking minus a turn —
-the round trip dominates. A failure close to the end of the output is one window away, so
-the wake adds a round trip and buys nothing. The post-fix re-run did remove the self-inflicted
-cost (the polling loop above): context fell to 9,892 [9,841–10,031] against vanilla's 28,021
-and calls to 2, but wall stayed negative (40.9s against 33.5s) because that part is the job
-plus the wake's arrival, not the agent. bgrun's genuinely owned win in these cells is
-`blocked_s` 0.0 — it never blocks the session — paid for in session wall time.
+the round trip dominates. A failure close to the end of the output is one window away, so the
+wake adds a round trip and buys nothing. The poll fix removed the self-inflicted cost (the
+polling loop above): on `red-tail-short`'s newest run context fell to 9,892 [9,841–10,031]
+against vanilla's 28,021 and calls to 2, but wall stayed negative (40.9s against 33.5s)
+because that part is the job plus the wake's arrival, not the agent. bgrun's genuinely owned
+win in these cells is `blocked_s` 0.0 — it never blocks the session — paid for in session wall
+time.
 
 **The pointer is a cost, not a benefit, when the session can search.** The three-way above:
 wrong and correct pointers both cost more calls and context than no pointer at all.
@@ -205,3 +250,6 @@ Full statement of what the measurements do and do not support: [`BENCHMARK.md`](
 → [`BENCHMARK.md`](../../BENCHMARK.md) (full findings) · [`method.md`](method.md) (how it was
 measured) · [`results.md`](results.md) (every cell and outcome) · [`predictions.md`](predictions.md)
 (the register) · [`runs/`](runs/) (the raw records)
+
+The rules these records follow — how a number is shown, what is labelled history, and what
+counts as awaiting a re-run — are stated in [`method.md`](method.md#recording-and-presentation-rules).
