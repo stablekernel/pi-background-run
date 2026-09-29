@@ -320,3 +320,11 @@ how it is written — not how a cell is measured.
 10. **Keep the boundary.** Unrun cells, falsified hypotheses and stated limits stay in the
     record. Collapse the prose around them when it is bloated, but never delete the markers: a
     benchmark that drops its untested cases claims more than it measured.
+11. **The summary shows the current tool only.** `AT-A-GLANCE.md` carries no historical runs, no
+    generation labels and no pre-fix numbers: a reader who was not here to run the benchmarks
+    cannot decode them, and they answer a question nobody reading a summary is asking. History
+    belongs in `BENCHMARK.md` (findings, including the findings that a *fixed defect* produced)
+    and `results.md` (the per-cell record). The test for any number in the summary: does it
+    describe the tool someone installing today would get? If not, it does not belong there.
+    Fixed defects still matter — they belong in the findings, with their measure of what the fix
+    bought, not in the summary as a caveat on numbers that no longer apply.
