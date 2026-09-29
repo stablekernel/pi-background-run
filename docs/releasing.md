@@ -1,5 +1,42 @@
 # Releasing pi-background-run
 
+## Landing changes: every commit and push is asked for first
+
+**Nothing is committed or pushed without the owner's permission.** Every change, every time —
+code, documents, records, fixes, tidying. Prepare the change, show it, and stop.
+
+- **Propose, don't push.** Show the diff, or say what is staged and ready, then wait. CI passing is
+  not permission: `pr-title.yml` and `ci.yml` check that a change is well-formed, never that it is
+  wanted.
+- **Permission is explicit and per-instance.** "You may commit this" or "you can commit freely in
+  this session" counts, because the owner said it. Silence does not. Neither does approval of the
+  *work* — agreeing that a change is good is not the same as agreeing it should land. If you are
+  unsure whether permission was given, ask.
+- **Never `main` on your own account.** Nothing reaches `main` without the owner asking for it in
+  that conversation.
+- **An agent brief must say "propose, do not commit."** The rule only holds if the instruction
+  pattern does; a brief ending "commit and push" overrides it by accident, and every brief written
+  before this rule existed did exactly that.
+- **Records are never rewritten.** A correction to a per-cell record is a dated annotation, not an
+  edit (`docs/benchmark/method.md` rule 8).
+
+Why the whole gate rather than a judgement call about what seems safe: the review that matters is
+the owner's, and the only reliable way to know it happened is that they asked for the change to
+land. A change being mechanically verifiable — a record checked against its own profiles and
+transcripts — makes reviewing it *fast*. It does not make reviewing it unnecessary.
+
+### Two rules a damaged file taught
+
+- **A failed edit can still truncate the file.** An edit that reports "no match" may have written
+  nothing — or emptied the file. Verify the file is intact before any other command touches it, and
+  before staging it. On this branch an empty `method.md` was committed at `4cdcc2d` exactly this
+  way, and only a later working-tree restore revealed it.
+- **Never stage a path whose change you did not confirm.** `git add <path>` on a path you merely
+  *intended* to change is how that damage got committed rather than staying a working-tree
+  accident. Stage what you inspected, not what you planned.
+
+
+
 Version numbers, `CHANGELOG.md`, and the GitHub Release notes are all derived from
 Conventional Commits, via [release-please](https://github.com/googleapis/release-please).
 Nobody edits a version by hand.
