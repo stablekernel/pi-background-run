@@ -51,7 +51,11 @@ running synchronously depends on how long the job takes.
 | `calls` | 3, 3, 3 vs 1, 1, 1 | 3, 4, 4 vs 12, 2, 6 |
 
 **For a cheap job (23–34s) the round trip dominates and the background arm is slower.**
-Cell 3a's job is 22.8s and the wake lands about 7s after it exits, so the arm's best case
+Cell 3a's job is 22.8s and the wake lands within **milliseconds** of it exiting (4ms, per
+`runs/trace-root-framewake/sessions/bgrun-*`) — the same millisecond delivery every post-fix
+cell shows. The **~7–8s** the earlier framing charged to the wake belongs to Cell 1, the
+pre-poll-fix run, where the session held its turn open polling and the wake waited for the
+turn boundary (`runs/red-tail-short/CELL.md`:117,119). So the arm's best case
 is vanilla's blocking minus the turn it saves — 40.7s against 34.5s. The arm still delivers
 what it owns — `blocked_s` 0.0 against 22.8s — but the unblocking is paid for in session
 wall time. Source: `runs/trace-root-framewake/CELL.md`.

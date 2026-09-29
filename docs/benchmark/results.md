@@ -310,7 +310,9 @@ than vanilla:
 
 These are the **pre-framing** numbers — they predate the wake's closing-line change, and Cell 1c
 above supersedes them. The fix removed the loop and drove the claims to zero; wall stayed negative
-there for the same floor reason (the job is 23.2s and the wake landed ~7s after it exited).
+there for the same floor reason (the job is 23.2s; the wake itself lands within milliseconds
+of exit — the ~7s figure once cited here was Cell 1's turn-boundary latency, an artifact of
+the polling that run exhibited, not of the wake).
 
 ### Before the poll fix — Cell 1, the fabricated-wake finding (`H12`) (labelled history)
 
