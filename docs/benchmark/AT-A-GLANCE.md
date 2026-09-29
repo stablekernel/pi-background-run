@@ -5,18 +5,17 @@ command's output never enters the conversation, and the session is woken when th
 Its cost is that **wake** — the session still waits for the completion notification, then does
 its own work around it before it can answer. What it buys is a session that never blocks:
 `blocked_s` is 0.0 in every cell, against 22.8–660.2s of foreground waiting. Whether the trade
-pays off turns entirely on **how long the job runs** — at ~23–34s the wake's round trip costs
-more than it saves, at ~204s the background arm pays the job once while the synchronous arm pays
-it over and over. Below: one section per measured cell, the three-way pointer result, then where
-it does not help. Every figure cites the cell's `profile.csv`; the full case and limits are in
+pays off turns entirely on **how long the job runs** — at ~23–34s the arm's own turns around the
+wake cost more than it saves, at ~204s the background arm pays the job once while the synchronous
+arm pays it over and over. Below: one section per measured cell, the three-way pointer result, then
+where it does not help. Every figure cites the cell's `profile.csv`; the full case and limits are in
 [`BENCHMARK.md`](../../BENCHMARK.md).
 
 ## Where to start
 
-**This document covers the current tool only.** Superseded runs — the tool's history, and the
-before-half of every check below — are in [`BENCHMARK.md`](../../BENCHMARK.md) and
-[`results.md`](results.md), not here. Most readers only need route 1; the rest is for checking
-the work.
+**This document shows the current tool only**, under the [recording and presentation
+rules](method.md#recording-and-presentation-rules) that every record here follows. Most readers
+only need route 1; the rest is for checking the work.
 
 1. **Five minutes — this file, then stop.** Every finding and number for the current tool is
    here; the terms are in the [Glossary](#glossary), the caveats under [Limits](#limits).
@@ -49,8 +48,10 @@ is cheap to reach?
 | `calls` | 4, 3, 3 | 1 [1–1] |
 | `blocked_s` (mechanism) | 0.0 | 24.3 |
 
-Source: `runs/red-tail-short-v080/profile.csv` (summary rows). The interaction is `bgrun` → yield
-→ wake → search → one window → answer: two sessions ran `bgrun bggrep bgtail`, the third
+Source: [`runs/red-tail-short-v080/profile.csv`](runs/red-tail-short-v080/profile.csv) (summary
+rows); cell record [`runs/red-tail-short-v080/CELL.md`](runs/red-tail-short-v080/CELL.md). The
+interaction is `bgrun` → yield → wake → search → one window → answer: two sessions ran `bgrun
+bggrep bgtail`, the third
 (`bgrun-1`) added a second `bggrep`. No session polled a running job or claimed a wake it had not
 received (`wake-claims.csv`: `claims_before_exit` 0, 0, 0 and polls 0, 0, 0) — which is why
 `blocked_s` 0.0 carries no hidden polling; the fabricated-wake episode that check exists for is in
@@ -72,7 +73,8 @@ is not exercised.
 | `calls` | 3, 4, 4 | 12, 2, 6 |
 | cause reached (`part-05.test.ts`) | 3/3 | 3/3 |
 
-Source: `runs/long-buried/profile.csv` (summary rows). The first cell where bgrun wins on both
+Source: [`runs/long-buried/profile.csv`](runs/long-buried/profile.csv) (summary rows); cell record
+[`runs/long-buried/CELL.md`](runs/long-buried/CELL.md). The first cell where bgrun wins on both
 axes — 3.1× faster and 4.3× lighter — with the diagnosis a tie. bgrun paid the ~204s job once
 (median session 225.9s ≈ the job plus ~22s of agent work; bgrun-1 made two `bggrep` calls and
 stopped, bgrun-3 added a `bgtail` for context); vanilla paid it repeatedly (vanilla-2 ran the whole
@@ -96,8 +98,10 @@ the wake promises the summary is the answer.
 | `harness.ts` in context | **3, 3, 5** | — |
 | deepest frame seen | **`harness.ts`** | `harness.ts` |
 
-Source: `runs/trace-root-framewake/profile.csv` (summary rows) and
-`runs/trace-root-framewake/CELL.md`. Vanilla's own run is unmoved (single full read). The sequence
+Source: [`runs/trace-root-framewake/profile.csv`](runs/trace-root-framewake/profile.csv) (summary
+rows) and the cell record
+[`runs/trace-root-framewake/CELL.md`](runs/trace-root-framewake/CELL.md). Vanilla's own run is
+unmoved (single full read). The sequence
 is `bgrun` → `bggrep` → one more read — `bgtail` in two sessions (bgrun-1, bgrun-3), a second
 `bggrep` in the other — to reach the window where the frames sit. bgrun-1's answer names the
 harness: *"**Harness:** …/harness.ts:28"*. The extra call cost ~4k characters and bought the cause,
@@ -118,16 +122,23 @@ the rule:
 | baseline | none | 3, 4, 4 | 18,760 [16,365–21,056] | 225.9 |
 | `tracepreset` | **wrong** | 5, 5, 6 | 28,633 [21,867–31,481] | 233.1 |
 
-Sources: `runs/long-buried/profile.csv`, `runs/long-buried-tracepreset/profile.csv`,
-`runs/long-buried-tracepreset-fixed/profile.csv`, and `runs/long-buried/CELL.md`. Ranges do not
-overlap on calls (baseline max 4, both variants min 5) or context (baseline max 21,056, correct
-variant min 29,180). Both variants reached the same `part-05.test.ts`.
+Sources: [`runs/long-buried/profile.csv`](runs/long-buried/profile.csv),
+[`runs/long-buried-tracepreset/profile.csv`](runs/long-buried-tracepreset/profile.csv),
+[`runs/long-buried-tracepreset-fixed/profile.csv`](runs/long-buried-tracepreset-fixed/profile.csv),
+and the cell records [`runs/long-buried/CELL.md`](runs/long-buried/CELL.md),
+[`runs/long-buried-tracepreset/CELL.md`](runs/long-buried-tracepreset/CELL.md),
+[`runs/long-buried-tracepreset-fixed/CELL.md`](runs/long-buried-tracepreset-fixed/CELL.md). Ranges
+do not overlap on calls (baseline max 4, both variants min 5) or context (baseline max 21,056,
+correct variant min 29,180). Both variants reached the same `part-05.test.ts`. The pointer workload
+is the extension's own suite — a pathological digest input, so the pointer *rule* generalises
+further than the pointer *number*.
 
-- **The current preset** (`runs/long-buried-tracepreset-fixed/`, three bgrun sessions, vanilla
-  omitted by design) requires real evidence before naming anything, and named the *true* failure
+- **The current preset** ([`runs/long-buried-tracepreset-fixed/`](runs/long-buried-tracepreset-fixed/),
+  three bgrun sessions, vanilla omitted by design) requires real evidence before naming anything,
+  and named the *true* failure
   (`AssertionError … at TestContext.<anonymous> (/private/tmp/long-buried-fixture/part-05.test.ts:59:9)`)
   — and cost the most, not the least.
-- **The wrong-pointer run** (`runs/long-buried-tracepreset/`), configured
+- **The wrong-pointer run** ([`runs/long-buried-tracepreset/`](runs/long-buried-tracepreset/)), configured
   `{ "preset": "js-trace", "on": "failure" }`, named `Failure: (pass) preset js-trace corpus
   (captured): …` — **a passing test's name**, because the suite under test contains the preset's own
   corpus tests and prints captured failure text. Sessions did not trust it and searched anyway.
@@ -146,8 +157,8 @@ jobs run 23–34s, so the arm pays the job plus its turns around the wake while 
 waiting inside one call. The wake is not slow — in `red-tail-short` it lands 4ms after the job exits
 in all three sessions, and `trace-root` shows the same millisecond delivery (`exitedAt` and the wake
 timestamp in `runs/red-tail-short-v080/sessions/bgrun-*` and
-`runs/trace-root-framewake/sessions/bgrun-*`) — so the penalty is the session's own work plus a
-round trip it cannot avoid: 46.7s against a ~24.4s job leaves ~22s of the arm's own turns. A failure
+`runs/trace-root-framewake/sessions/bgrun-*`) — so the penalty is the session's own turns around
+the wake: 46.7s against a ~24.4s job leaves ~22s of the arm's own turns. A failure
 one window from the end means the wake buys back the search and little else: context is 13,941
 [12,876–16,534] against vanilla's 30,056 and calls are 4, 3, 3. bgrun's genuinely owned win here is
 `blocked_s` 0.0 — it never blocks the session — paid for in wall time.
@@ -160,15 +171,13 @@ both cost more calls and context than no pointer at all.
 n=3 per arm, one model (`anthropic/claude-sonnet-4-6`), one synthetic fixture family, one machine;
 three runs demonstrate an effect and claim no significance, and every cell was human-driven (`H6
 <unattended>` is negative on this setup). `ctx_chars` counts characters of transcript text, not
-billed tokens. The fixture has no flaky tests, retries, parallel workers or enormous stack traces,
-and the pointer workload is the extension's own suite — a pathological digest input, so the pointer
-*rule* generalises further than the pointer *number*. **The command in every cell also runs this
-repository's own test suite, and its size changes between revisions as tests are added** (the
-presets work alone added 718 lines to it). The fixture's workload is pinned behaviourally; that
-repo-suite margin is not, so the absolute figures belong to the revision each cell ran against —
-the mechanism findings do not depend on it ([#40](https://github.com/stablekernel/pi-background-run/issues/40)).
-Full statement of what the measurements do and do not support:
-[`BENCHMARK.md`](../../BENCHMARK.md).
+billed tokens. The fixture has no flaky tests, retries, parallel workers or enormous stack traces.
+**The command in every cell also runs this repository's own test suite, and its size changes between
+revisions as tests are added** (the presets work alone added 718 lines to it). The fixture's workload
+is pinned behaviourally; that repo-suite margin is not, so the absolute figures belong to the
+revision each cell ran against — the mechanism findings do not depend on it
+([#40](https://github.com/stablekernel/pi-background-run/issues/40)). Full statement of what the
+measurements do and do not support: [`BENCHMARK.md`](../../BENCHMARK.md).
 
 ## Glossary
 
