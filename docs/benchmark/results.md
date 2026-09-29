@@ -29,7 +29,7 @@ procedure that produces these rows is in [method.md](./method.md).
 | cell | prediction | status |
 |---|---|---|
 | `green-short` | vanilla by median, bimodal | not run |
-| `red-tail-short` | vanilla by median | **run** — [Cell 1b](#cell-1b--red-tail-short-measured-2026-09-28) (newest run, awaiting a re-run) with Cell 1 as its before-half |
+| `red-tail-short` | vanilla by median | **run** — [Cell 1c](#cell-1c--red-tail-short-on-080-measured-2026-09-29) (the current tool) with Cell 1b and Cell 1 as its labelled history |
 | `long-buried` | bgrun on executions and blocked; context undecided | **run** — [Cell 4](#cell-4--long-buried-and-its-pointer-variant-2026-09-28), plus its pointer variants |
 | `trace-root` | bgrun on cost; the cause may not survive the wake | **run** — [Cell 3a](#cell-3a--trace-root-measured-2026-09-28) with Cell 3 as its before-half |
 | `fast-verbose` | struggle for bgrun | not run |
@@ -255,42 +255,64 @@ haiku→sonnet→opus, which is the axis `H7`/`H11` need.
 | rung | model | `red-tail-short` | `long-buried` | `trace-root` |
 |---|---|---|---|---|
 | weak | `anthropic/claude-haiku-4-5` | not run | not run | not run |
-| mid | `anthropic/claude-sonnet-4-6` | **done** — [Cell 1b](#cell-1b--red-tail-short-measured-2026-09-28) | **done** — [Cell 4](#cell-4--long-buried-and-its-pointer-variant-2026-09-28) | **done** — [Cell 3a](#cell-3a--trace-root-measured-2026-09-28) |
+| mid | `anthropic/claude-sonnet-4-6` | **done** — [Cell 1c](#cell-1c--red-tail-short-on-080-measured-2026-09-29) | **done** — [Cell 4](#cell-4--long-buried-and-its-pointer-variant-2026-09-28) | **done** — [Cell 3a](#cell-3a--trace-root-measured-2026-09-28) |
 | strong | `anthropic/claude-opus-5` | not run | not run | not run |
 | floor probe (not a rung) | `fireworks/gpt-oss-120b` | not run | not run | not run |
 
-## Cell 1b — `red-tail-short`, measured 2026-09-28
+## Cell 1c — `red-tail-short` on 0.8.0, measured 2026-09-29
 
-**Awaiting a re-run.** The newest run of this cell is Cell 1b: the same fixture, model and prompt
-re-run after the poll fix, which made a running job answer a reader with its *state* rather than its
-log (`runs/red-tail-short-fixed/`). It postdates that fix but predates the wake's closing-line
-change — the same change `trace-root` below shows flipping a short cell's call sequence — so these
-are the newest numbers this cell has, not the current tool's, and the cell needs a re-run before
-they can stand as current.
+**Current run — the current tool.** The newest run of this cell
+([runs/red-tail-short-v080/CELL.md](runs/red-tail-short-v080/CELL.md)) is the same fixture (sha
+`0bfe00ed1d9866b9`), model, prompt and command on version 0.8.0 (`origin/main` at `9350fae`),
+carrying both the poll fix and the wake's closing-line change (merged as `6b04d24`). No session
+polls a running job or claims a wake it has not received, and the framing change costs the same
+increment the `trace-root` pair showed.
 
-Cell 1's mechanism was fixed in the extension and the cell re-run, with the fixture, model, prompt
-and command held fixed — the only difference is the tool code (the bench commit that synced the
-fixed extension; extension sha `18f022248c9f4552`, against Cell 1's `b6539e3fab30bb99`; the
-product's poll fix and the changes with it merged as `6b04d24`). Full record and artifacts:
-[runs/red-tail-short-fixed/CELL.md](runs/red-tail-short-fixed/CELL.md).
+| metric (median [min–max]) | bgrun | vanilla |
+|---|---|---|
+| wall_s | 46.7 [40.3–50.7] | **35.0** [34.4–38.6] |
+| blocked_s | 0.0 [0.0–0.0] | 24.3 [23.9–24.4] |
+| ctx_chars | **13,941** [12,876–16,534] | 30,056 [29,962–30,183] |
+| tool calls | 4, 3, 3 | 1, 1, 1 |
+| execs | 1.0 [1.0–1.0] | 1.0 [1.0–1.0] |
+| diag_reach / cause_reached | 3/3 | 3/3 |
 
-| metric | Cell 1 | Cell 1b | vanilla (control) |
-|---|---|---|---|
-| wake claims before exit | 1, 2, 1 | **0, 0, 0** | — |
-| polls before exit | 10, 9, 5 | **0, 0, 0** | — |
-| tool calls per session | 12, 11, 9 | **2, 2, 2** | 1 |
-| ctx_chars (median) | 31,170 | **9,892** | 27,817 → 28,021 |
-| wall_s (median [min–max]) | 45.4 [42.9–51.1] | 40.9 [38.1–42.7] | 33.0 → 33.5 |
-| blocked_s / diag_reach | 0.0, 3/3 | 0.0, 3/3 | 22.5, 3/3 |
+Source: [runs/red-tail-short-v080/profile.csv](runs/red-tail-short-v080/profile.csv) and
+[runs/red-tail-short-v080/wake-claims.csv](runs/red-tail-short-v080/wake-claims.csv).
 
-**`H12` supported and fixed:** no session claims a wake it has not received, and the polls it
-licensed went to zero. The interaction is now `bgrun` → yield → wake → one search → answer. Context
-inverted — bgrun costs *less* than vanilla here — because with the log unavailable before the wake
-the session searched it (`bggrep`, `locate` flipping from `position` to `pattern`) instead of
-reading it in pieces. Wall time did **not** invert: the cell stays negative, exactly as the floor
-argument predicted, because the job is 23.2s and the wake lands ~7s after it exits.
+**The interaction is `bgrun` → yield → wake → search → one window → answer.** Two sessions ran
+`bgrun bggrep bgtail`; the third (bgrun-1) added a second `bggrep` after its first search matched
+mostly passes. `wake-claims.csv` reads `claims_before_exit` 0, 0, 0 with polls 0, 0, 0, so `H12`
+stays fixed on the current tool. Context is below vanilla's but above the pre-framing Cell 1b — the
+wake's closing line points at the log, so the session opens a window on it: **calls 2 → 3–4 and
+context 9,892 → 13,941**. Wall stays negative exactly as the floor argument predicts for a ~24.4s
+job: 46.7s against 35.0s, with `blocked_s` 0.0 against 24.3.
 
-### Before the poll fix — Cell 1, the fabricated-wake finding (`H12`)
+The command's own output reads **`Ran 280 tests across 5 files`** (the 3 repo files plus the
+fixture's 2); the repo suite alone was 272 tests across 3 files before the run, and that margin
+belongs to this revision (issue [#40](https://github.com/stablekernel/pi-bgrun/issues/40)).
+
+### Pre-framing — Cell 1b (post-poll-fix, labelled history)
+
+The same cell re-run after the poll fix and before the wake's closing line changed
+([runs/red-tail-short-fixed/CELL.md](runs/red-tail-short-fixed/CELL.md); extension sha
+`18f022248c9f4552`, against Cell 1's `b6539e3fab30bb99`; the poll fix and the changes with it merged
+as `6b04d24`). The log was gated behind the wake, so the session searched it (`locate` flipping
+`position` → `pattern`) instead of reading it in pieces, and context **inverted** — bgrun cost less
+than vanilla:
+
+| metric (median [min–max]) | bgrun | vanilla |
+|---|---|---|
+| wall_s | 40.9 [38.1–42.7] | **33.5** [32.3–33.9] |
+| ctx_chars | **9,892** [9,841–10,031] | 28,021 [28,000–28,236] |
+| tool calls | 2, 2, 2 | 1, 1, 1 |
+| blocked_s / diag_reach | 0.0, 3/3 | 22.4, 3/3 |
+
+These are the **pre-framing** numbers — they predate the wake's closing-line change, and Cell 1c
+above supersedes them. The fix removed the loop and drove the claims to zero; wall stayed negative
+there for the same floor reason (the job is 23.2s and the wake landed ~7s after it exited).
+
+### Before the poll fix — Cell 1, the fabricated-wake finding (`H12`) (labelled history)
 
 The first real cell: six sessions (3 bgrun / 3 vanilla) at `anthropic/claude-sonnet-4-6`, the
 neutral prompt, one session directory each, interleaved. Full record, provenance and instrument
@@ -436,7 +458,7 @@ generalises further than the *number* does.
 
 - Phase 1 instrument work is closed: `locating`, the shape and evidence-path instruments,
   and the unattended question (`H6`, negative — see above) are all answered. The first cell
-  has since been measured ([Cell 1b](#cell-1b--red-tail-short-measured-2026-09-28)); what
+  has since been measured ([Cell 1c](#cell-1c--red-tail-short-on-080-measured-2026-09-29)); what
   remains is the ladder rungs above the mid rung — each needs its own attended sessions.
 - The fixture's crutch is now a knob, not a blocker: `DUMMY_ANNOUNCE_FAILURE=0` removes
   the line that names the planted failure, and every diagnosis or discovery cell must run

@@ -1,0 +1,56 @@
+label                 arm    execs fg handoff wall_s blocked_s idle_s sleep_s ctx_chars diag    locate    cause  calls
+bgrun-1               bgrun  1    0  1      50.7   0.0      50.7   0.0    16,534   up+down pattern   reached 4
+bgrun-2               bgrun  1    0  1      46.7   0.0      46.7   0.0    13,941   up+down pattern   reached 3
+bgrun-3               bgrun  1    0  1      40.3   0.0      40.3   0.0    12,876   up+down pattern   reached 3
+vanilla-1             vanilla 1    1  0      38.6   24.3     14.4   0.0    30,183   up+down position  reached 1
+vanilla-2             vanilla 1    1  0      35.0   24.4     10.6   0.0    29,962   up+down position  reached 1
+vanilla-3             vanilla 1    1  0      34.4   23.9     10.4   0.0    30,056   up+down position  reached 1
+
+bgrun-1  docs/benchmark/runs/red-tail-short-v080/sessions/bgrun-1/2026-09-29T15-44-52-183Z_01a0edd7-19d7-7681-b108-b0d83d7283bd.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bgrun     0.0     320     685       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
+  2  bggrep    0.0     8196    9,665     pattern   bun-tests-1790696698-65337
+  3  bggrep    0.0     2623    12,623    pattern   bun-tests-1790696698-65337
+  4  bgtail    0.0     2520    15,377    position  bun-tests-1790696698-65337
+
+bgrun-2  docs/benchmark/runs/red-tail-short-v080/sessions/bgrun-2/2026-09-29T15-48-10-661Z_01a0edda-2125-706c-839a-e13b81f0cf32.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bgrun     0.0     320     615       -         bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
+  2  bggrep    0.0     8154    9,527     pattern   bun-tests-1790696898-79192
+  3  bgtail    0.0     3054    12,691    position  bun-tests-1790696898-79192
+
+bgrun-3  docs/benchmark/runs/red-tail-short-v080/sessions/bgrun-3/2026-09-29T15-53-01-428Z_01a0edde-90f3-71ba-a17f-ce0b168b7a0e.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bgrun     0.0     320     662       -         cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
+  2  bggrep    0.0     8147    9,573     pattern   bun-tests-1790697186-97438
+  3  bgtail    0.0     2189    11,900    position  bun-tests-1790697186-97438
+
+vanilla-1  docs/benchmark/runs/red-tail-short-v080/sessions/vanilla-1/2026-09-29T15-45-50-139Z_01a0edd7-fc3a-7791-96f1-866e9821f6ec.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bash      24.3    28880   29,084    position  cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
+
+vanilla-2  docs/benchmark/runs/red-tail-short-v080/sessions/vanilla-2/2026-09-29T15-50-55-239Z_01a0eddc-a407-73a3-ba51-db04651b92b7.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bash      24.4    28871   29,106    position  cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
+
+vanilla-3  docs/benchmark/runs/red-tail-short-v080/sessions/vanilla-3/2026-09-29T15-54-10-007Z_01a0eddf-9cd7-73ff-b318-862a46214ea4.jsonl
+  #  tool      wait_s  result  cum_ctx   locate    command
+  1  bash      23.9    28871   29,106    position  cd /Users/benchmark-runner1/sk/pi-bgrun.bench-doc && bun test extension/index.test.ts scripts/measure-sessions.test.ts scripts/pty-shape.test.ts /private/tmp/red-tail-fixture 2>&1
+
+summary (median [min–max]; arms with a single session have no median)
+  vanilla (3 sessions)
+    execs      1.0 [1.0–1.0]
+    wall_s     35.0 [34.4–38.6]
+    blocked_s  24.3 [23.9–24.4]
+    idle_s     10.6 [10.4–14.4]
+    sleep_s    0.0 [0.0–0.0]
+    ctx_chars  30,056 [29,962–30,183]
+    diag_reach 3/3
+  bgrun (3 sessions)
+    execs      1.0 [1.0–1.0]
+    wall_s     46.7 [40.3–50.7]
+    blocked_s  0.0 [0.0–0.0]
+    idle_s     46.7 [40.3–50.7]
+    sleep_s    0.0 [0.0–0.0]
+    ctx_chars  13,941 [12,876–16,534]
+    diag_reach 3/3

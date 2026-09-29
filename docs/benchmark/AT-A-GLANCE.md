@@ -32,33 +32,49 @@ together, merged as `6b04d24`.)
 output: a short run whose diagnostic is one tail-window away. Does the background handoff
 buy anything when the failure is cheap to reach?
 
-**Awaiting a re-run — newest run is Cell 1b, with the poll fix in place.** The current-tool
-run of this cell is the one below (`runs/red-tail-short-fixed/`): the same fixture, model and
-prompt re-run after the poll fix, which made a running job answer a reader with its *state*
-rather than its log. It postdates that fix but predates the wake's closing-line change — the
-same change `trace-root` below shows flipping a short cell's call sequence — so these are the
-newest numbers this cell has, not the current tool's, and the cell needs a re-run before they
-can stand as current.
+**Current run — the current tool (0.8.0).** The newest run of this cell
+(`runs/red-tail-short-v080/`) is the same fixture, model, prompt and command on the current tool,
+carrying both the poll fix and the wake's closing-line change (merged as `6b04d24`, released 0.8.0).
+It leads.
 
 | metric (median [min–max]) | bgrun | vanilla |
 |---|---|---|
-| `wall_s` | 40.9 [38.1–42.7] | 33.5 [32.3–33.9] |
+| `wall_s` | 46.7 [40.3–50.7] | **35.0** [34.4–38.6] |
+| `ctx_chars` | **13,941** [12,876–16,534] | 30,056 [29,962–30,183] |
+| `calls` | 4, 3, 3 | 1 [1–1] |
+| `blocked_s` (mechanism) | 0.0 | 24.3 |
+
+Source: `runs/red-tail-short-v080/profile.csv` (summary rows). The interaction is `bgrun` → yield →
+wake → search → one window → answer: two sessions ran `bgrun bggrep bgtail`, the third (`bgrun-1`)
+added a second `bggrep`. No session polled a running job or claimed a wake it had not received
+(`wake-claims.csv`: `claims_before_exit` 0, 0, 0 and polls 0, 0, 0), so `H12` stays fixed on the
+current tool. The wake's closing line — the change `trace-root` below shows fixing a short cell —
+costs the same increment here against Cell 1b: **calls 2 → 3–4 and context 9,892 → 13,941**, because
+the session opens a window on the log instead of answering from the summary. Wall stays negative, as
+the floor argument predicts for a ~24.4s job: 46.7s against 35.0s.
+
+### The finding this cell produced (`H12`) — its two earlier generations
+
+**Cell 1b — post-poll-fix, pre-framing (labelled history).** Cell 1's fabricated-wake loop was fixed
+in the extension and the cell re-run, before the wake's closing line changed. The fix removed the
+loop outright and **inverted** the context result:
+
+| metric (median [min–max]) | bgrun | vanilla |
+|---|---|---|
+| `wall_s` | 40.9 [38.1–42.7] | **33.5** [32.3–33.9] |
 | `ctx_chars` | **9,892** [9,841–10,031] | 28,021 [28,000–28,236] |
 | `calls` | 2 [2–2] | 1 [1–1] |
 | `blocked_s` (mechanism) | 0.0 | 22.4 |
 
-Source: `runs/red-tail-short-fixed/profile.csv` (summary rows). The whole interaction is
-`bgrun` → yield → wake → one search → answer: with the log gated behind the wake the arm
-searched it rather than reading it in pieces (`locate` flipped `position` → `pattern`), so
-context came in *below* vanilla's — the 12% penalty of the pre-fix run inverted. Wall time
-stayed negative, exactly as the floor argument predicted: the job is 23.2s and the wake lands
-~7s after it exits, so the arm's best case is vanilla's blocking less a turn.
+Source: `runs/red-tail-short-fixed/profile.csv` (summary rows). With the log gated behind the wake the
+arm searched it rather than reading it in pieces (`locate` flipped `position` → `pattern`), so context
+came in *below* vanilla's — the 12% penalty of Cell 1 inverted (9,892 against 28,021). These are the
+**pre-framing** numbers: they predate the wake's closing-line change, and the current run above is the
+one that supersedes them. Wall stayed negative there for the same floor reason.
 
-### Before the poll fix — the fabricated-wake finding (`H12`)
-
-The run above exists because of this one. Cell 1 (`runs/red-tail-short/`), on the extension
-before the fix, made every bgrun session poll a job it had just handed off, each claiming a
-wake it had never received:
+**Cell 1 — pre-poll-fix (labelled history).** The run Cell 1b exists because of. On the extension
+before the fix, every bgrun session polled a job it had just handed off, each claiming a wake it had
+never received:
 
 | metric (median [min–max]) | bgrun (pre-fix) | vanilla |
 |---|---|---|
@@ -82,15 +98,16 @@ real wake arrived ~8s after the job exited, so the arm front-ran it: the three s
 each first claimed a wake 3–4s into a ~23s job. 27 of the three sessions' 30 tool calls were
 made while the job was still running, and the fix drove that — and the claims — to zero:
 
-| metric | pre-fix (Cell 1) | post-fix (Cell 1b) |
-|---|---|---|
-| wake claims before exit | 1, 2, 1 | **0, 0, 0** |
-| polls before exit | 10, 9, 5 | **0, 0, 0** |
-| tool calls per session | 12, 11, 9 | **2, 2, 2** |
-| `ctx_chars` (median) | 31,170 | **9,892** |
-| `wall_s` (median [min–max]) | 45.4 [42.9–51.1] | 40.9 [38.1–42.7] |
+| metric | pre-fix (Cell 1) | post-poll-fix, pre-framing (Cell 1b) | current, 0.8.0 (Cell 1c) |
+|---|---|---|---|
+| wake claims before exit | 1, 2, 1 | **0, 0, 0** | **0, 0, 0** |
+| polls before exit | 10, 9, 5 | **0, 0, 0** | **0, 0, 0** |
+| tool calls per session | 12, 11, 9 | 2, 2, 2 | 4, 3, 3 |
+| `ctx_chars` (median) | 31,170 | 9,892 | 13,941 |
+| `wall_s` (median [min–max]) | 45.4 [42.9–51.1] | 40.9 [38.1–42.7] | 46.7 [40.3–50.7] |
 
-Sources: `runs/red-tail-short/profile.csv` and `runs/red-tail-short-fixed/profile.csv`.
+Sources: `runs/red-tail-short/profile.csv`, `runs/red-tail-short-fixed/profile.csv` and
+`runs/red-tail-short-v080/profile.csv`.
 
 ## `long-buried` — a failure buried in a long noisy run
 
@@ -217,17 +234,17 @@ product issue [#33](https://github.com/stablekernel/pi-background-run/issues/33)
 ## Where bgrun does not help
 
 **Every short-job cell is a loss or a tie on wall time.** `trace-root` (current, 40.7s vs
-34.5s) and `red-tail-short` (newest run, 40.9 [38.1–42.7] vs 33.5 [32.3–33.9]; awaiting a
-re-run) both put the background arm behind, and before the poll fix `red-tail-short` was worse
-still (45.4s vs 33.0s). The reason is structural: those jobs run 23–34s and the wake lands
-about 7–8s after the job exits, so the arm's best case is vanilla's blocking minus a turn —
-the round trip dominates. A failure close to the end of the output is one window away, so the
-wake adds a round trip and buys nothing. The poll fix removed the self-inflicted cost (the
-polling loop above): on `red-tail-short`'s newest run context fell to 9,892 [9,841–10,031]
-against vanilla's 28,021 and calls to 2, but wall stayed negative (40.9s against 33.5s)
-because that part is the job plus the wake's arrival, not the agent. bgrun's genuinely owned
-win in these cells is `blocked_s` 0.0 — it never blocks the session — paid for in session wall
-time.
+34.5s) and `red-tail-short` (current run, 46.7 [40.3–50.7] vs 35.0 [34.4–38.6]) both put the
+background arm behind, and before the poll fix `red-tail-short` was worse still (45.4s vs
+33.0s). The reason is structural: those jobs run 23–34s, so the arm pays the job plus the turns
+it makes around the wake, while vanilla pays the same waiting inside a single call — the round
+trip dominates. A failure close to the end of the output is one window away, so the wake adds a
+round trip and buys nothing. The poll fix removed the self-inflicted cost (the polling loop
+above): on `red-tail-short`'s current run context is 13,941 [12,876–16,534] against vanilla's
+30,056 and calls are 4, 3, 3, and the pre-framing Cell 1b was lighter still at 9,892 [9,841–10,031].
+Wall stayed negative in every generation because that part is the job plus the wake, not the
+agent. bgrun's genuinely owned win in these cells is `blocked_s` 0.0 — it never blocks the
+session — paid for in session wall time.
 
 **The pointer is a cost, not a benefit, when the session can search.** The three-way above:
 wrong and correct pointers both cost more calls and context than no pointer at all.

@@ -56,13 +56,28 @@ is vanilla's blocking minus the turn it saves — 40.7s against 34.5s. The arm s
 what it owns — `blocked_s` 0.0 against 22.8s — but the unblocking is paid for in session
 wall time. Source: `runs/trace-root-framewake/CELL.md`.
 
+**`red-tail-short` — the same cheap job on the current tool.** The second short cell measures
+the same shape: on 0.8.0 (Cell 1c, `runs/red-tail-short-v080/CELL.md`) the arm is 46.7
+[40.3–50.7] against vanilla's 35.0 [34.4–38.6], with context 13,941 [12,876–16,534] against
+30,056 and calls 4, 3, 3 against 1, 1, 1; no session polls a running job
+(`blocked_s` 0.0 against 24.3, wake claims 0, 0, 0). It is negative on wall for the same
+floor reason — the job is ~24.4s and the arm pays it plus its own turns around the wake —
+and, as in every short cell, the unblocking is paid for in session wall time.
+
+**The wake's closing-line change costs the same increment here as in the `trace-root` pair**
+(Cell 3 → Cell 3a). Against the pre-framing Cell 1b, **calls rise 2 → 3–4 and context 9,892 →
+13,941**, because the closing line points at the log and the session now opens a window on it
+(`bgtail`) instead of answering from the summary — the same one-step sequence change the
+`trace-root` pair shows.
+
 **Before the wake's closing line changed** (labelled history). Two earlier runs measured the
-same shape on builds that predate the wake's closing-line change: `red-tail-short`'s newest
-run (Cell 1b) at 40.9 [38.1–42.7] vs 33.5 [32.3–33.9] with context 9,892 against 28,021
-(`runs/red-tail-short-fixed/CELL.md` — itself awaiting a re-run, since its newest run
-predates the same change), and `trace-root`'s Cell 3 at 37.5s against 34.5s
+same shape on builds that predate the change: `red-tail-short`'s Cell 1b (the poll fix,
+pre-framing) at 40.9 [38.1–42.7] vs 33.5 [32.3–33.9] with context 9,892 against 28,021
+(`runs/red-tail-short-fixed/CELL.md`), and `trace-root`'s Cell 3 at 37.5s against 34.5s
 (`runs/trace-root/CELL.md`). Each is kept as labelled history inside its own cell section,
-never as a competing headline.
+never as a competing headline. Cell 1b is also the poll fix's own success — it drove the
+fabricated wake and the polls it licensed to zero — but the current red-tail measurement is
+Cell 1c above.
 
 **For an expensive job the background arm pays it once and the synchronous arm pays it
 repeatedly.** Cell 4's job takes ~204s. The `bgrun` arm's 225.9s is that job plus about
@@ -171,13 +186,14 @@ whether a log is red. Three decisions in this work are instances of holding that
 
 In every measured cell, the `bgrun` sessions made **zero polls before the wake** and
 **zero wake claims they had not received** (`0/0` in all three Cell 4 baseline sessions,
-all three Cell 4 pointer-variant sessions, and all Cell 3a sessions). Cell 1 was the
-counter-example that produced the fix — 3 of 3 sessions claimed a wake before receiving
-it and made 10, 9 and 5 polls — and Cell 1b re-ran the same cell on the fixed extension
-and measured 0, 0, 0 in both columns (`runs/red-tail-short-fixed/CELL.md`; that run is
-itself awaiting a re-run, since it predates the wake's closing-line change). This holds in
-Cell 4, a 1,281-line log and a ~204s job, which is the cell where polling is most
-tempting. It is a mechanism result about the tool, not a claim about agents in general.
+all three Cell 4 pointer-variant sessions, all Cell 3a sessions, and all three Cell 1c
+sessions). Cell 1 was the counter-example that produced the fix — 3 of 3 sessions claimed a
+wake before receiving it and made 10, 9 and 5 polls — and Cell 1b re-ran the same cell on the
+fixed extension and measured 0, 0, 0 in both columns
+(`runs/red-tail-short-fixed/CELL.md`); Cell 1c re-ran it again on 0.8.0 and measured the same
+0, 0, 0 (`runs/red-tail-short-v080/wake-claims.csv`), so the fix holds on the current tool.
+This holds in Cell 4, a 1,281-line log and a ~204s job, which is the cell where polling is
+most tempting. It is a mechanism result about the tool, not a claim about agents in general.
 
 ## What the results do not establish
 
@@ -223,6 +239,7 @@ The full record lives in the adjacent benchmark checkout, `pi-bgrun.bench-doc`, 
 
 Cell → record path: `red-tail-short` (Cell 1) `runs/red-tail-short/CELL.md`;
 `red-tail-short` after the no-poll change (Cell 1b) `runs/red-tail-short-fixed/CELL.md`;
+`red-tail-short` on 0.8.0 (Cell 1c, the current tool) `runs/red-tail-short-v080/CELL.md`;
 `trace-root` (Cell 3) `runs/trace-root/CELL.md`; `trace-root` with the framing fix
 (Cell 3a) `runs/trace-root-framewake/CELL.md`; `long-buried` and its pointer variants
 (Cell 4) `runs/long-buried/CELL.md`, `runs/long-buried-tracepreset/CELL.md` and
