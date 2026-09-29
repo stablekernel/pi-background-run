@@ -310,9 +310,10 @@ than vanilla:
 
 These are the **pre-framing** numbers — they predate the wake's closing-line change, and Cell 1c
 above supersedes them. The fix removed the loop and drove the claims to zero; wall stayed negative
-there for the same floor reason (the job is 23.2s; the wake itself lands within milliseconds
-of exit — the ~7s figure once cited here was Cell 1's turn-boundary latency, an artifact of
-the polling that run exhibited, not of the wake).
+there for the same floor reason (the job is 23.2s; this cell's own wake lands within milliseconds
+of exit — 4ms in all three sessions, `runs/red-tail-short-fixed/sessions/bgrun-*` — and the ~7s
+figure once cited here belongs to Cell 1, the pre-poll-fix run, where the session held the turn
+open polling and the wake waited for the turn boundary).
 
 ### Before the poll fix — Cell 1, the fabricated-wake finding (`H12`) (labelled history)
 
@@ -424,7 +425,8 @@ record: [runs/long-buried/CELL.md](runs/long-buried/CELL.md).
 job's cost.** bgrun pays it once (225.9s ≈ 204s job + ~22s agent work, `blocked_s` 0.0); vanilla pays
 it repeatedly (4 foreground runs median, `blocked_s` 660.2, spread 283.8–732.4 depending on how many
 times the session chose to re-run). This is the regime the async handoff is for, and it is the
-counterweight to Cells 1/1b/3, where a 23–34s job made the wake's round trip the dominant cost.
+counterweight to Cells 1/1b/3, where a 23–34s job left the background arm paying for its own turns
+around the wake.
 Diagnosis is a *tie* — both arms reached `part-05.test.ts` — which is the best form of the result:
 the same answer at a quarter of the context, because vanilla bought it by reading everything.
 
