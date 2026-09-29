@@ -23,8 +23,8 @@ the work.
 2. **The findings and their limits** — [`BENCHMARK.md`](../../BENCHMARK.md): the full case, the
    argument behind it, what the measurements do and do not support, and the history.
 3. **How it was measured, and re-deriving it** — [`method.md`](method.md) (procedure and the rules
-   these records follow), [`results.md`](results.md) (every cell, each outcome, and the earlier
-   generations), [`predictions.md`](predictions.md) (the hypotheses `H1`–`H12`), [`runs/`](runs/)
+   these records follow), [`results.md`](results.md) (every cell, each outcome, and the superseded
+   runs), [`predictions.md`](predictions.md) (the hypotheses `H1`–`H12`), [`runs/`](runs/)
    (transcripts, profiles, per-cell sheets). Re-check a figure with
    `bun scripts/measure-sessions.ts <session dirs> --csv` (`method.md` § *Re-deriving a table*).
    Running a cell is operator work, not reading: the quickstart for `./run-cell.sh <cell>` is in
