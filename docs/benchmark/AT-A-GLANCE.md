@@ -7,8 +7,8 @@ its own work around it before it can answer. What it buys is a session that neve
 `blocked_s` is 0.0 in every cell, against 22.8–660.2s of foreground waiting. Whether the trade
 pays off turns entirely on **how long the job runs** — at ~23–34s the arm's own turns around the
 wake cost more than it saves, at ~204s the background arm pays the job once while the synchronous
-arm pays it over and over. Below: one section per measured cell, the three-way pointer result, then
-where it does not help. Every figure cites the cell's `profile.csv`; the full case and limits are in
+arm pays it over and over. Below: one section per measured cell, then where it does not help. Every
+figure cites the cell's `profile.csv`; the full case and limits are in
 [`BENCHMARK.md`](../../BENCHMARK.md).
 
 ## Where to start
@@ -17,8 +17,8 @@ where it does not help. Every figure cites the cell's `profile.csv`; the full ca
 rules](method.md#recording-and-presentation-rules) that every record here follows. Most readers
 only need route 1; the rest is for checking the work.
 
-1. **Five minutes — this file, then stop.** Every finding and number for the current tool is
-   here; the terms are in the [Glossary](#glossary), the caveats under [Limits](#limits).
+1. **Five minutes — this file, then stop.** The headline findings and numbers for the current tool
+   are here; the terms are in the [Glossary](#glossary), the caveats under [Limits](#limits).
 2. **The findings and their limits** — [`BENCHMARK.md`](../../BENCHMARK.md): the full case, the
    argument behind it, what the measurements do and do not support, and the history.
 3. **How it was measured, and re-deriving it** — [`method.md`](method.md) (procedure and the rules
@@ -32,8 +32,7 @@ only need route 1; the rest is for checking the work.
 
 Cells: [`red-tail-short`](#red-tail-short--failure-near-the-end-of-a-short-run) ·
 [`long-buried`](#long-buried--a-failure-buried-in-a-long-noisy-run) ·
-[`trace-root`](#trace-root--symptom-at-the-end-cause-three-frames-down-another-file) ·
-[pointer variants](#the-three-way-pointer-result)
+[`trace-root`](#trace-root--symptom-at-the-end-cause-three-frames-down-another-file)
 
 ## `red-tail-short` — failure near the end of a short run
 
@@ -42,9 +41,7 @@ short run whose diagnostic is one tail-window away. Does the handoff buy anythin
 is cheap to reach?
 
 **Bold marks the favourable value in each row** — the smaller median for time, context, calls and
-blocking, the larger for appearances of the cause; a tie is not bolded. In the
-[pointer table](#the-three-way-pointer-result), whose rows are pointer variants rather than arms,
-bold instead flags the pointer's correctness.
+blocking, the larger for appearances of the cause; a tie is not bolded.
 
 | | bgrun (median [min–max]) | vanilla (median [min–max]) |
 |---|---|---|
@@ -59,12 +56,25 @@ Brackets give the range across the three runs; an outcome row reports the runs t
 result, not a median.
 
 Source: [`runs/red-tail-short-v080/profile.csv`](runs/red-tail-short-v080/profile.csv) (summary
-rows); cell record [`runs/red-tail-short-v080/CELL.md`](runs/red-tail-short-v080/CELL.md). The
-interaction is `bgrun` → yield → wake → search → one window → answer: two sessions ran `bgrun
-bggrep bgtail`, the third
-(`bgrun-1`) added a second `bggrep`. No session polled a running job or claimed a wake it had not
-received (`wake-claims.csv`: `claims_before_exit` 0, 0, 0 and polls 0, 0, 0) — which is why
-`blocked_s` 0.0 carries no hidden polling; the fabricated-wake episode that check exists for is in
+rows); cell record [`runs/red-tail-short-v080/CELL.md`](runs/red-tail-short-v080/CELL.md).
+
+**What each arm did (from the transcripts).** One row per step; an arm that has finished shows
+`—`; a repeated phase is collapsed with its summed cost; character counts are the call's result
+size.
+
+| # | bgrun | vanilla |
+|---|---|---|
+| 1 | Hands the suite to a detached job (~24.4s); the hand-off call returns 320 characters. | Runs the suite in the foreground with one `bash` call: blocks ~24s, returns ~28.9k characters. *"Let me run the tests as requested."* (vanilla-1) |
+| 2 | The wake lands ~4ms after the job exits; nothing polls the running job. | Reads the returned output, locates the failure by position, and answers from it — no search call, no windowing decision. |
+| 3 | `bggrep` searches the log for failure patterns: 8.1–8.2k characters. *"Let me look at the test failures by searching the log for failure patterns."* (bgrun-2) | — |
+| 4 | `bgtail` reads a window on the log: 2.2–3.1k characters. *"The grep results don't show clear failures. Let me look at the tail of the log to see the summary of failures."* (bgrun-2) | — |
+
+The path taken by most sessions (2 of 3 here: bgrun-2 and bgrun-3); bgrun-1 took a second `bggrep`
+before its `bgtail`, and runs varied in tool-call count.
+
+No session polled a running job or claimed a wake it had not received (`wake-claims.csv`:
+`claims_before_exit` 0, 0, 0 and polls 0, 0, 0) — which is why `blocked_s` 0.0 carries no hidden
+polling; the fabricated-wake episode that check exists for is in
 [`BENCHMARK.md`](../../BENCHMARK.md) § Robustness. Wall stays negative, as the floor argument
 predicts for a ~24.4s job: 46.7s against 35.0s.
 
@@ -72,8 +82,7 @@ predicts for a ~24.4s job: 46.7s against 35.0s.
 
 **What it tested.** Ten fixture parts with the failure in `part-05` (the only part with a real
 assertion cluster), so a tail read has nothing to find: 570 tests, 1,281 lines, ~204s per run.
-This is the regime the async handoff is *for*. Run with no digest configured, so the pointer layer
-is not exercised.
+This is the regime the async handoff is *for*. Run with no digest configured.
 
 | | bgrun (median [min–max]) | vanilla (median [min–max]) |
 |---|---|---|
@@ -85,13 +94,29 @@ is not exercised.
 | Deepest frame seen — cause_file | `part-05.test.ts` | `part-05.test.ts` |
 
 Source: [`runs/long-buried/profile.csv`](runs/long-buried/profile.csv) (summary rows); cell record
-[`runs/long-buried/CELL.md`](runs/long-buried/CELL.md). The first cell where bgrun wins on both
-axes — 3.1× faster and 4.3× lighter — with the diagnosis a tie. bgrun paid the ~204s job once
-(median session 225.9s ≈ the job plus ~22s of agent work; bgrun-1 made two `bggrep` calls and
-stopped, bgrun-3 added a `bgtail` for context); vanilla paid it repeatedly (vanilla-2 ran the whole
-suite twice, the second wait 203.6s and 86,836 characters by the end; vanilla-1 made 12 calls
-across 8 foreground runs). Both arms reached `part-05.test.ts:59`; bgrun bought the same answer at
-a quarter of the context because vanilla bought it by reading everything.
+[`runs/long-buried/CELL.md`](runs/long-buried/CELL.md).
+
+**What each arm did (from the transcripts).** One row per step; an arm that has finished shows
+`—`; a repeated phase is collapsed with its summed cost; character counts are the call's result
+size.
+
+| # | bgrun | vanilla |
+|---|---|---|
+| 1 | Hands the suite to a detached job (~204s: 570 tests, 1,281 lines); the hand-off call returns 320 characters. | Runs the suite in the foreground with one `bash` call; its output arrives inline, 35.0–50.6k characters. |
+| 2 | The wake lands after the job exits; nothing polls it (`wake-claims.csv`: claims 0/0/0). | The output is too large to read whole, so it is searched in place (`grep`, `tail`, `sed`). |
+| 3 | Searches the log (`bggrep`) — 2 searches, 13.1–14.4k characters summed. | Re-runs the whole suite for a fresh log — 2, 4 or 8 times (one count per session), costing **263.6s (×2), 660.2s (×4) and 707.3s (×8)** blocked and returning **84,934, 66,873 and 54,634 characters**. |
+| 4 | Reads a window (`bgtail`): 2.8–3.9k characters. | — |
+
+The path taken by most sessions: bgrun made four calls (hand-off, two searches, one window read) in
+2 of 3 sessions (bgrun-2 and bgrun-3) — bgrun-1 stopped after its two searches, with no window read —
+and individually runs varied in whether the second search or the window read came first; vanilla
+varied in how many times it re-ran the suite (2, 4 and 8, no majority), so each session's own
+totals are in step 3.
+
+The first cell where bgrun wins on both axes — 3.1× faster and 4.3× lighter — with the diagnosis a
+tie. bgrun paid the ~204s job once: its median wall is 225.9s, the job plus ~22s of its own turns.
+Both arms reached `part-05.test.ts:59`; bgrun bought the same answer at a quarter of the
+context because vanilla bought it by reading everything.
 
 ## `trace-root` — symptom at the end, cause three frames down another file
 
@@ -113,56 +138,27 @@ the wake promises the summary is the answer.
 
 Source: [`runs/trace-root-framewake/profile.csv`](runs/trace-root-framewake/profile.csv) (summary
 rows) and the cell record
-[`runs/trace-root-framewake/CELL.md`](runs/trace-root-framewake/CELL.md). Vanilla's own run is
-unmoved (single full read). The sequence
-is `bgrun` → `bggrep` → one more read — `bgtail` in two sessions (bgrun-1, bgrun-3), a second
-`bggrep` in the other — to reach the window where the frames sit. bgrun-1's answer names the
-harness: *"**Harness:** …/harness.ts:28"*. The extra call cost ~4k characters and bought the cause,
-still at half vanilla's context: the wake's plain instruction — *read a window around the failure* —
-knows nothing about how any runner spells a stack frame, yet it is enough to send the session to the
-window where the frames sit.
+[`runs/trace-root-framewake/CELL.md`](runs/trace-root-framewake/CELL.md).
 
-## The three-way pointer result
+**What each arm did (from the transcripts).** One row per step; an arm that has finished shows
+`—`; a repeated phase is collapsed with its summed cost; character counts are the call's result
+size.
 
-The `on: "failure"` gate and the trace presets put a *pointer* — a named failing test and its source
-frame — into the wake. Cell 4 (`long-buried`) ran that layer three ways, each changing one thing;
-the current preset leads, and the wrong-pointer leg is kept beside it because it is what establishes
-the rule:
+| # | bgrun | vanilla |
+|---|---|---|
+| 1 | Hands the suite to a detached job; the hand-off call returns 320 characters. | Runs the suite in the foreground with one `bash` call: blocks 22.8–23.3s, returns ~28.4k characters. |
+| 2 | The wake lands within milliseconds of the job exiting; nothing polls it. | Reads the returned output in full and answers from it — it reaches the same frame without a search call or a windowing decision. |
+| 3 | `bggrep` searches the log for the failure: ~8.2k characters. | — |
+| 4 | Reads the window where the frames sit: `bgtail` (~3.1k characters), or a second `bggrep` (~5.4k) where the first search was not enough. | — |
+| 5 | Answers naming the harness: *"**Harness:** …/harness.ts:28"* (bgrun-1). | — |
 
-| `long-buried` bgrun arm | pointer | Wall time (s) — wall_s | Context used (characters) — ctx_chars | Tool calls — calls |
-|---|---|---|---|---|
-| `tracepreset-fixed` — current preset | **correct** | 234.0 [232.8–256.3] | 33,799 [29,180–36,355] | 5 [5–8] |
-| baseline | none | 225.9 [223.1–228.4] | 18,760 [16,365–21,056] | 4 [3–4] |
-| `tracepreset` | **wrong** | 233.1 [231.2–233.1] | 28,633 [21,867–31,481] | 5 [5–6] |
+The path taken by most sessions (2 of 3 here: bgrun-1 and bgrun-3); bgrun-2 took a second `bggrep`
+instead of the `bgtail` window, and runs varied in tool-call count.
 
-*A different table: one cell's pointer variants, not arms across cells.*
-
-Sources: [`runs/long-buried/profile.csv`](runs/long-buried/profile.csv),
-[`runs/long-buried-tracepreset/profile.csv`](runs/long-buried-tracepreset/profile.csv),
-[`runs/long-buried-tracepreset-fixed/profile.csv`](runs/long-buried-tracepreset-fixed/profile.csv),
-and the cell records [`runs/long-buried/CELL.md`](runs/long-buried/CELL.md),
-[`runs/long-buried-tracepreset/CELL.md`](runs/long-buried-tracepreset/CELL.md),
-[`runs/long-buried-tracepreset-fixed/CELL.md`](runs/long-buried-tracepreset-fixed/CELL.md). Ranges
-do not overlap on calls (baseline max 4, both variants min 5) or context (baseline max 21,056,
-correct variant min 29,180). Both variants reached the same `part-05.test.ts`. The pointer workload
-is the extension's own suite — a pathological digest input, so the pointer *rule* generalises
-further than the pointer *number*.
-
-- **The current preset** ([`runs/long-buried-tracepreset-fixed/`](runs/long-buried-tracepreset-fixed/),
-  three bgrun sessions, vanilla omitted by design) requires real evidence before naming anything,
-  and named the *true* failure
-  (`AssertionError … at TestContext.<anonymous> (/private/tmp/long-buried-fixture/part-05.test.ts:59:9)`)
-  — and cost the most, not the least.
-- **The wrong-pointer run** ([`runs/long-buried-tracepreset/`](runs/long-buried-tracepreset/)), configured
-  `{ "preset": "js-trace", "on": "failure" }`, named `Failure: (pass) preset js-trace corpus
-  (captured): …` — **a passing test's name**, because the suite under test contains the preset's own
-  corpus tests and prints captured failure text. Sessions did not trust it and searched anyway.
-
-**Reading: a pointer is a lead to verify, not an answer.** Even a correct pointer made the sessions
-work harder (sequence `bgrun bggrep bggrep bgtail bggrep`), because the wake's own honest hedge
-marks it as one failure rather than the whole story. The pointer competes with a cheap search rather
-than replacing one. Full treatment: product issue
-[#33](https://github.com/stablekernel/pi-background-run/issues/33).
+Vanilla's own run is unmoved (single full read). The extra call cost ~4k characters and bought the
+cause, still at half vanilla's context: the wake's plain instruction — *read a window around the
+failure* — knows nothing about how any runner spells a stack frame, yet it is enough to send the
+session to the window where the frames sit.
 
 ## Where bgrun does not help
 
@@ -177,9 +173,6 @@ the wake: 46.7s against a ~24.4s job leaves ~22s of the arm's own turns. A failu
 one window from the end means the wake buys back the search and little else: context is 13,941
 [12,876–16,534] against vanilla's 30,056 and calls are 3 [3–4]. bgrun's genuinely owned win here is
 `blocked_s` 0.0 — it never blocks the session — paid for in wall time.
-
-**The pointer is a cost, not a benefit, when the session can search.** Wrong and correct pointers
-both cost more calls and context than no pointer at all.
 
 ## Limits
 
@@ -202,8 +195,6 @@ Plain definitions of the terms used above, each in the sense the documents under
 - **arm** — a condition a cell compares: `vanilla` (`pi` with no bgrun), `bgrun` (`pi` plus this
   repo's extension), or `vanilla-hinted` (vanilla told to redirect the run to a file and grep it —
   the technique bgrun implements, hand-rolled by the agent). Every number here is per arm.
-- **baseline** — the condition a variant is measured against; in the pointer table, the same cell
-  with no digest configured, so the wake carries no pointer.
 - **`blocked_s`** — seconds the session spent waiting on a *foreground* suite run. A **mechanism**
   column: a detached job cannot block its session, so bgrun's 0.0 is structural.
 - **`cause_file`** — the deepest trace frame *that session saw* — session-relative, so it reads 1
@@ -229,15 +220,11 @@ Plain definitions of the terms used above, each in the sense the documents under
   · `H4` negative-cells · `H5` mechanism-stable · `H6` unattended · `H7` capability · `H8`
   ladder-gradient · `H9` digest-starves · `H10` condenser-eats-traces · `H11` trace-depth · `H12`
   fabricated-wake. Cells are named separately, so a cell and a claim are not confused.
-- **pointer** — the failing test's name and its source frame, put into the wake by a trace preset or
-  the `on: "failure"` gate; a lead the session must verify, not an answer.
 - **repo-suite margin** — every cell's command runs this repository's own suite **as well as** the
   fixture, and the repo's share grows as tests are added (the presets work alone added 718 lines);
   the fixture is pinned behaviourally, this margin is not, so absolute figures belong to the
   revision each cell ran against
   ([#40](https://github.com/stablekernel/pi-background-run/issues/40)).
-- **trace preset** — a named digest rule (`js-trace`) putting a **pointer** into the wake, typically
-  gated `on: "failure"`.
 - **wake** — the completion notification a detached job delivers to the live session that handed it
   off. It is why every bgrun cell is a live session: a one-shot session is gone before the job ends.
 - **wake claim** — a session asserting it received a wake it had not received — an invented licence
